@@ -456,7 +456,7 @@ kernel void route(device const float* logits [[buffer(0)]],
     }
 }
 
-inline void quant_block16(const thread float* blk, float enc, float dec, float out_scale, device float* dst) {
+inline void quant_block16(const thread float* blk, float enc, float dec, float out_scale, device half* dst) {
     float bmax = 0;
     for (uint j = 0; j < 16; ++j) bmax = max(bmax, fabs(blk[j]));
     float best_err[2];
@@ -476,11 +476,11 @@ inline void quant_block16(const thread float* blk, float enc, float dec, float o
         best_err[c] = err[0];
     }
     uint pick = best_err[1] < best_err[0] ? 1u : 0u;
-    for (uint j = 0; j < 16; ++j) dst[j] = vals[pick][j];
+    for (uint j = 0; j < 16; ++j) dst[j] = half(vals[pick][j]);
 }
 
 kernel void quant_nvfp4(device const float* x [[buffer(0)]],
-                        device float* operand [[buffer(1)]],
+                        device half* operand [[buffer(1)]],
                         device float* outer [[buffer(2)]],
                         constant uint& n [[buffer(3)]],
                         uint row [[threadgroup_position_in_grid]],
@@ -490,7 +490,7 @@ kernel void quant_nvfp4(device const float* x [[buffer(0)]],
                         uint simd [[simdgroup_index_in_threadgroup]]) {
     threadgroup float part[8];
     device const float* xr = x + row * n;
-    device float* opr = operand + row * n;
+    device half* opr = operand + row * n;
     float a = 0;
     for (uint i = tid; i < n; i += threads) a = max(a, fabs(xr[i]));
     a = simd_max(a);
@@ -499,7 +499,7 @@ kernel void quant_nvfp4(device const float* x [[buffer(0)]],
     float amax = 0;
     for (uint i = 0; i < (threads + 31u) / 32u; ++i) amax = max(amax, part[i]);
     if (amax == 0.0f) {
-        for (uint i = tid; i < n; i += threads) opr[i] = 0;
+        for (uint i = tid; i < n; i += threads) opr[i] = half(0);
         if (tid == 0) outer[row] = 0;
         return;
     }
@@ -518,7 +518,7 @@ struct Swiglu { uint inter; uint top; float gate_cap; float up_cap; uint round_o
 
 kernel void swiglu_quant_nvfp4(device const float* gu [[buffer(0)]],
                                device const float* gammas [[buffer(1)]],
-                               device float* hq [[buffer(2)]],
+                               device half* hq [[buffer(2)]],
                                device float* houter [[buffer(3)]],
                                constant Swiglu& p [[buffer(4)]],
                                uint k [[threadgroup_position_in_grid]],
@@ -546,9 +546,9 @@ kernel void swiglu_quant_nvfp4(device const float* gu [[buffer(0)]],
     threadgroup_barrier(mem_flags::mem_threadgroup);
     float amax = 0;
     for (uint i = 0; i < (threads + 31u) / 32u; ++i) amax = max(amax, part[i]);
-    device float* opr = hq + k * p.inter;
+    device half* opr = hq + k * p.inter;
     if (amax == 0.0f) {
-        for (uint i = tid; i < p.inter; i += threads) opr[i] = 0;
+        for (uint i = tid; i < p.inter; i += threads) opr[i] = half(0);
         if (tid == 0) houter[k] = 0;
         return;
     }
@@ -595,7 +595,7 @@ kernel void expert_nvfp4(device const uchar* w [[buffer(0)]],
                          device const uchar* sc [[buffer(1)]],
                          device const float* amax [[buffer(2)]],
                          device const float* denom [[buffer(3)]],
-                         device const float* x [[buffer(4)]],
+                         device const half* x [[buffer(4)]],
                          device const float* outer [[buffer(5)]],
                          device const uint* ids [[buffer(6)]],
                          device float* y [[buffer(7)]],
@@ -610,14 +610,15 @@ kernel void expert_nvfp4(device const uchar* w [[buffer(0)]],
     uint e = ids[k];
     device const uchar* wr = w + ulong(e) * p.expert_bytes + ulong(row) * (p.cols / 2u);
     device const uchar* sr = sc + ulong(e) * p.scale_bytes + ulong(row) * (p.cols / 16u);
-    device const float4* x4 = (device const float4*)(x + (p.per_row_input ? k * p.in_stride : 0u));
+    device const half4* x4 = (device const half4*)(x + (p.per_row_input ? k * p.in_stride : 0u));
     float acc = 0.0f;
     uint blocks = p.cols / 16u;
     for (uint b = lane; b < blocks; b += 32u) {
         uint2 packed = *(device const uint2*)(wr + b * 8u);
         float s = e4m3_decode(sr[b]);
-        float4 part = fp4x4(packed.x) * x4[b * 4u] + fp4x4(packed.x >> 16) * x4[b * 4u + 1u]
-                    + fp4x4(packed.y) * x4[b * 4u + 2u] + fp4x4(packed.y >> 16) * x4[b * 4u + 3u];
+        uint b4 = b * 4u;
+        float4 part = fp4x4(packed.x) * float4(x4[b4]) + fp4x4(packed.x >> 16) * float4(x4[b4 + 1u])
+                    + fp4x4(packed.y) * float4(x4[b4 + 2u]) + fp4x4(packed.y >> 16) * float4(x4[b4 + 3u]);
         acc += ((part.x + part.y) + (part.z + part.w)) * s;
     }
     float total = simd_sum(acc);

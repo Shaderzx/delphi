@@ -85,6 +85,9 @@ float f(NSDictionary* d, NSString* k) { return [d[k] floatValue]; }
 
 class Engine {
 public:
+    static constexpr uint32_t MAX_BATCH = 16;
+    enum LogitsMode { LOGITS_NONE = 0, LOGITS_LAST = 1, LOGITS_ALL = 2 };
+
     Gpu gpu;
     Config c{};
     std::map<std::string, Tensor> tensors;
@@ -97,21 +100,31 @@ public:
     id<MTLComputePipelineState> p_ctl_norm, p_ctl_mix_norm, p_embed, p_softcap, p_argmax, p_round;
     id<MTLComputePipelineState> p_ch_build, p_ch_xnorm, p_ch_scan, p_ch_tau, p_ch_filter, p_ch_setup, p_ch_rescore, p_ch_argmax;
     id<MTLComputePipelineState> p_bf12_hist, p_bf12_pack, p_gemv12;
+    id<MTLComputePipelineState> p_embed_b, p_norm_b, p_res_b, p_ctl_norm_b, p_ctl_mix_b, p_sconv_b, p_conv_commit;
+    id<MTLComputePipelineState> p_clip_b, p_clip_kv_b, p_rel_b, p_attend_b, p_route_b, p_union, p_env4_g, p_emxf8_g, p_combine_b;
+    id<MTLComputePipelineState> p_ch_xnorm_b, p_ch_tau_b, p_ch_filter_b, p_ch_setup_b, p_copy_tap;
+    std::array<id<MTLComputePipelineState>, 9> p_gemv12_rows, p_gemv16_rows, p_ch_scan_rows;
     id<MTLBuffer> arena, queries, logits, token, scratch;
     id<MTLBuffer> head_q4 = nil, head_sc = nil, head_err = nil;
     id<MTLBuffer> ch_ub = nil, ch_tg_val = nil, ch_tg_row = nil, ch_state = nil, ch_count = nil, ch_cands = nil, ch_indirect = nil;
     id<MTLBuffer> bf12_sm = nil, bf12_ex = nil, bf12_ro = nil, bf12_op = nil;
+    id<MTLBuffer> conv_buf = nil, conv_meta = nil;
+    id<MTLBuffer> u_exp = nil, u_cnt = nil, u_pairs = nil, u_ind_w13 = nil, u_ind_w2 = nil;
+    id<MTLBuffer> tap_buf = nil;
     bool cert_head_ready = false;
     bool bf12_ready = false;
+    uint32_t q_stride = 0, k_stride_local = 0, k_stride_global = 0;
     uint64_t s_qbundle, s_kbundle, s_vbundle;
     uint64_t s_q, s_qc, s_r, s_rc, s_gate, s_sinks, s_kraw, s_vraw, s_k, s_v, s_dynk, s_dynv, s_rel, s_gated;
     uint64_t s_router, s_ids, s_gammas, s_xq, s_outer, s_gu, s_h, s_hq, s_houter, s_rows;
     uint64_t s_normed[3], s_ctlh[3], s_gf[3], s_gain[3], s_forget[3];
     std::vector<id<MTLBuffer>> kcache, vcache;
-    std::vector<std::array<id<MTLBuffer>, 4>> conv;
+    std::vector<std::array<uint64_t, 4>> conv_off;
+    uint32_t conv_count = 0;
+    uint32_t pending_conv_commit = 0;
     uint32_t max_context = 4096;
     uint32_t next_slot = 0;
-    uint32_t slots = 4096;
+    uint32_t slots = 1024;
     std::vector<uint64_t> q_attn_off, q_mlp_off, q_loop_attn_off, q_loop_mlp_off;
     uint64_t q_output_off = 0;
     id<MTLComputeCommandEncoder> enc = nil;
@@ -220,14 +233,46 @@ public:
         p_bf12_hist = pipeline(gpu, @"bf12_hist");
         p_bf12_pack = pipeline(gpu, @"bf12_pack");
         p_gemv12 = pipeline(gpu, @"gemv_bf12");
-        arena = [gpu.device newBufferWithLength:uint64_t(slots) * c.hidden * 4 options:MTLResourceStorageModePrivate];
+        p_embed_b = pipeline(gpu, @"embed_rows");
+        p_norm_b = pipeline(gpu, @"rms_norm_batch");
+        p_res_b = pipeline(gpu, @"attn_res_batch");
+        p_ctl_norm_b = pipeline(gpu, @"ctl_normed_batch");
+        p_ctl_mix_b = pipeline(gpu, @"ctl_mix_norm_batch");
+        p_sconv_b = pipeline(gpu, @"sconv_batch");
+        p_conv_commit = pipeline(gpu, @"conv_commit_all");
+        p_clip_b = pipeline(gpu, @"clip_rows_batch");
+        p_clip_kv_b = pipeline(gpu, @"clip_kv_store_batch");
+        p_rel_b = pipeline(gpu, @"rel_bias_batch");
+        p_attend_b = pipeline(gpu, @"attend_gated_batch");
+        p_route_b = pipeline(gpu, @"route_batch");
+        p_union = pipeline(gpu, @"build_expert_union");
+        p_env4_g = pipeline(gpu, @"expert_nvfp4_grouped");
+        p_emxf8_g = pipeline(gpu, @"expert_mxfp8_grouped");
+        p_combine_b = pipeline(gpu, @"combine_batch");
+        p_ch_xnorm_b = pipeline(gpu, @"cert_head_xnorm_batch");
+        p_ch_tau_b = pipeline(gpu, @"cert_head_tau_batch");
+        p_ch_filter_b = pipeline(gpu, @"cert_head_filter_batch");
+        p_ch_setup_b = pipeline(gpu, @"cert_head_setup_batch");
+        p_copy_tap = pipeline(gpu, @"copy_tap_batch");
+        for (uint32_t r = 1; r <= 8; ++r) {
+            p_gemv12_rows[r] = pipeline_for_rows(gpu, @"gemv_bf12_rows", r);
+            p_gemv16_rows[r] = pipeline_for_rows(gpu, @"gemv_bf16_rows", r);
+            p_ch_scan_rows[r] = pipeline_for_rows(gpu, @"cert_head_scan_rows", r);
+        }
+        arena = [gpu.device newBufferWithLength:uint64_t(slots) * MAX_BATCH * c.hidden * 4 options:MTLResourceStorageModePrivate];
         if (!arena) { error = "arena allocation failed"; return false; }
         build_queries();
         if (!queries) { error = "queries allocation failed"; return false; }
         resolve_weights();
         logits = [gpu.device newBufferWithLength:uint64_t(c.padded_vocab) * 4 options:MTLResourceStorageModeShared];
-        token = [gpu.device newBufferWithLength:16 options:MTLResourceStorageModeShared];
-        if (!logits || !token) { error = "workspace allocation failed"; return false; }
+        token = [gpu.device newBufferWithLength:256 options:MTLResourceStorageModeShared];
+        u_exp = [gpu.device newBufferWithLength:128 * 4 options:MTLResourceStorageModePrivate];
+        u_cnt = [gpu.device newBufferWithLength:128 * 4 options:MTLResourceStorageModePrivate];
+        u_pairs = [gpu.device newBufferWithLength:128 * MAX_BATCH * 4 options:MTLResourceStorageModePrivate];
+        u_ind_w13 = [gpu.device newBufferWithLength:16 options:MTLResourceStorageModePrivate];
+        u_ind_w2 = [gpu.device newBufferWithLength:16 options:MTLResourceStorageModePrivate];
+        tap_buf = [gpu.device newBufferWithLength:uint64_t(MAX_BATCH) * 4 * c.hidden * 4 options:MTLResourceStorageModePrivate];
+        if (!logits || !token || !u_exp || !u_cnt || !u_pairs || !u_ind_w13 || !u_ind_w2 || !tap_buf) { error = "workspace allocation failed"; return false; }
         uint32_t H = c.hidden, I = c.inter, K = c.top;
         uint64_t at = 0;
         auto slot_alloc = [&](uint64_t count) {
@@ -235,44 +280,50 @@ public:
             at += (count * 4 + 255) / 256 * 256;
             return off;
         };
-        s_qbundle = slot_alloc(c.heads * c.head_dim * 2 + c.heads * c.d_rel + c.heads);
+        q_stride = c.heads * c.head_dim * 2 + c.heads * c.d_rel + c.heads;
+        k_stride_local = c.kv_heads * c.head_dim;
+        k_stride_global = k_stride_local + c.kv_heads * 4;
+        s_qbundle = slot_alloc(uint64_t(MAX_BATCH) * q_stride);
         s_q = s_qbundle;
         s_r = s_q + uint64_t(c.heads * c.head_dim) * 4;
         s_gate = s_r + uint64_t(c.heads * c.d_rel) * 4;
         s_sinks = s_gate + uint64_t(c.heads * c.head_dim) * 4;
-        s_qc = slot_alloc(c.heads * c.head_dim);
-        s_rc = slot_alloc(c.heads * c.d_rel);
-        s_kbundle = slot_alloc(c.kv_heads * c.head_dim + c.kv_heads * 4);
+        s_qc = slot_alloc(uint64_t(MAX_BATCH) * c.heads * c.head_dim);
+        s_rc = slot_alloc(uint64_t(MAX_BATCH) * c.heads * c.d_rel);
+        s_kbundle = slot_alloc(uint64_t(MAX_BATCH) * k_stride_global);
         s_kraw = s_kbundle;
-        s_dynk = s_kraw + uint64_t(c.kv_heads * c.head_dim) * 4;
-        s_vbundle = slot_alloc(c.kv_heads * c.head_dim + c.kv_heads * 4);
+        s_dynk = s_kraw + uint64_t(k_stride_local) * 4;
+        s_vbundle = slot_alloc(uint64_t(MAX_BATCH) * k_stride_global);
         s_vraw = s_vbundle;
-        s_dynv = s_vraw + uint64_t(c.kv_heads * c.head_dim) * 4;
-        s_k = slot_alloc(c.kv_heads * c.head_dim);
-        s_v = slot_alloc(c.kv_heads * c.head_dim);
-        s_rel = slot_alloc(c.heads * c.rel_extent);
-        s_gated = slot_alloc(c.heads * c.head_dim);
-        s_router = slot_alloc(c.experts);
-        s_ids = slot_alloc(16);
-        s_gammas = slot_alloc(16);
-        s_xq = slot_alloc(H);
-        s_outer = slot_alloc(16);
-        s_gu = slot_alloc(K * 2 * I);
-        s_h = slot_alloc(K * I);
-        s_hq = slot_alloc(K * I);
-        s_houter = slot_alloc(16);
-        s_rows = slot_alloc(K * H);
+        s_dynv = s_vraw + uint64_t(k_stride_local) * 4;
+        s_k = slot_alloc(uint64_t(MAX_BATCH) * k_stride_local);
+        s_v = slot_alloc(uint64_t(MAX_BATCH) * k_stride_local);
+        s_rel = slot_alloc(uint64_t(MAX_BATCH) * c.heads * c.rel_extent);
+        s_gated = slot_alloc(uint64_t(MAX_BATCH) * c.heads * c.head_dim);
+        s_router = slot_alloc(uint64_t(MAX_BATCH) * c.experts);
+        s_ids = slot_alloc(uint64_t(MAX_BATCH) * 16);
+        s_gammas = slot_alloc(uint64_t(MAX_BATCH) * 16);
+        s_xq = slot_alloc(uint64_t(MAX_BATCH) * H);
+        s_outer = slot_alloc(uint64_t(MAX_BATCH) * 4);
+        s_gu = slot_alloc(uint64_t(MAX_BATCH) * K * 2 * I);
+        s_h = slot_alloc(uint64_t(MAX_BATCH) * K * I);
+        s_hq = slot_alloc(uint64_t(MAX_BATCH) * K * I);
+        s_houter = slot_alloc(uint64_t(MAX_BATCH) * K);
+        s_rows = slot_alloc(uint64_t(MAX_BATCH) * K * H);
         for (int k = 0; k < 3; ++k) {
-            s_normed[k] = slot_alloc(2 * H);
-            s_ctlh[k] = slot_alloc(64);
-            s_gf[k] = slot_alloc(2 * H);
+            s_normed[k] = slot_alloc(uint64_t(MAX_BATCH) * 2 * H);
+            s_ctlh[k] = slot_alloc(uint64_t(MAX_BATCH) * 64);
+            s_gf[k] = slot_alloc(uint64_t(MAX_BATCH) * 2 * H);
             s_gain[k] = s_gf[k];
             s_forget[k] = s_gf[k] + uint64_t(H) * 4;
         }
         scratch = [gpu.device newBufferWithLength:at options:MTLResourceStorageModePrivate];
         if (!scratch) { error = "scratch allocation failed"; return false; }
         uint32_t visits = c.layers + (c.passes - 1) * (c.core_end - c.core_start);
-        conv.resize(visits);
+        conv_off.resize(visits);
+        struct ConvMetaHost { uint32_t offset_f, width; };
+        std::vector<ConvMetaHost> cmeta;
+        uint64_t conv_floats = 0;
         for (uint32_t v = 0; v < visits; ++v) {
             id<MTLBuffer> kb = [gpu.device newBufferWithLength:uint64_t(max_context) * c.kv_heads * c.head_dim * 2 options:MTLResourceStorageModePrivate];
             id<MTLBuffer> vb = [gpu.device newBufferWithLength:uint64_t(max_context) * c.kv_heads * c.head_dim * 2 options:MTLResourceStorageModePrivate];
@@ -280,12 +331,17 @@ public:
             kcache.push_back(kb);
             vcache.push_back(vb);
             for (int s = 0; s < 4; ++s) {
-                uint64_t width = s < 2 ? c.kv_heads * c.head_dim : c.hidden;
-                id<MTLBuffer> b = [gpu.device newBufferWithLength:3 * width * 4 options:MTLResourceStorageModeShared];
-                if (!b) { error = "conv state allocation failed"; return false; }
-                conv[v][s] = b;
+                uint32_t width = s < 2 ? c.kv_heads * c.head_dim : c.hidden;
+                conv_off[v][s] = conv_floats * 4;
+                cmeta.push_back({uint32_t(conv_floats), width});
+                conv_floats += ((3u + MAX_BATCH) * width + 63u) / 64u * 64u;
             }
         }
+        conv_count = uint32_t(cmeta.size());
+        conv_buf = [gpu.device newBufferWithLength:conv_floats * 4 options:MTLResourceStorageModePrivate];
+        conv_meta = [gpu.device newBufferWithBytes:cmeta.data() length:cmeta.size() * sizeof(ConvMetaHost) options:MTLResourceStorageModeShared];
+        if (!conv_buf || !conv_meta) { error = "conv state allocation failed"; return false; }
+        reset_state();
         if (use_cert_head && (c.hidden % 32 == 0) && c.vocab >= 64) {
             if (!build_cert_head(error)) return false;
         }
@@ -473,13 +529,13 @@ public:
         head_q4 = [gpu.device newBufferWithLength:uint64_t(V) * ng * 16 options:MTLResourceStorageModePrivate];
         head_sc = [gpu.device newBufferWithLength:uint64_t(V) * ng * 2 options:MTLResourceStorageModePrivate];
         head_err = [gpu.device newBufferWithLength:uint64_t(V) * 4 options:MTLResourceStorageModePrivate];
-        ch_ub = [gpu.device newBufferWithLength:uint64_t(V) * 4 options:MTLResourceStorageModePrivate];
-        ch_tg_val = [gpu.device newBufferWithLength:uint64_t(ntg) * 4 options:MTLResourceStorageModePrivate];
-        ch_tg_row = [gpu.device newBufferWithLength:uint64_t(ntg) * 4 options:MTLResourceStorageModePrivate];
-        ch_state = [gpu.device newBufferWithLength:16 options:MTLResourceStorageModePrivate];
-        ch_count = [gpu.device newBufferWithLength:16 options:MTLResourceStorageModeShared];
-        ch_cands = [gpu.device newBufferWithLength:uint64_t(V) * 4 options:MTLResourceStorageModePrivate];
-        ch_indirect = [gpu.device newBufferWithLength:16 options:MTLResourceStorageModePrivate];
+        ch_ub = [gpu.device newBufferWithLength:uint64_t(MAX_BATCH) * V * 4 options:MTLResourceStorageModePrivate];
+        ch_tg_val = [gpu.device newBufferWithLength:uint64_t(MAX_BATCH) * ntg * 4 options:MTLResourceStorageModePrivate];
+        ch_tg_row = [gpu.device newBufferWithLength:uint64_t(MAX_BATCH) * ntg * 4 options:MTLResourceStorageModePrivate];
+        ch_state = [gpu.device newBufferWithLength:uint64_t(MAX_BATCH) * 16 options:MTLResourceStorageModePrivate];
+        ch_count = [gpu.device newBufferWithLength:uint64_t(MAX_BATCH) * 4 options:MTLResourceStorageModeShared];
+        ch_cands = [gpu.device newBufferWithLength:uint64_t(MAX_BATCH) * V * 4 options:MTLResourceStorageModePrivate];
+        ch_indirect = [gpu.device newBufferWithLength:uint64_t(MAX_BATCH) * 16 options:MTLResourceStorageModePrivate];
         if (!head_q4 || !head_sc || !head_err || !ch_ub || !ch_tg_val || !ch_tg_row || !ch_state || !ch_count || !ch_cands || !ch_indirect) {
             error = "certified head allocation failed";
             return false;
@@ -608,14 +664,18 @@ public:
         queries = [gpu.device newBufferWithBytes:all.data() length:all.size() * 4 options:MTLResourceStorageModeShared];
     }
 
-    uint64_t so(uint32_t slot) const { return uint64_t(slot) * c.hidden * 4; }
+    uint64_t so(uint32_t slot) const { return uint64_t(slot) * MAX_BATCH * c.hidden * 4; }
     uint32_t alloc() { return next_slot++; }
 
     void barrier() { if (!together) [enc memoryBarrierWithScope:MTLBarrierScopeBuffers]; }
     void grid(NSUInteger groups, NSUInteger threads) { barrier(); [enc dispatchThreadgroups:MTLSizeMake(groups, 1, 1) threadsPerThreadgroup:MTLSizeMake(threads, 1, 1)]; }
     void grid2(NSUInteger gx, NSUInteger gy, NSUInteger threads) { barrier(); [enc dispatchThreadgroups:MTLSizeMake(gx, gy, 1) threadsPerThreadgroup:MTLSizeMake(threads, 1, 1)]; }
+    void grid3(NSUInteger gx, NSUInteger gy, NSUInteger gz, NSUInteger threads) { barrier(); [enc dispatchThreadgroups:MTLSizeMake(gx, gy, gz) threadsPerThreadgroup:MTLSizeMake(threads, 1, 1)]; }
 
     struct GemvP { uint32_t rows, cols, round_out; float scale; };
+    struct GemvBP { uint32_t rows, cols, round_out, x_stride, y_stride; float scale; };
+    struct Gemv12BP { uint32_t rows, cols, round_out, has_outliers, x_stride, y_stride; uint32_t elut[16]; };
+
     void gemv_ab(const Mat& m, id<MTLBuffer> in_buf, uint64_t in_off, id<MTLBuffer> out_buf, uint64_t out_off, bool round_out = true) {
         GemvP g{m.rows, m.cols, round_out ? 1u : 0u, 1.0f};
         [enc setComputePipelineState:p_gemv];
@@ -624,6 +684,23 @@ public:
         [enc setBuffer:out_buf offset:out_off atIndex:2];
         [enc setBytes:&g length:sizeof(g) atIndex:3];
         grid((g.rows + 7) / 8, 256);
+    }
+
+    void gemv16_m(const Mat& m, id<MTLBuffer> in_buf, uint64_t in_off, uint32_t x_stride, id<MTLBuffer> out_buf, uint64_t out_off, uint32_t y_stride, uint32_t M, bool round_out = true) {
+        if (M == 1) {
+            gemv_ab(m, in_buf, in_off, out_buf, out_off, round_out);
+            return;
+        }
+        for (uint32_t m0 = 0; m0 < M; m0 += 8) {
+            uint32_t mb = std::min<uint32_t>(8, M - m0);
+            GemvBP g{m.rows, m.cols, round_out ? 1u : 0u, x_stride, y_stride, 1.0f};
+            [enc setComputePipelineState:p_gemv16_rows[mb]];
+            [enc setBuffer:file offset:m.offset atIndex:0];
+            [enc setBuffer:in_buf offset:in_off + uint64_t(m0) * x_stride * 4 atIndex:1];
+            [enc setBuffer:out_buf offset:out_off + uint64_t(m0) * y_stride * 4 atIndex:2];
+            [enc setBytes:&g length:sizeof(g) atIndex:3];
+            grid((g.rows + 7) / 8, 256);
+        }
     }
 
     void gemv12_ab(const Mat12& m, id<MTLBuffer> in_buf, uint64_t in_off, id<MTLBuffer> out_buf, uint64_t out_off, bool round_out = true) {
@@ -644,132 +721,167 @@ public:
         grid((g.rows + 7) / 8, 256);
     }
 
+    void gemv12_m(const Mat12& m, id<MTLBuffer> in_buf, uint64_t in_off, uint32_t x_stride, id<MTLBuffer> out_buf, uint64_t out_off, uint32_t y_stride, uint32_t M, bool round_out = true) {
+        if (M == 1) {
+            gemv12_ab(m, in_buf, in_off, out_buf, out_off, round_out);
+            return;
+        }
+        for (uint32_t m0 = 0; m0 < M; m0 += 8) {
+            uint32_t mb = std::min<uint32_t>(8, M - m0);
+            Gemv12BP g{};
+            g.rows = m.rows;
+            g.cols = m.cols;
+            g.round_out = round_out ? 1u : 0u;
+            g.has_outliers = m.has_outliers;
+            g.x_stride = x_stride;
+            g.y_stride = y_stride;
+            std::memcpy(g.elut, m.elut, sizeof(g.elut));
+            [enc setComputePipelineState:p_gemv12_rows[mb]];
+            [enc setBuffer:bf12_sm offset:m.sm_off atIndex:0];
+            [enc setBuffer:bf12_ex offset:m.ex_off atIndex:1];
+            [enc setBuffer:bf12_ro offset:m.ro_off atIndex:2];
+            [enc setBuffer:bf12_op offset:m.op_off atIndex:3];
+            [enc setBuffer:in_buf offset:in_off + uint64_t(m0) * x_stride * 4 atIndex:4];
+            [enc setBuffer:out_buf offset:out_off + uint64_t(m0) * y_stride * 4 atIndex:5];
+            [enc setBytes:&g length:sizeof(g) atIndex:6];
+            grid((g.rows + 7) / 8, 256);
+        }
+    }
+
     struct NormP { uint32_t n, has_weight; float eps; };
-    uint32_t norm(uint32_t in, uint64_t weight_off) {
+    uint32_t norm(uint32_t in, uint64_t weight_off, uint32_t M) {
         uint32_t out = alloc();
         NormP p{c.hidden, 1, 1e-6f};
-        [enc setComputePipelineState:p_norm];
+        [enc setComputePipelineState:M == 1 ? p_norm : p_norm_b];
         [enc setBuffer:arena offset:so(in) atIndex:0];
         [enc setBuffer:file offset:weight_off atIndex:1];
         [enc setBuffer:arena offset:so(out) atIndex:2];
         [enc setBytes:&p length:sizeof(p) atIndex:3];
-        grid(1, 576);
+        grid(M, 576);
         return out;
     }
 
     struct ResP { uint32_t n, sources; int32_t addend; uint32_t queries, normalize, has_norm, offs[8], outs[3]; uint32_t pad; uint64_t norm_offs[3]; };
-    std::vector<uint32_t> res(const std::vector<uint32_t>& sources, int addend, uint64_t query_off, uint32_t nq, const uint64_t* norm_offs = nullptr) {
+    std::vector<uint32_t> res(const std::vector<uint32_t>& sources, int addend, uint64_t query_off, uint32_t nq, uint32_t M, const uint64_t* norm_offs = nullptr) {
         ResP p{};
         p.n = c.hidden;
         p.sources = uint32_t(sources.size());
-        p.addend = addend >= 0 ? int32_t(addend * c.hidden) : -1;
+        p.addend = addend >= 0 ? int32_t(addend * MAX_BATCH * c.hidden) : -1;
         p.queries = nq;
         p.normalize = 1;
         p.has_norm = norm_offs ? 1u : 0u;
-        for (size_t i = 0; i < sources.size(); ++i) p.offs[i] = sources[i] * c.hidden;
+        for (size_t i = 0; i < sources.size(); ++i) p.offs[i] = sources[i] * MAX_BATCH * c.hidden;
         std::vector<uint32_t> outs;
         for (uint32_t k = 0; k < nq; ++k) {
             outs.push_back(alloc());
-            p.outs[k] = outs.back() * c.hidden;
+            p.outs[k] = outs.back() * MAX_BATCH * c.hidden;
             if (norm_offs) p.norm_offs[k] = norm_offs[k];
         }
-        [enc setComputePipelineState:p_res];
+        [enc setComputePipelineState:M == 1 ? p_res : p_res_b];
         [enc setBuffer:arena offset:0 atIndex:0];
         [enc setBuffer:queries offset:query_off atIndex:1];
         [enc setBuffer:file offset:0 atIndex:2];
         [enc setBytes:&p length:sizeof(p) atIndex:3];
-        grid(1, 576);
+        grid(M, 576);
         return outs;
     }
 
-    std::array<uint32_t, 3> controllers_attn_norm(const LayerWeights& w, const uint32_t dests[3], const uint32_t msgs[3], const uint64_t norm_offs[3]) {
+    struct CtlMixBP { uint32_t n, gf_stride; };
+
+    std::array<uint32_t, 3> controllers_attn_norm(const LayerWeights& w, const uint32_t dests[3], const uint32_t msgs[3], const uint64_t norm_offs[3], uint32_t M) {
         uint32_t n = c.hidden;
+        uint32_t gfs = 2 * n;
         [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
         together = true;
         for (int k = 0; k < 3; ++k) {
-            [enc setComputePipelineState:p_ctl_norm];
+            [enc setComputePipelineState:M == 1 ? p_ctl_norm : p_ctl_norm_b];
             [enc setBuffer:arena offset:so(dests[k]) atIndex:0];
             [enc setBuffer:arena offset:so(msgs[k]) atIndex:1];
             [enc setBuffer:scratch offset:s_normed[k] atIndex:2];
             [enc setBytes:&n length:4 atIndex:3];
-            grid(1, 576);
+            grid(M, 576);
         }
         together = false;
         [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
         together = true;
         for (int k = 0; k < 3; ++k) {
-            if (bf12_ready) gemv12_ab(w.ctl[k].down12, scratch, s_normed[k], scratch, s_ctlh[k]);
-            else gemv_ab(w.ctl[k].down, scratch, s_normed[k], scratch, s_ctlh[k]);
+            if (bf12_ready) gemv12_m(w.ctl[k].down12, scratch, s_normed[k], 2 * n, scratch, s_ctlh[k], 64, M);
+            else gemv16_m(w.ctl[k].down, scratch, s_normed[k], 2 * n, scratch, s_ctlh[k], 64, M);
         }
         together = false;
         [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
         together = true;
         for (int k = 0; k < 3; ++k) {
             if (bf12_ready) {
-                gemv12_ab(w.ctl[k].gf12, scratch, s_ctlh[k], scratch, s_gf[k], false);
+                gemv12_m(w.ctl[k].gf12, scratch, s_ctlh[k], 64, scratch, s_gf[k], gfs, M, false);
             } else {
-                gemv_ab(w.ctl[k].gain, scratch, s_ctlh[k], scratch, s_gain[k], false);
-                gemv_ab(w.ctl[k].forget, scratch, s_ctlh[k], scratch, s_forget[k], false);
+                gemv16_m(w.ctl[k].gain, scratch, s_ctlh[k], 64, scratch, s_gain[k], gfs, M, false);
+                gemv16_m(w.ctl[k].forget, scratch, s_ctlh[k], 64, scratch, s_forget[k], gfs, M, false);
             }
         }
         together = false;
         [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
         together = true;
         std::array<uint32_t, 3> outs;
+        CtlMixBP cmp{n, gfs};
         for (int k = 0; k < 3; ++k) {
             outs[k] = alloc();
-            [enc setComputePipelineState:p_ctl_mix_norm];
+            [enc setComputePipelineState:M == 1 ? p_ctl_mix_norm : p_ctl_mix_b];
             [enc setBuffer:arena offset:so(dests[k]) atIndex:0];
             [enc setBuffer:arena offset:so(msgs[k]) atIndex:1];
             [enc setBuffer:scratch offset:s_gain[k] atIndex:2];
             [enc setBuffer:scratch offset:s_forget[k] atIndex:3];
             [enc setBuffer:file offset:norm_offs[k] atIndex:4];
             [enc setBuffer:arena offset:so(outs[k]) atIndex:5];
-            [enc setBytes:&n length:4 atIndex:6];
-            grid(1, 576);
+            if (M == 1) [enc setBytes:&n length:4 atIndex:6];
+            else [enc setBytes:&cmp length:sizeof(cmp) atIndex:6];
+            grid(M, 576);
         }
         together = false;
         return outs;
     }
 
-    uint32_t controller_mlp_norm(const LayerWeights& w, uint32_t dest, uint32_t msg) {
+    uint32_t controller_mlp_norm(const LayerWeights& w, uint32_t dest, uint32_t msg, uint32_t M) {
         uint32_t n = c.hidden;
-        [enc setComputePipelineState:p_ctl_norm];
+        uint32_t gfs = 2 * n;
+        [enc setComputePipelineState:M == 1 ? p_ctl_norm : p_ctl_norm_b];
         [enc setBuffer:arena offset:so(dest) atIndex:0];
         [enc setBuffer:arena offset:so(msg) atIndex:1];
         [enc setBuffer:scratch offset:s_normed[0] atIndex:2];
         [enc setBytes:&n length:4 atIndex:3];
-        grid(1, 576);
+        grid(M, 576);
         if (bf12_ready) {
-            gemv12_ab(w.ctl[3].down12, scratch, s_normed[0], scratch, s_ctlh[0]);
-            gemv12_ab(w.ctl[3].gf12, scratch, s_ctlh[0], scratch, s_gf[0], false);
+            gemv12_m(w.ctl[3].down12, scratch, s_normed[0], 2 * n, scratch, s_ctlh[0], 64, M);
+            gemv12_m(w.ctl[3].gf12, scratch, s_ctlh[0], 64, scratch, s_gf[0], gfs, M, false);
         } else {
-            gemv_ab(w.ctl[3].down, scratch, s_normed[0], scratch, s_ctlh[0]);
+            gemv16_m(w.ctl[3].down, scratch, s_normed[0], 2 * n, scratch, s_ctlh[0], 64, M);
             [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
             together = true;
-            gemv_ab(w.ctl[3].gain, scratch, s_ctlh[0], scratch, s_gain[0], false);
-            gemv_ab(w.ctl[3].forget, scratch, s_ctlh[0], scratch, s_forget[0], false);
+            gemv16_m(w.ctl[3].gain, scratch, s_ctlh[0], 64, scratch, s_gain[0], gfs, M, false);
+            gemv16_m(w.ctl[3].forget, scratch, s_ctlh[0], 64, scratch, s_forget[0], gfs, M, false);
             together = false;
         }
         uint32_t out = alloc();
-        [enc setComputePipelineState:p_ctl_mix_norm];
+        CtlMixBP cmp{n, gfs};
+        [enc setComputePipelineState:M == 1 ? p_ctl_mix_norm : p_ctl_mix_b];
         [enc setBuffer:arena offset:so(dest) atIndex:0];
         [enc setBuffer:arena offset:so(msg) atIndex:1];
         [enc setBuffer:scratch offset:s_gain[0] atIndex:2];
         [enc setBuffer:scratch offset:s_forget[0] atIndex:3];
         [enc setBuffer:file offset:w.mlp_norm atIndex:4];
         [enc setBuffer:arena offset:so(out) atIndex:5];
-        [enc setBytes:&n length:4 atIndex:6];
-        grid(1, 576);
+        if (M == 1) [enc setBytes:&n length:4 atIndex:6];
+        else [enc setBytes:&cmp length:sizeof(cmp) atIndex:6];
+        grid(M, 576);
         return out;
     }
 
-    struct ConvP { uint32_t channels, dynamic, head_dim; float scale; };
-    void sconv_run(id<MTLBuffer> xb, uint64_t xoff, id<MTLBuffer> state, uint64_t woff, uint64_t dynoff, id<MTLBuffer> yb, uint64_t yoff, uint32_t channels, bool dynamic) {
-        ConvP p{channels, dynamic ? 1u : 0u, c.head_dim, dynamic ? 1.0f / 3.0f : 0.4472135955f};
-        [enc setComputePipelineState:p_sconv];
+    struct ConvBP { uint32_t channels, dynamic, head_dim, rows, x_stride, dyn_stride, y_stride; float scale; };
+    void sconv_run(id<MTLBuffer> xb, uint64_t xoff, uint64_t state_off, uint64_t woff, uint64_t dynoff, id<MTLBuffer> yb, uint64_t yoff, uint32_t channels, bool dynamic, uint32_t M, uint32_t x_stride, uint32_t dyn_stride, uint32_t y_stride) {
+        ConvBP p{channels, dynamic ? 1u : 0u, c.head_dim, M, x_stride, dyn_stride, y_stride, dynamic ? 1.0f / 3.0f : 0.4472135955f};
+        [enc setComputePipelineState:p_sconv_b];
         [enc setBuffer:xb offset:xoff atIndex:0];
-        [enc setBuffer:state offset:0 atIndex:1];
+        [enc setBuffer:conv_buf offset:state_off atIndex:1];
         [enc setBuffer:file offset:woff atIndex:2];
         [enc setBuffer:scratch offset:dynoff atIndex:3];
         [enc setBuffer:yb offset:yoff atIndex:4];
@@ -777,171 +889,249 @@ public:
         grid((channels + 255) / 256, 256);
     }
 
-    struct ClipP { uint32_t width, has_scale; float threshold, tau; uint32_t mode; };
-    void clip_run(uint64_t in_off, uint64_t scale_off, uint64_t out_off, uint32_t rows, uint32_t width, float thr, float tau, uint32_t mode) {
-        ClipP p{width, scale_off ? 1u : 0u, thr, tau, mode};
-        [enc setComputePipelineState:p_clip];
+    void conv_commit_encode(uint32_t commit) {
+        if (commit == 0) return;
+        [enc setComputePipelineState:p_conv_commit];
+        [enc setBuffer:conv_buf offset:0 atIndex:0];
+        [enc setBuffer:conv_meta offset:0 atIndex:1];
+        [enc setBytes:&commit length:4 atIndex:2];
+        grid(conv_count, 256);
+    }
+
+    struct ClipBP { uint32_t width, has_scale, pos0, is_local, n_floor, in_stride, out_stride, mode; float threshold, alpha; };
+    void clip_run(uint64_t in_off, uint64_t scale_off, uint64_t out_off, uint32_t rows, uint32_t width, float thr, uint32_t pos0, bool is_local, uint32_t in_stride, uint32_t out_stride, uint32_t mode, uint32_t M) {
+        ClipBP p{width, scale_off ? 1u : 0u, pos0, is_local ? 1u : 0u, c.n_floor, in_stride, out_stride, mode, thr, c.alpha};
+        [enc setComputePipelineState:p_clip_b];
         [enc setBuffer:scratch offset:in_off atIndex:0];
         if (scale_off) [enc setBuffer:file offset:scale_off atIndex:1]; else [enc setBuffer:scratch offset:in_off atIndex:1];
         [enc setBuffer:scratch offset:out_off atIndex:2];
         [enc setBytes:&p length:sizeof(p) atIndex:3];
-        grid(rows, 32);
+        grid2(rows, M, 32);
     }
 
-    struct ClipKvP { uint32_t width, pos, stride, mode; float threshold; };
-    void clip_kv_run(uint64_t in_off, id<MTLBuffer> cache, uint32_t rows, uint32_t width, uint32_t pos, uint32_t stride, uint32_t mode, float thr) {
-        ClipKvP p{width, pos, stride, mode, thr};
-        [enc setComputePipelineState:p_clip_kv];
+    struct ClipKvBP { uint32_t width, pos0, kv_stride, in_stride, mode; float threshold; };
+    void clip_kv_run(uint64_t in_off, id<MTLBuffer> cache, uint32_t rows, uint32_t width, uint32_t pos0, uint32_t kv_stride, uint32_t in_stride, uint32_t mode, float thr, uint32_t M) {
+        ClipKvBP p{width, pos0, kv_stride, in_stride, mode, thr};
+        [enc setComputePipelineState:p_clip_kv_b];
         [enc setBuffer:scratch offset:in_off atIndex:0];
         [enc setBuffer:cache offset:0 atIndex:1];
         [enc setBytes:&p length:sizeof(p) atIndex:2];
-        grid(rows, 32);
+        grid2(rows, M, 32);
     }
 
     struct AttnP { uint32_t pos, start, kv_heads, group, head_dim, extent; float scale; };
-    uint32_t attention(const LayerWeights& w, uint32_t visit, uint32_t sq, uint32_t sk, uint32_t sv, uint32_t pos) {
+    struct AttnBP { uint32_t pos0, rows, window, is_local, kv_heads, group, head_dim, extent, heads, q_stride, gate_stride, gate_off, sink_off, out_stride; float scale; };
+    struct RelBP { uint32_t d_rel, extent, heads; };
+
+    uint32_t attention(const LayerWeights& w, uint32_t visit, uint32_t sq, uint32_t sk, uint32_t sv, uint32_t pos0, uint32_t M) {
+        uint32_t H = c.hidden;
         uint32_t kvw = c.kv_heads * c.head_dim;
+        uint32_t kstr = w.local ? k_stride_local : k_stride_global;
+        uint32_t qdim = c.heads * c.head_dim;
+        uint32_t rdim = c.heads * c.d_rel;
         [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
         together = true;
         if (bf12_ready) {
-            gemv12_ab(w.q12, arena, so(sq), scratch, s_qbundle);
-            gemv12_ab(w.k12, arena, so(sk), scratch, s_kbundle);
-            gemv12_ab(w.v12, arena, so(sv), scratch, s_vbundle);
+            gemv12_m(w.q12, arena, so(sq), H, scratch, s_qbundle, q_stride, M);
+            gemv12_m(w.k12, arena, so(sk), H, scratch, s_kbundle, kstr, M);
+            gemv12_m(w.v12, arena, so(sv), H, scratch, s_vbundle, kstr, M);
         } else {
-            gemv_ab(w.wq, arena, so(sq), scratch, s_q);
-            gemv_ab(w.wr, arena, so(sq), scratch, s_r);
-            gemv_ab(w.gate_attn, arena, so(sq), scratch, s_gate);
-            gemv_ab(w.sink, arena, so(sq), scratch, s_sinks);
-            gemv_ab(w.wk, arena, so(sk), scratch, s_kraw);
-            gemv_ab(w.wv, arena, so(sv), scratch, s_vraw);
+            gemv16_m(w.wq, arena, so(sq), H, scratch, s_q, q_stride, M);
+            gemv16_m(w.wr, arena, so(sq), H, scratch, s_r, q_stride, M);
+            gemv16_m(w.gate_attn, arena, so(sq), H, scratch, s_gate, q_stride, M);
+            gemv16_m(w.sink, arena, so(sq), H, scratch, s_sinks, q_stride, M);
+            gemv16_m(w.wk, arena, so(sk), H, scratch, s_kraw, kstr, M);
+            gemv16_m(w.wv, arena, so(sv), H, scratch, s_vraw, kstr, M);
             if (!w.local) {
-                gemv_ab(w.dynk, arena, so(sk), scratch, s_dynk);
-                gemv_ab(w.dynv, arena, so(sv), scratch, s_dynv);
+                gemv16_m(w.dynk, arena, so(sk), H, scratch, s_dynk, kstr, M);
+                gemv16_m(w.dynv, arena, so(sv), H, scratch, s_dynv, kstr, M);
             }
         }
         together = false;
         [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
         together = true;
-        float tau = w.local ? 1.0f : 1.0f + c.alpha * std::log(std::max((pos + 1.0f) / float(c.n_floor), 1.0f));
-        sconv_run(scratch, s_kraw, conv[visit][0], w.k_sconv, s_dynk, scratch, s_k, kvw, !w.local);
-        sconv_run(scratch, s_vraw, conv[visit][1], w.v_sconv, s_dynv, scratch, s_v, kvw, !w.local);
-        clip_run(s_q, w.q_clip, s_qc, c.heads, c.head_dim, c.clip_qk, tau, 0);
-        clip_run(s_r, w.r_clip, s_rc, c.heads, c.d_rel, c.clip_rel, tau, 0);
+        sconv_run(scratch, s_kraw, conv_off[visit][0], w.k_sconv, s_dynk, scratch, s_k, kvw, !w.local, M, kstr, kstr, kvw);
+        sconv_run(scratch, s_vraw, conv_off[visit][1], w.v_sconv, s_dynv, scratch, s_v, kvw, !w.local, M, kstr, kstr, kvw);
+        clip_run(s_q, w.q_clip, s_qc, c.heads, c.head_dim, c.clip_qk, pos0, w.local, q_stride, qdim, 0, M);
+        clip_run(s_r, w.r_clip, s_rc, c.heads, c.d_rel, c.clip_rel, pos0, w.local, q_stride, rdim, 0, M);
         together = false;
         [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
         together = true;
-        clip_kv_run(s_k, kcache[visit], c.kv_heads, c.head_dim, pos, kvw, 0, c.clip_qk);
-        clip_kv_run(s_v, vcache[visit], c.kv_heads, c.head_dim, pos, kvw, 1, 0.0f);
-        uint32_t dims[2] = {c.d_rel, c.rel_extent};
-        [enc setComputePipelineState:p_rel];
+        clip_kv_run(s_k, kcache[visit], c.kv_heads, c.head_dim, pos0, kvw, kvw, 0, c.clip_qk, M);
+        clip_kv_run(s_v, vcache[visit], c.kv_heads, c.head_dim, pos0, kvw, kvw, 1, 0.0f, M);
+        RelBP rbp{c.d_rel, c.rel_extent, c.heads};
+        [enc setComputePipelineState:p_rel_b];
         [enc setBuffer:scratch offset:s_rc atIndex:0];
         [enc setBuffer:file offset:w.rel_proj atIndex:1];
         [enc setBuffer:scratch offset:s_rel atIndex:2];
-        [enc setBytes:dims length:8 atIndex:3];
-        [enc dispatchThreadgroups:MTLSizeMake((c.rel_extent + 255) / 256, c.heads, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        [enc setBytes:&rbp length:sizeof(rbp) atIndex:3];
+        grid3((c.rel_extent + 255) / 256, c.heads, M, 256);
         together = false;
-        uint32_t start = w.local && pos + 1 > c.window ? pos + 1 - c.window : 0;
-        AttnP a{pos, start, c.kv_heads, c.heads / c.kv_heads, c.head_dim, c.rel_extent, 1.0f / std::sqrt(float(c.head_dim))};
-        [enc setComputePipelineState:p_attend];
-        [enc setBuffer:scratch offset:s_qc atIndex:0];
-        [enc setBuffer:kcache[visit] offset:0 atIndex:1];
-        [enc setBuffer:vcache[visit] offset:0 atIndex:2];
-        [enc setBuffer:scratch offset:s_rel atIndex:3];
-        [enc setBuffer:scratch offset:s_gate atIndex:4];
-        [enc setBuffer:scratch offset:s_sinks atIndex:5];
-        [enc setBuffer:scratch offset:s_gated atIndex:6];
-        [enc setBytes:&a length:sizeof(a) atIndex:7];
-        grid(c.heads, 128);
+        if (M == 1) {
+            uint32_t start = w.local && pos0 + 1 > c.window ? pos0 + 1 - c.window : 0;
+            AttnP a{pos0, start, c.kv_heads, c.heads / c.kv_heads, c.head_dim, c.rel_extent, 1.0f / std::sqrt(float(c.head_dim))};
+            [enc setComputePipelineState:p_attend];
+            [enc setBuffer:scratch offset:s_qc atIndex:0];
+            [enc setBuffer:kcache[visit] offset:0 atIndex:1];
+            [enc setBuffer:vcache[visit] offset:0 atIndex:2];
+            [enc setBuffer:scratch offset:s_rel atIndex:3];
+            [enc setBuffer:scratch offset:s_gate atIndex:4];
+            [enc setBuffer:scratch offset:s_sinks atIndex:5];
+            [enc setBuffer:scratch offset:s_gated atIndex:6];
+            [enc setBytes:&a length:sizeof(a) atIndex:7];
+            grid(c.heads, 128);
+        } else {
+            AttnBP a{pos0, M, c.window, w.local ? 1u : 0u, c.kv_heads, c.heads / c.kv_heads, c.head_dim, c.rel_extent, c.heads, qdim, q_stride, qdim + rdim, qdim * 2 + rdim, qdim, 1.0f / std::sqrt(float(c.head_dim))};
+            [enc setComputePipelineState:p_attend_b];
+            [enc setBuffer:scratch offset:s_qc atIndex:0];
+            [enc setBuffer:kcache[visit] offset:0 atIndex:1];
+            [enc setBuffer:vcache[visit] offset:0 atIndex:2];
+            [enc setBuffer:scratch offset:s_rel atIndex:3];
+            [enc setBuffer:scratch offset:s_qbundle atIndex:4];
+            [enc setBuffer:scratch offset:s_gated atIndex:5];
+            [enc setBytes:&a length:sizeof(a) atIndex:6];
+            grid2(c.heads, (M + 3) / 4, 128);
+        }
         uint32_t out = alloc();
-        if (bf12_ready) gemv12_ab(w.wo12, scratch, s_gated, arena, so(out));
-        else gemv_ab(w.wo, scratch, s_gated, arena, so(out));
+        if (bf12_ready) gemv12_m(w.wo12, scratch, s_gated, qdim, arena, so(out), H, M);
+        else gemv16_m(w.wo, scratch, s_gated, qdim, arena, so(out), H, M);
         return out;
     }
 
     struct RouteP { uint32_t experts, top; float scale; };
+    struct UnionPP { uint32_t rows, top, experts, w13_groups, w2_groups; };
     struct ExpertP { uint32_t rows, cols, in_stride, out_stride, per_row_input; uint32_t pad; uint64_t expert_bytes, scale_bytes; };
+    struct ExpertGP { uint32_t rows, cols, in_stride, out_stride, per_row_input, top; uint64_t expert_bytes, scale_bytes; };
     struct SwigluP { uint32_t inter, top; float gate_cap, up_cap; uint32_t round_out; };
 
-    void experts(const LayerWeights& w, uint32_t x) {
+    void experts(const LayerWeights& w, uint32_t x, uint32_t M) {
         uint32_t H = c.hidden, I = c.inter;
         [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
         together = true;
-        if (bf12_ready) gemv12_ab(w.router12, arena, so(x), scratch, s_router, false);
-        else gemv_ab(w.router, arena, so(x), scratch, s_router, false);
+        if (bf12_ready) gemv12_m(w.router12, arena, so(x), H, scratch, s_router, c.experts, M, false);
+        else gemv16_m(w.router, arena, so(x), H, scratch, s_router, c.experts, M, false);
         if (w.nvfp4) {
             [enc setComputePipelineState:p_qnv4];
             [enc setBuffer:arena offset:so(x) atIndex:0];
             [enc setBuffer:scratch offset:s_xq atIndex:1];
             [enc setBuffer:scratch offset:s_outer atIndex:2];
             [enc setBytes:&H length:4 atIndex:3];
-            grid(1, 160);
+            grid(M, 160);
         } else {
             [enc setComputePipelineState:p_qmxf8];
             [enc setBuffer:arena offset:so(x) atIndex:0];
             [enc setBuffer:scratch offset:s_xq atIndex:1];
             [enc setBytes:&H length:4 atIndex:2];
-            grid2((H / 32 + 63) / 64, 1, 64);
+            grid2((H / 32 + 63) / 64, M, 64);
         }
         together = false;
         RouteP rp{c.experts, c.top, c.route_scale};
-        [enc setComputePipelineState:p_route];
+        [enc setComputePipelineState:M == 1 ? p_route : p_route_b];
         [enc setBuffer:scratch offset:s_router atIndex:0];
         [enc setBuffer:file offset:w.router_bias atIndex:1];
         [enc setBuffer:scratch offset:s_ids atIndex:2];
         [enc setBuffer:scratch offset:s_gammas atIndex:3];
         [enc setBytes:&rp length:sizeof(rp) atIndex:4];
-        grid(1, 32);
+        grid(M, 32);
+        if (M > 1) {
+            UnionPP up{M, c.top, c.experts, (2 * I + 7) / 8, (H + 7) / 8};
+            [enc setComputePipelineState:p_union];
+            [enc setBuffer:scratch offset:s_ids atIndex:0];
+            [enc setBuffer:u_exp offset:0 atIndex:1];
+            [enc setBuffer:u_cnt offset:0 atIndex:2];
+            [enc setBuffer:u_pairs offset:0 atIndex:3];
+            [enc setBuffer:u_ind_w13 offset:0 atIndex:4];
+            [enc setBuffer:u_ind_w2 offset:0 atIndex:5];
+            [enc setBytes:&up length:sizeof(up) atIndex:6];
+            grid(1, 128);
+        }
         auto run_expert = [&](bool is_w2, uint32_t rows, uint32_t cols, uint64_t in_off, uint64_t outer_off, uint64_t out_off, bool per_row) {
-            ExpertP p{rows, cols, per_row ? I : 0u, per_row ? H : 2 * I, per_row ? 1u : 0u, 0, is_w2 ? w.w2_eb : w.w13_eb, is_w2 ? w.w2_sb : w.w13_sb};
-            [enc setComputePipelineState:w.nvfp4 ? p_env4 : p_emxf8];
-            [enc setBuffer:file offset:is_w2 ? w.w2_w : w.w13_w atIndex:0];
-            [enc setBuffer:file offset:is_w2 ? w.w2_s : w.w13_s atIndex:1];
-            if (w.nvfp4) {
-                [enc setBuffer:file offset:is_w2 ? w.w2_amax : w.w13_amax atIndex:2];
-                [enc setBuffer:file offset:is_w2 ? w.w2_denom : w.w13_denom atIndex:3];
-                [enc setBuffer:scratch offset:outer_off atIndex:5];
+            if (M == 1) {
+                ExpertP p{rows, cols, per_row ? I : 0u, per_row ? H : 2 * I, per_row ? 1u : 0u, 0, is_w2 ? w.w2_eb : w.w13_eb, is_w2 ? w.w2_sb : w.w13_sb};
+                [enc setComputePipelineState:w.nvfp4 ? p_env4 : p_emxf8];
+                [enc setBuffer:file offset:is_w2 ? w.w2_w : w.w13_w atIndex:0];
+                [enc setBuffer:file offset:is_w2 ? w.w2_s : w.w13_s atIndex:1];
+                if (w.nvfp4) {
+                    [enc setBuffer:file offset:is_w2 ? w.w2_amax : w.w13_amax atIndex:2];
+                    [enc setBuffer:file offset:is_w2 ? w.w2_denom : w.w13_denom atIndex:3];
+                    [enc setBuffer:scratch offset:outer_off atIndex:5];
+                }
+                [enc setBuffer:scratch offset:in_off atIndex:4];
+                [enc setBuffer:scratch offset:s_ids atIndex:6];
+                [enc setBuffer:scratch offset:out_off atIndex:7];
+                [enc setBytes:&p length:sizeof(p) atIndex:8];
+                grid2((rows + 7) / 8, c.top, 256);
+            } else {
+                ExpertGP p{rows, cols, per_row ? I : H, per_row ? H : 2 * I, per_row ? 1u : 0u, c.top, is_w2 ? w.w2_eb : w.w13_eb, is_w2 ? w.w2_sb : w.w13_sb};
+                [enc setComputePipelineState:w.nvfp4 ? p_env4_g : p_emxf8_g];
+                [enc setBuffer:file offset:is_w2 ? w.w2_w : w.w13_w atIndex:0];
+                [enc setBuffer:file offset:is_w2 ? w.w2_s : w.w13_s atIndex:1];
+                if (w.nvfp4) {
+                    [enc setBuffer:file offset:is_w2 ? w.w2_amax : w.w13_amax atIndex:2];
+                    [enc setBuffer:file offset:is_w2 ? w.w2_denom : w.w13_denom atIndex:3];
+                    [enc setBuffer:scratch offset:outer_off atIndex:5];
+                }
+                [enc setBuffer:scratch offset:in_off atIndex:4];
+                [enc setBuffer:u_exp offset:0 atIndex:6];
+                [enc setBuffer:u_cnt offset:0 atIndex:7];
+                [enc setBuffer:u_pairs offset:0 atIndex:8];
+                [enc setBuffer:scratch offset:out_off atIndex:9];
+                [enc setBytes:&p length:sizeof(p) atIndex:10];
+                barrier();
+                [enc dispatchThreadgroupsWithIndirectBuffer:(is_w2 ? u_ind_w2 : u_ind_w13) indirectBufferOffset:0 threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
             }
-            [enc setBuffer:scratch offset:in_off atIndex:4];
-            [enc setBuffer:scratch offset:s_ids atIndex:6];
-            [enc setBuffer:scratch offset:out_off atIndex:7];
-            [enc setBytes:&p length:sizeof(p) atIndex:8];
-            grid2((rows + 7) / 8, c.top, 256);
         };
         run_expert(false, 2 * I, H, s_xq, s_outer, s_gu, false);
+        uint32_t total_k = M * c.top;
         if (w.nvfp4) {
-            SwigluP sp{I, c.top, c.gate_cap, c.up_cap, 1u};
+            SwigluP sp{I, total_k, c.gate_cap, c.up_cap, 1u};
             [enc setComputePipelineState:p_swiglu_qnv4];
             [enc setBuffer:scratch offset:s_gu atIndex:0];
             [enc setBuffer:scratch offset:s_gammas atIndex:1];
             [enc setBuffer:scratch offset:s_hq atIndex:2];
             [enc setBuffer:scratch offset:s_houter atIndex:3];
             [enc setBytes:&sp length:sizeof(sp) atIndex:4];
-            grid(c.top, 128);
+            grid(total_k, 128);
         } else {
-            uint32_t n = c.top * 2 * I;
+            uint32_t n = total_k * 2 * I;
             [enc setComputePipelineState:p_round];
             [enc setBuffer:scratch offset:s_gu atIndex:0];
             [enc setBytes:&n length:4 atIndex:1];
             grid((n + 255) / 256, 256);
-            SwigluP sp{I, c.top, c.gate_cap, c.up_cap, 0u};
+            SwigluP sp{I, total_k, c.gate_cap, c.up_cap, 0u};
             [enc setComputePipelineState:p_swiglu];
             [enc setBuffer:scratch offset:s_gu atIndex:0];
             [enc setBuffer:scratch offset:s_gammas atIndex:1];
             [enc setBuffer:scratch offset:s_h atIndex:2];
             [enc setBytes:&sp length:sizeof(sp) atIndex:3];
-            grid2((I + 255) / 256, c.top, 256);
+            grid2((I + 255) / 256, total_k, 256);
             [enc setComputePipelineState:p_qmxf8];
             [enc setBuffer:scratch offset:s_h atIndex:0];
             [enc setBuffer:scratch offset:s_hq atIndex:1];
             [enc setBytes:&I length:4 atIndex:2];
-            grid2((I / 32 + 63) / 64, c.top, 64);
+            grid2((I / 32 + 63) / 64, total_k, 64);
         }
         run_expert(true, H, I, s_hq, s_houter, s_rows, true);
     }
 
-    struct CombineP { uint32_t n, top, boundary; };
+    struct CombineBP { uint32_t n, top, boundary, rows; };
+    struct TapCopyP { uint32_t n4, tap_idx; };
 
-    std::pair<std::vector<uint32_t>, uint32_t> layer(std::vector<uint32_t> blocks, uint32_t partial, uint32_t layer_idx, uint32_t pass, const std::vector<uint32_t>& bank, uint32_t pos) {
+    void copy_tap(uint32_t slot, uint32_t tap_idx, uint32_t M) {
+        TapCopyP tp{c.hidden / 4, tap_idx};
+        [enc setComputePipelineState:p_copy_tap];
+        [enc setBuffer:arena offset:so(slot) atIndex:0];
+        [enc setBuffer:tap_buf offset:0 atIndex:1];
+        [enc setBytes:&tp length:sizeof(tp) atIndex:2];
+        grid2((tp.n4 + 255) / 256, M, 256);
+    }
+
+    std::pair<std::vector<uint32_t>, uint32_t> layer(std::vector<uint32_t> blocks, uint32_t partial, uint32_t layer_idx, uint32_t pass, const std::vector<uint32_t>& bank, uint32_t pos0, uint32_t M, bool capture_taps) {
+        if (capture_taps) {
+            if (pass == 0 && layer_idx == 5) copy_tap(partial, 0, M);
+            else if (pass == 1 && layer_idx == 11) copy_tap(partial, 1, M);
+            else if (pass == 2 && layer_idx == 17) copy_tap(partial, 2, M);
+        }
         const LayerWeights& w = lw[layer_idx];
         uint32_t visit = pass == 0 ? layer_idx : c.layers + (pass - 1) * (c.core_end - c.core_start) + (layer_idx - c.core_start);
         uint32_t sq, sk, sv;
@@ -951,23 +1141,23 @@ public:
             src.push_back(partial);
             [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
             together = true;
-            auto streams = res(src, -1, q_attn_off[layer_idx], w.local ? 1 : 3);
-            auto messages = res(bank, -1, q_loop_attn_off[core_layer], 3);
+            auto streams = res(src, -1, q_attn_off[layer_idx], w.local ? 1 : 3, M);
+            auto messages = res(bank, -1, q_loop_attn_off[core_layer], 3, M);
             together = false;
             uint32_t dests[3] = {streams[0], w.local ? streams[0] : streams[1], w.local ? streams[0] : streams[2]};
             uint32_t msgs[3] = {messages[0], messages[1], messages[2]};
             uint64_t noffs[3] = {w.local ? w.attn_norm : w.q_norm, w.local ? w.attn_norm : w.k_norm, w.local ? w.attn_norm : w.v_norm};
-            auto norms = controllers_attn_norm(w, dests, msgs, noffs);
+            auto norms = controllers_attn_norm(w, dests, msgs, noffs, M);
             sq = norms[0]; sk = norms[1]; sv = norms[2];
         } else if (blocks.empty()) {
             if (w.local) {
-                sq = sk = sv = norm(partial, w.attn_norm);
+                sq = sk = sv = norm(partial, w.attn_norm, M);
             } else {
                 [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
                 together = true;
-                sq = norm(partial, w.q_norm);
-                sk = norm(partial, w.k_norm);
-                sv = norm(partial, w.v_norm);
+                sq = norm(partial, w.q_norm, M);
+                sk = norm(partial, w.k_norm, M);
+                sv = norm(partial, w.v_norm, M);
                 together = false;
             }
         } else {
@@ -975,16 +1165,16 @@ public:
             src.push_back(partial);
             if (w.local) {
                 uint64_t noffs[3] = {w.attn_norm, 0, 0};
-                sq = sk = sv = res(src, -1, q_attn_off[layer_idx], 1, noffs)[0];
+                sq = sk = sv = res(src, -1, q_attn_off[layer_idx], 1, M, noffs)[0];
             } else {
                 uint64_t noffs[3] = {w.q_norm, w.k_norm, w.v_norm};
-                auto norms = res(src, -1, q_attn_off[layer_idx], 3, noffs);
+                auto norms = res(src, -1, q_attn_off[layer_idx], 3, M, noffs);
                 sq = norms[0]; sk = norms[1]; sv = norms[2];
             }
         }
-        uint32_t att = attention(w, visit, sq, sk, sv, pos);
+        uint32_t att = attention(w, visit, sq, sk, sv, pos0, M);
         uint32_t attc = alloc();
-        sconv_run(arena, so(att), conv[visit][2], w.attn_sconv, s_dynk, arena, so(attc), c.hidden, false);
+        sconv_run(arena, so(att), conv_off[visit][2], w.attn_sconv, s_dynk, arena, so(attc), c.hidden, false, M, c.hidden, 0, c.hidden);
         bool boundary = layer_idx % c.block == 0;
         std::vector<uint32_t> src = blocks;
         src.push_back(partial);
@@ -994,23 +1184,23 @@ public:
         if (!bank.empty()) {
             [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
             together = true;
-            uint32_t mlp_in = res(src, mlp_addend, q_mlp_off[layer_idx], 1)[0];
-            uint32_t msg = res(bank, -1, q_loop_mlp_off[core_layer], 1)[0];
+            uint32_t mlp_in = res(src, mlp_addend, q_mlp_off[layer_idx], 1, M)[0];
+            uint32_t msg = res(bank, -1, q_loop_mlp_off[core_layer], 1, M)[0];
             together = false;
-            x = controller_mlp_norm(w, mlp_in, msg);
+            x = controller_mlp_norm(w, mlp_in, msg, M);
         } else {
             uint64_t noffs[3] = {w.mlp_norm, 0, 0};
-            x = res(src, mlp_addend, q_mlp_off[layer_idx], 1, noffs)[0];
+            x = res(src, mlp_addend, q_mlp_off[layer_idx], 1, M, noffs)[0];
         }
-        experts(w, x);
+        experts(w, x, M);
         uint32_t out = alloc();
-        CombineP cp{c.hidden, c.top, boundary ? 1u : 0u};
-        [enc setComputePipelineState:p_combine];
+        CombineBP cp{c.hidden, c.top, boundary ? 1u : 0u, M};
+        [enc setComputePipelineState:p_combine_b];
         [enc setBuffer:scratch offset:s_rows atIndex:0];
         [enc setBuffer:scratch offset:s_ids atIndex:1];
         [enc setBuffer:arena offset:so(attc) atIndex:2];
         [enc setBuffer:arena offset:so(partial) atIndex:3];
-        [enc setBuffer:conv[visit][3] offset:0 atIndex:4];
+        [enc setBuffer:conv_buf offset:conv_off[visit][3] atIndex:4];
         [enc setBuffer:file offset:w.mlp_sconv atIndex:5];
         [enc setBuffer:arena offset:so(out) atIndex:6];
         [enc setBytes:&cp length:sizeof(cp) atIndex:7];
@@ -1019,23 +1209,199 @@ public:
         return {blocks, out};
     }
 
-    double step(uint32_t tok, uint32_t pos, bool need_logits = true, bool full_logits = false) {
+    struct EmbedBP { uint32_t n, rows; };
+    struct CertHeadBP { uint32_t vocab, cols, ng, ntg, m_base; float cap; };
+
+    void run_head_single(uint64_t hidden_off, uint64_t tok_out_off, bool full_logits) {
+        uint32_t H = c.hidden;
+        if (cert_head_ready && !full_logits) {
+            uint32_t V = c.vocab;
+            uint32_t ng = c.hidden / 32;
+            uint32_t ntg = (V + 7) / 8;
+            CertHeadP chp{V, c.hidden, ng, c.softcap};
+            CertTauP ctp{ntg, c.hidden, c.softcap};
+            [enc setComputePipelineState:p_ch_xnorm];
+            [enc setBuffer:arena offset:hidden_off atIndex:0];
+            [enc setBuffer:ch_state offset:0 atIndex:1];
+            [enc setBuffer:ch_count offset:0 atIndex:2];
+            [enc setBytes:&H length:4 atIndex:3];
+            grid(1, 576);
+            [enc setComputePipelineState:p_ch_scan];
+            [enc setBuffer:head_q4 offset:0 atIndex:0];
+            [enc setBuffer:head_sc offset:0 atIndex:1];
+            [enc setBuffer:head_err offset:0 atIndex:2];
+            [enc setBuffer:arena offset:hidden_off atIndex:3];
+            [enc setBuffer:ch_state offset:0 atIndex:4];
+            [enc setBuffer:ch_ub offset:0 atIndex:5];
+            [enc setBuffer:ch_tg_val offset:0 atIndex:6];
+            [enc setBuffer:ch_tg_row offset:0 atIndex:7];
+            [enc setBytes:&chp length:sizeof(chp) atIndex:8];
+            grid(ntg, 256);
+            [enc setComputePipelineState:p_ch_tau];
+            [enc setBuffer:ch_tg_val offset:0 atIndex:0];
+            [enc setBuffer:ch_tg_row offset:0 atIndex:1];
+            [enc setBuffer:file offset:unembed_mat.offset atIndex:2];
+            [enc setBuffer:arena offset:hidden_off atIndex:3];
+            [enc setBuffer:ch_state offset:0 atIndex:4];
+            [enc setBytes:&ctp length:sizeof(ctp) atIndex:5];
+            grid(1, 512);
+            [enc setComputePipelineState:p_ch_filter];
+            [enc setBuffer:ch_ub offset:0 atIndex:0];
+            [enc setBuffer:ch_state offset:0 atIndex:1];
+            [enc setBuffer:ch_count offset:0 atIndex:2];
+            [enc setBuffer:ch_cands offset:0 atIndex:3];
+            [enc setBytes:&V length:4 atIndex:4];
+            grid((V + 255) / 256, 256);
+            [enc setComputePipelineState:p_ch_setup];
+            [enc setBuffer:ch_count offset:0 atIndex:0];
+            [enc setBuffer:ch_indirect offset:0 atIndex:1];
+            grid(1, 1);
+            [enc setComputePipelineState:p_ch_rescore];
+            [enc setBuffer:file offset:unembed_mat.offset atIndex:0];
+            [enc setBuffer:arena offset:hidden_off atIndex:1];
+            [enc setBuffer:ch_cands offset:0 atIndex:2];
+            [enc setBuffer:ch_count offset:0 atIndex:3];
+            [enc setBuffer:ch_tg_val offset:0 atIndex:4];
+            [enc setBuffer:ch_tg_row offset:0 atIndex:5];
+            [enc setBytes:&ctp length:sizeof(ctp) atIndex:6];
+            barrier();
+            [enc dispatchThreadgroupsWithIndirectBuffer:ch_indirect indirectBufferOffset:0 threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+            [enc setComputePipelineState:p_ch_argmax];
+            [enc setBuffer:ch_tg_val offset:0 atIndex:0];
+            [enc setBuffer:ch_tg_row offset:0 atIndex:1];
+            [enc setBuffer:ch_indirect offset:0 atIndex:2];
+            [enc setBuffer:token offset:tok_out_off atIndex:3];
+            grid(1, 256);
+        } else {
+            gemv_ab(unembed_mat, arena, hidden_off, logits, 0, true);
+            struct { uint32_t n, valid; float cap; } lp{c.padded_vocab, c.vocab, c.softcap};
+            [enc setComputePipelineState:p_softcap];
+            [enc setBuffer:logits offset:0 atIndex:0];
+            [enc setBytes:&lp length:sizeof(lp) atIndex:1];
+            grid((c.padded_vocab + 255) / 256, 256);
+            [enc setComputePipelineState:p_argmax];
+            [enc setBuffer:logits offset:0 atIndex:0];
+            [enc setBuffer:token offset:tok_out_off atIndex:1];
+            [enc setBytes:&c.padded_vocab length:4 atIndex:2];
+            grid(1, 1024);
+        }
+    }
+
+    void run_head_batch(uint32_t hidden, uint32_t M, LogitsMode lmode, bool full_logits) {
+        if (lmode == LOGITS_NONE) return;
+        uint32_t H = c.hidden;
+        if (lmode == LOGITS_LAST) {
+            run_head_single(so(hidden) + uint64_t(M - 1) * H * 4, 16 * 4, full_logits);
+            return;
+        }
+        if (M == 1 || full_logits || !cert_head_ready) {
+            for (uint32_t m = 0; m < M; ++m) {
+                run_head_single(so(hidden) + uint64_t(m) * H * 4, (16 + m) * 4, full_logits);
+            }
+            return;
+        }
+        uint32_t V = c.vocab;
+        uint32_t ng = c.hidden / 32;
+        uint32_t ntg = (V + 7) / 8;
+        CertTauP ctp{ntg, c.hidden, c.softcap};
+        [enc setComputePipelineState:p_ch_xnorm_b];
+        [enc setBuffer:arena offset:so(hidden) atIndex:0];
+        [enc setBuffer:ch_state offset:0 atIndex:1];
+        [enc setBuffer:ch_count offset:0 atIndex:2];
+        [enc setBytes:&H length:4 atIndex:3];
+        grid(M, 576);
+        for (uint32_t m0 = 0; m0 < M; m0 += 8) {
+            uint32_t mb = std::min<uint32_t>(8, M - m0);
+            CertHeadBP chb{V, c.hidden, ng, ntg, m0, c.softcap};
+            [enc setComputePipelineState:p_ch_scan_rows[mb]];
+            [enc setBuffer:head_q4 offset:0 atIndex:0];
+            [enc setBuffer:head_sc offset:0 atIndex:1];
+            [enc setBuffer:head_err offset:0 atIndex:2];
+            [enc setBuffer:arena offset:so(hidden) atIndex:3];
+            [enc setBuffer:ch_state offset:0 atIndex:4];
+            [enc setBuffer:ch_ub offset:0 atIndex:5];
+            [enc setBuffer:ch_tg_val offset:0 atIndex:6];
+            [enc setBuffer:ch_tg_row offset:0 atIndex:7];
+            [enc setBytes:&chb length:sizeof(chb) atIndex:8];
+            grid(ntg, 256);
+        }
+        [enc setComputePipelineState:p_ch_tau_b];
+        [enc setBuffer:ch_tg_val offset:0 atIndex:0];
+        [enc setBuffer:ch_tg_row offset:0 atIndex:1];
+        [enc setBuffer:file offset:unembed_mat.offset atIndex:2];
+        [enc setBuffer:arena offset:so(hidden) atIndex:3];
+        [enc setBuffer:ch_state offset:0 atIndex:4];
+        [enc setBytes:&ctp length:sizeof(ctp) atIndex:5];
+        grid(M, 512);
+        [enc setComputePipelineState:p_ch_filter_b];
+        [enc setBuffer:ch_ub offset:0 atIndex:0];
+        [enc setBuffer:ch_state offset:0 atIndex:1];
+        [enc setBuffer:ch_count offset:0 atIndex:2];
+        [enc setBuffer:ch_cands offset:0 atIndex:3];
+        [enc setBytes:&V length:4 atIndex:4];
+        grid2((V + 255) / 256, M, 256);
+        [enc setComputePipelineState:p_ch_setup_b];
+        [enc setBuffer:ch_count offset:0 atIndex:0];
+        [enc setBuffer:ch_indirect offset:0 atIndex:1];
+        grid(M, 1);
+        [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+        together = true;
+        [enc setComputePipelineState:p_ch_rescore];
+        for (uint32_t m = 0; m < M; ++m) {
+            [enc setBuffer:file offset:unembed_mat.offset atIndex:0];
+            [enc setBuffer:arena offset:so(hidden) + uint64_t(m) * H * 4 atIndex:1];
+            [enc setBuffer:ch_cands offset:uint64_t(m) * V * 4 atIndex:2];
+            [enc setBuffer:ch_count offset:uint64_t(m) * 4 atIndex:3];
+            [enc setBuffer:ch_tg_val offset:uint64_t(m) * ntg * 4 atIndex:4];
+            [enc setBuffer:ch_tg_row offset:uint64_t(m) * ntg * 4 atIndex:5];
+            [enc setBytes:&ctp length:sizeof(ctp) atIndex:6];
+            [enc dispatchThreadgroupsWithIndirectBuffer:ch_indirect indirectBufferOffset:uint64_t(m) * 16 threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        }
+        together = false;
+        [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+        together = true;
+        [enc setComputePipelineState:p_ch_argmax];
+        for (uint32_t m = 0; m < M; ++m) {
+            [enc setBuffer:ch_tg_val offset:uint64_t(m) * ntg * 4 atIndex:0];
+            [enc setBuffer:ch_tg_row offset:uint64_t(m) * ntg * 4 atIndex:1];
+            [enc setBuffer:ch_indirect offset:uint64_t(m) * 16 atIndex:2];
+            [enc setBuffer:token offset:uint64_t(16 + m) * 4 atIndex:3];
+            grid(1, 256);
+        }
+        together = false;
+    }
+
+    double step_rows(const uint32_t* toks, uint32_t pos0, uint32_t M, LogitsMode lmode, bool auto_commit = true, bool full_logits = false, bool capture_taps = false) {
         next_slot = 0;
-        *static_cast<uint32_t*>(token.contents) = tok;
+        std::memcpy(token.contents, toks, M * 4);
         id<MTLCommandBuffer> cb = [gpu.queue commandBuffer];
         enc = [cb computeCommandEncoderWithDispatchType:MTLDispatchTypeConcurrent];
+        if (pending_conv_commit > 0) {
+            conv_commit_encode(pending_conv_commit);
+            pending_conv_commit = 0;
+        }
         uint32_t emb = alloc();
         uint32_t H = c.hidden;
-        [enc setComputePipelineState:p_embed];
-        [enc setBuffer:file offset:embed_off atIndex:0];
-        [enc setBuffer:token offset:0 atIndex:1];
-        [enc setBuffer:arena offset:so(emb) atIndex:2];
-        [enc setBytes:&H length:4 atIndex:3];
-        grid((H + 255) / 256, 256);
-        uint32_t x = norm(emb, embed_norm_off);
+        if (M == 1) {
+            [enc setComputePipelineState:p_embed];
+            [enc setBuffer:file offset:embed_off atIndex:0];
+            [enc setBuffer:token offset:0 atIndex:1];
+            [enc setBuffer:arena offset:so(emb) atIndex:2];
+            [enc setBytes:&H length:4 atIndex:3];
+            grid((H + 255) / 256, 256);
+        } else {
+            EmbedBP ep{H, M};
+            [enc setComputePipelineState:p_embed_b];
+            [enc setBuffer:file offset:embed_off atIndex:0];
+            [enc setBuffer:token offset:0 atIndex:1];
+            [enc setBuffer:arena offset:so(emb) atIndex:2];
+            [enc setBytes:&ep length:sizeof(ep) atIndex:3];
+            grid2((H + 255) / 256, M, 256);
+        }
+        uint32_t x = norm(emb, embed_norm_off, M);
         std::vector<uint32_t> blocks;
         uint32_t partial = x;
-        for (uint32_t l = 0; l < c.core_start; ++l) std::tie(blocks, partial) = layer(blocks, partial, l, 0, {}, pos);
+        for (uint32_t l = 0; l < c.core_start; ++l) std::tie(blocks, partial) = layer(blocks, partial, l, 0, {}, pos0, M, capture_taps);
         auto prelude_blocks = blocks;
         uint32_t prelude_partial = partial;
         std::vector<uint32_t> bank;
@@ -1046,99 +1412,39 @@ public:
                 blocks = prelude_blocks;
                 partial = prelude_partial;
             }
-            for (uint32_t l = c.core_start; l < c.core_end; ++l) std::tie(blocks, partial) = layer(blocks, partial, l, pass, bank, pos);
+            for (uint32_t l = c.core_start; l < c.core_end; ++l) std::tie(blocks, partial) = layer(blocks, partial, l, pass, bank, pos0, M, capture_taps);
         }
-        for (uint32_t l = c.core_end; l < c.layers; ++l) std::tie(blocks, partial) = layer(blocks, partial, l, 0, {}, pos);
-        if (need_logits) {
+        for (uint32_t l = c.core_end; l < c.layers; ++l) std::tie(blocks, partial) = layer(blocks, partial, l, 0, {}, pos0, M, capture_taps);
+        if (lmode != LOGITS_NONE || capture_taps) {
             std::vector<uint32_t> src = blocks;
             src.push_back(partial);
             uint64_t final_noffs[3] = {final_norm_off, 0, 0};
-            uint32_t hidden = res(src, -1, q_output_off, 1, final_noffs)[0];
-            if (cert_head_ready && !full_logits) {
-                uint32_t V = c.vocab;
-                uint32_t ng = c.hidden / 32;
-                uint32_t ntg = (V + 7) / 8;
-                CertHeadP chp{V, c.hidden, ng, c.softcap};
-                CertTauP ctp{ntg, c.hidden, c.softcap};
-                [enc setComputePipelineState:p_ch_xnorm];
-                [enc setBuffer:arena offset:so(hidden) atIndex:0];
-                [enc setBuffer:ch_state offset:0 atIndex:1];
-                [enc setBuffer:ch_count offset:0 atIndex:2];
-                [enc setBytes:&H length:4 atIndex:3];
-                grid(1, 576);
-                [enc setComputePipelineState:p_ch_scan];
-                [enc setBuffer:head_q4 offset:0 atIndex:0];
-                [enc setBuffer:head_sc offset:0 atIndex:1];
-                [enc setBuffer:head_err offset:0 atIndex:2];
-                [enc setBuffer:arena offset:so(hidden) atIndex:3];
-                [enc setBuffer:ch_state offset:0 atIndex:4];
-                [enc setBuffer:ch_ub offset:0 atIndex:5];
-                [enc setBuffer:ch_tg_val offset:0 atIndex:6];
-                [enc setBuffer:ch_tg_row offset:0 atIndex:7];
-                [enc setBytes:&chp length:sizeof(chp) atIndex:8];
-                grid(ntg, 256);
-                [enc setComputePipelineState:p_ch_tau];
-                [enc setBuffer:ch_tg_val offset:0 atIndex:0];
-                [enc setBuffer:ch_tg_row offset:0 atIndex:1];
-                [enc setBuffer:file offset:unembed_mat.offset atIndex:2];
-                [enc setBuffer:arena offset:so(hidden) atIndex:3];
-                [enc setBuffer:ch_state offset:0 atIndex:4];
-                [enc setBytes:&ctp length:sizeof(ctp) atIndex:5];
-                grid(1, 512);
-                [enc setComputePipelineState:p_ch_filter];
-                [enc setBuffer:ch_ub offset:0 atIndex:0];
-                [enc setBuffer:ch_state offset:0 atIndex:1];
-                [enc setBuffer:ch_count offset:0 atIndex:2];
-                [enc setBuffer:ch_cands offset:0 atIndex:3];
-                [enc setBytes:&V length:4 atIndex:4];
-                grid((V + 255) / 256, 256);
-                [enc setComputePipelineState:p_ch_setup];
-                [enc setBuffer:ch_count offset:0 atIndex:0];
-                [enc setBuffer:ch_indirect offset:0 atIndex:1];
-                grid(1, 1);
-                [enc setComputePipelineState:p_ch_rescore];
-                [enc setBuffer:file offset:unembed_mat.offset atIndex:0];
-                [enc setBuffer:arena offset:so(hidden) atIndex:1];
-                [enc setBuffer:ch_cands offset:0 atIndex:2];
-                [enc setBuffer:ch_count offset:0 atIndex:3];
-                [enc setBuffer:ch_tg_val offset:0 atIndex:4];
-                [enc setBuffer:ch_tg_row offset:0 atIndex:5];
-                [enc setBytes:&ctp length:sizeof(ctp) atIndex:6];
-                barrier();
-                [enc dispatchThreadgroupsWithIndirectBuffer:ch_indirect indirectBufferOffset:0 threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
-                [enc setComputePipelineState:p_ch_argmax];
-                [enc setBuffer:ch_tg_val offset:0 atIndex:0];
-                [enc setBuffer:ch_tg_row offset:0 atIndex:1];
-                [enc setBuffer:ch_indirect offset:0 atIndex:2];
-                [enc setBuffer:token offset:4 atIndex:3];
-                grid(1, 256);
-            } else {
-                gemv_ab(unembed_mat, arena, so(hidden), logits, 0, true);
-                struct { uint32_t n, valid; float cap; } lp{c.padded_vocab, c.vocab, c.softcap};
-                [enc setComputePipelineState:p_softcap];
-                [enc setBuffer:logits offset:0 atIndex:0];
-                [enc setBytes:&lp length:sizeof(lp) atIndex:1];
-                grid((c.padded_vocab + 255) / 256, 256);
-                [enc setComputePipelineState:p_argmax];
-                [enc setBuffer:logits offset:0 atIndex:0];
-                [enc setBuffer:token offset:4 atIndex:1];
-                [enc setBytes:&c.padded_vocab length:4 atIndex:2];
-                grid(1, 1024);
-            }
+            uint32_t hidden = res(src, -1, q_output_off, 1, M, final_noffs)[0];
+            if (capture_taps) copy_tap(hidden, 3, M);
+            run_head_batch(hidden, M, lmode, full_logits);
         }
+        if (auto_commit) conv_commit_encode(M);
         [enc endEncoding];
         double seconds = gpu_seconds(cb);
         if (next_slot > slots) { std::fprintf(stderr, "delphi: arena overflow %u\n", next_slot); std::exit(3); }
         return seconds;
     }
 
-    void reset_state() {
-        for (auto& arr : conv) {
-            for (int s = 0; s < 4; ++s) std::memset(arr[s].contents, 0, arr[s].length);
-        }
+    double step(uint32_t tok, uint32_t pos, bool need_logits = true, bool full_logits = false) {
+        return step_rows(&tok, pos, 1, need_logits ? LOGITS_ALL : LOGITS_NONE, true, full_logits, false);
     }
 
-    uint32_t chosen() const { return static_cast<const uint32_t*>(token.contents)[1]; }
+    void reset_state() {
+        pending_conv_commit = 0;
+        id<MTLCommandBuffer> cb = [gpu.queue commandBuffer];
+        id<MTLBlitCommandEncoder> blit = [cb blitCommandEncoder];
+        [blit fillBuffer:conv_buf range:NSMakeRange(0, conv_buf.length) value:0];
+        [blit endEncoding];
+        gpu_seconds(cb);
+    }
+
+    uint32_t chosen_at(uint32_t m) const { return static_cast<const uint32_t*>(token.contents)[16 + m]; }
+    uint32_t chosen() const { return chosen_at(0); }
 
     std::vector<std::pair<float, uint32_t>> top5() const {
         const float* l = static_cast<const float*>(logits.contents);
@@ -1182,11 +1488,146 @@ std::optional<std::vector<uint32_t>> parse_ids(const std::string& text, std::str
     return ids;
 }
 
+std::vector<uint32_t> lookup_draft(const std::vector<uint32_t>& history, uint32_t max_k) {
+    if (max_k == 0 || history.size() < 6) return {};
+    size_t L = history.size();
+    size_t best_end = 0;
+    size_t best_len = 0;
+    size_t scan_start = L > 16384 ? L - 16384 : 0;
+    uint32_t last = history[L - 1];
+    for (size_t i = L - 2; i > scan_start; --i) {
+        if (history[i] != last) continue;
+        size_t len = 1;
+        while (len < 32 && len <= i && history[i - len] == history[L - 1 - len]) ++len;
+        if (len >= 5 && len > best_len) {
+            best_len = len;
+            best_end = i;
+            if (best_len >= 12) break;
+        }
+    }
+    if (best_len < 5) return {};
+    uint32_t cap = best_len >= 8 ? 15u : (best_len >= 6 ? 11u : 7u);
+    uint32_t k = std::min<uint32_t>(max_k, cap);
+    std::vector<uint32_t> out;
+    out.reserve(k);
+    for (uint32_t j = 1; j <= k && best_end + j < L; ++j) out.push_back(history[best_end + j]);
+    return out;
+}
+
+struct DecodeStats {
+    std::vector<uint32_t> out;
+    double prefill_wall = 0;
+    double decode_wall = 0;
+    double decode_gpu = 0;
+    uint64_t verify_steps = 0;
+    uint64_t spec_tokens = 0;
+};
+
+DecodeStats run_decode_pass(Engine& engine, const std::vector<uint32_t>& ids, uint64_t steps, const std::string& spec, bool logprobs, std::string* steps_json) {
+    DecodeStats st;
+    engine.reset_state();
+    bool use_batch_prefill = (spec != "off") && !logprobs;
+    uint32_t pos = 0;
+    auto w0 = std::chrono::steady_clock::now();
+    if (use_batch_prefill && ids.size() > 1) {
+        for (size_t i = 0; i < ids.size(); ) {
+            uint32_t chunk = uint32_t(std::min<size_t>(8, ids.size() - i));
+            bool is_last = (i + chunk == ids.size());
+            engine.step_rows(ids.data() + i, pos, chunk, is_last ? Engine::LOGITS_LAST : Engine::LOGITS_NONE, true, logprobs, false);
+            pos += chunk;
+            i += chunk;
+        }
+    } else {
+        for (size_t i = 0; i < ids.size(); ++i) {
+            engine.step(ids[i], pos++, i + 1 == ids.size(), logprobs);
+        }
+    }
+    auto w1 = std::chrono::steady_clock::now();
+    st.out.reserve(steps);
+    std::vector<uint32_t> history = ids;
+    history.reserve(ids.size() + steps);
+    uint32_t anchor = engine.chosen();
+    st.out.push_back(anchor);
+    history.push_back(anchor);
+    if (logprobs && steps_json) {
+        auto top = engine.top5();
+        std::ostringstream s;
+        s << "{\"id\":" << anchor << ",\"top\":[";
+        for (size_t k = 0; k < top.size(); ++k) s << (k ? "," : "") << "[" << top[k].first << "," << top[k].second << "]";
+        s << "]}";
+        *steps_json += s.str();
+    }
+    bool use_spec = (spec != "off") && !logprobs;
+    while (st.out.size() < steps) {
+        uint64_t rem = steps - st.out.size();
+        uint32_t ctx_room = pos < engine.max_context ? engine.max_context - pos : 0;
+        if (ctx_room == 0) break;
+        std::vector<uint32_t> draft;
+        if (use_spec && rem > 1 && ctx_room > 1) {
+            uint32_t max_k = uint32_t(std::min<uint64_t>({uint64_t(Engine::MAX_BATCH - 1), rem - 1, uint64_t(ctx_room - 1)}));
+            if (spec == "lookup" || spec == "auto") draft = lookup_draft(history, max_k);
+        }
+        if (draft.empty()) {
+            st.decode_gpu += engine.step(anchor, pos++, true, logprobs);
+            st.verify_steps++;
+            anchor = engine.chosen();
+            st.out.push_back(anchor);
+            history.push_back(anchor);
+            st.spec_tokens++;
+            if (logprobs && steps_json) {
+                auto top = engine.top5();
+                std::ostringstream s;
+                s << ",{\"id\":" << anchor << ",\"top\":[";
+                for (size_t k = 0; k < top.size(); ++k) s << (k ? "," : "") << "[" << top[k].first << "," << top[k].second << "]";
+                s << "]}";
+                *steps_json += s.str();
+            }
+        } else {
+            uint32_t K = uint32_t(draft.size());
+            uint32_t M = K + 1;
+            std::array<uint32_t, Engine::MAX_BATCH> batch{};
+            batch[0] = anchor;
+            for (uint32_t j = 0; j < K; ++j) batch[1 + j] = draft[j];
+            st.decode_gpu += engine.step_rows(batch.data(), pos, M, Engine::LOGITS_ALL, false, false, false);
+            st.verify_steps++;
+            uint32_t accepted = 0;
+            uint32_t next_tok = 0;
+            for (uint32_t j = 0; j < K; ++j) {
+                uint32_t v = engine.chosen_at(j);
+                if (v == draft[j]) {
+                    accepted++;
+                    st.out.push_back(v);
+                    history.push_back(v);
+                } else {
+                    next_tok = v;
+                    st.out.push_back(next_tok);
+                    history.push_back(next_tok);
+                    break;
+                }
+            }
+            if (accepted == K) {
+                next_tok = engine.chosen_at(K);
+                st.out.push_back(next_tok);
+                history.push_back(next_tok);
+            }
+            uint32_t commit = accepted + 1;
+            pos += commit;
+            engine.pending_conv_commit = commit;
+            anchor = next_tok;
+            st.spec_tokens += commit;
+        }
+    }
+    auto w2 = std::chrono::steady_clock::now();
+    st.prefill_wall = std::chrono::duration<double>(w1 - w0).count();
+    st.decode_wall = std::chrono::duration<double>(w2 - w1).count();
+    return st;
+}
+
 }
 
 int generate_command(int argc, char** argv) {
     std::string error;
-    auto flags = parse_flags(argc, argv, {"--model", "--input-ids", "--steps", "--head", "--pack"}, {"--logprobs"}, error);
+    auto flags = parse_flags(argc, argv, {"--model", "--input-ids", "--steps", "--head", "--pack", "--spec"}, {"--logprobs"}, error);
     if (!flags) return refuse(error);
     auto steps = whole_flag(*flags, "--steps", 8, 1, 4000, error);
     if (!steps) return refuse(error);
@@ -1194,6 +1635,8 @@ int generate_command(int argc, char** argv) {
     if (head != "exact" && head != "full") return refuse("--head must be exact or full");
     std::string pack = flags->values.count("--pack") ? flags->values["--pack"] : "bf12";
     if (pack != "bf12" && pack != "off") return refuse("--pack must be bf12 or off");
+    std::string spec = flags->values.count("--spec") ? flags->values["--spec"] : "auto";
+    if (spec != "off" && spec != "lookup" && spec != "mtp" && spec != "auto") return refuse("--spec must be off, lookup, mtp, or auto");
     if (!flags->values.count("--model") || !flags->values.count("--input-ids")) return refuse("generate needs --model DIR and --input-ids JSON");
     auto ids_opt = parse_ids(flags->values["--input-ids"], error);
     if (!ids_opt) return refuse(error);
@@ -1213,40 +1656,22 @@ int generate_command(int argc, char** argv) {
     for (uint32_t id : ids) {
         if (id >= embed_rows) return refuse("input token id out of embedding range");
     }
-    uint32_t pos = 0;
-    auto wall0 = std::chrono::steady_clock::now();
-    for (size_t i = 0; i < ids.size(); ++i) engine.step(ids[i], pos++, i + 1 == ids.size(), logprobs);
-    auto wall1 = std::chrono::steady_clock::now();
-    std::vector<uint32_t> out;
     std::string steps_json;
-    double decode_gpu = 0;
-    for (uint64_t i = 0; i < *steps; ++i) {
-        uint32_t next = engine.chosen();
-        out.push_back(next);
-        if (logprobs) {
-            auto top = engine.top5();
-            std::ostringstream s;
-            s << (i ? "," : "") << "{\"id\":" << next << ",\"top\":[";
-            for (size_t k = 0; k < top.size(); ++k) s << (k ? "," : "") << "[" << top[k].first << "," << top[k].second << "]";
-            s << "]}";
-            steps_json += s.str();
-        }
-        if (i + 1 < *steps) decode_gpu += engine.step(next, pos++, true, logprobs);
-    }
-    auto wall2 = std::chrono::steady_clock::now();
-    double prefill_wall = std::chrono::duration<double>(wall1 - wall0).count();
-    double decode_wall = std::chrono::duration<double>(wall2 - wall1).count();
+    DecodeStats st = run_decode_pass(engine, ids, *steps, spec, logprobs, &steps_json);
+    double dec_toks = *steps > 1 ? double(*steps - 1) : 0.0;
+    double acc_per_step = st.verify_steps ? double(st.spec_tokens) / double(st.verify_steps) : 1.0;
     std::printf("{\"output_ids\": [");
-    for (size_t i = 0; i < out.size(); ++i) std::printf(i ? ", %u" : "%u", out[i]);
-    std::printf("], \"prompt_tokens\": %zu, \"prefill_tokens_per_s\": %.3f, \"decode_tokens_per_s\": %.3f, \"decode_gpu_tokens_per_s\": %.3f%s%s%s}\n",
-                ids.size(), ids.size() / prefill_wall, *steps > 1 ? (*steps - 1) / decode_wall : 0.0, *steps > 1 ? (*steps - 1) / decode_gpu : 0.0,
+    for (size_t i = 0; i < st.out.size(); ++i) std::printf(i ? ", %u" : "%u", st.out[i]);
+    std::printf("], \"prompt_tokens\": %zu, \"prefill_tokens_per_s\": %.3f, \"decode_tokens_per_s\": %.3f, \"decode_gpu_tokens_per_s\": %.3f, \"verify_steps\": %llu, \"accepted_per_step\": %.3f%s%s%s}\n",
+                ids.size(), ids.size() / st.prefill_wall, dec_toks / st.decode_wall, st.decode_gpu > 0 ? dec_toks / st.decode_gpu : 0.0,
+                static_cast<unsigned long long>(st.verify_steps), acc_per_step,
                 logprobs ? ", \"steps\": [" : "", steps_json.c_str(), logprobs ? "]" : "");
     return 0;
 }
 
 int bench_command(int argc, char** argv) {
     std::string error;
-    auto flags = parse_flags(argc, argv, {"--model", "--input-ids", "--steps", "--repeats", "--warmup", "--head", "--pack"}, {}, error);
+    auto flags = parse_flags(argc, argv, {"--model", "--input-ids", "--steps", "--repeats", "--warmup", "--head", "--pack", "--spec"}, {}, error);
     if (!flags) return refuse(error);
     auto steps = whole_flag(*flags, "--steps", 64, 2, 4000, error);
     auto repeats = steps ? whole_flag(*flags, "--repeats", 6, 1, 100, error) : std::nullopt;
@@ -1256,6 +1681,8 @@ int bench_command(int argc, char** argv) {
     if (head != "exact" && head != "full") return refuse("--head must be exact or full");
     std::string pack = flags->values.count("--pack") ? flags->values["--pack"] : "bf12";
     if (pack != "bf12" && pack != "off") return refuse("--pack must be bf12 or off");
+    std::string spec = flags->values.count("--spec") ? flags->values["--spec"] : "auto";
+    if (spec != "off" && spec != "lookup" && spec != "mtp" && spec != "auto") return refuse("--spec must be off, lookup, mtp, or auto");
     if (!flags->values.count("--model") || !flags->values.count("--input-ids")) return refuse("bench needs --model DIR and --input-ids JSON");
     auto ids_opt = parse_ids(flags->values["--input-ids"], error);
     if (!ids_opt) return refuse(error);
@@ -1275,40 +1702,30 @@ int bench_command(int argc, char** argv) {
     }
     std::vector<double> wall_tps, gpu_tps, prefill_tps, gpu_ms_tok;
     std::vector<uint32_t> ref_out;
+    uint64_t ref_vsteps = 0;
+    double ref_acc = 1.0;
     for (uint64_t r = 0; r < *warmup + *repeats; ++r) {
-        engine.reset_state();
-        uint32_t pos = 0;
-        auto w0 = std::chrono::steady_clock::now();
-        for (size_t i = 0; i < ids.size(); ++i) engine.step(ids[i], pos++, i + 1 == ids.size(), false);
-        auto w1 = std::chrono::steady_clock::now();
-        std::vector<uint32_t> out;
-        out.reserve(*steps);
-        double dgpu = 0;
-        for (uint64_t i = 0; i < *steps; ++i) {
-            uint32_t next = engine.chosen();
-            out.push_back(next);
-            if (i + 1 < *steps) dgpu += engine.step(next, pos++, true, false);
-        }
-        auto w2 = std::chrono::steady_clock::now();
+        DecodeStats st = run_decode_pass(engine, ids, *steps, spec, false, nullptr);
         if (ref_out.empty()) {
-            ref_out = out;
-        } else if (out != ref_out) {
+            ref_out = st.out;
+            ref_vsteps = st.verify_steps;
+            ref_acc = st.verify_steps ? double(st.spec_tokens) / double(st.verify_steps) : 1.0;
+        } else if (st.out != ref_out) {
             std::fprintf(stderr, "delphi: bench output changed between passes\n");
             return 3;
         }
         if (r >= *warmup) {
-            double pw = std::chrono::duration<double>(w1 - w0).count();
-            double dw = std::chrono::duration<double>(w2 - w1).count();
-            prefill_tps.push_back(ids.size() / pw);
-            wall_tps.push_back((*steps - 1) / dw);
-            gpu_tps.push_back((*steps - 1) / dgpu);
-            gpu_ms_tok.push_back(dgpu * 1000.0 / (*steps - 1));
+            double toks = double(*steps - 1);
+            prefill_tps.push_back(ids.size() / st.prefill_wall);
+            wall_tps.push_back(toks / st.decode_wall);
+            gpu_tps.push_back(toks / st.decode_gpu);
+            gpu_ms_tok.push_back(st.decode_gpu * 1000.0 / toks);
         }
     }
     std::string hash = hex64(fnv1a(ref_out.data(), ref_out.size() * sizeof(uint32_t)));
-    std::printf("{\"prompt_tokens\": %zu, \"steps\": %llu, \"repeats\": %llu, \"output_hash\": \"%s\", \"prefill_tokens_per_s_median\": %.3f, \"decode_tokens_per_s_median\": %.3f, \"decode_gpu_tokens_per_s_median\": %.3f, \"gpu_ms_per_token_median\": %.3f, \"decode_gpu_runs\": [",
+    std::printf("{\"prompt_tokens\": %zu, \"steps\": %llu, \"repeats\": %llu, \"output_hash\": \"%s\", \"verify_steps\": %llu, \"accepted_per_step\": %.3f, \"prefill_tokens_per_s_median\": %.3f, \"decode_tokens_per_s_median\": %.3f, \"decode_gpu_tokens_per_s_median\": %.3f, \"gpu_ms_per_token_median\": %.3f, \"decode_gpu_runs\": [",
                 ids.size(), static_cast<unsigned long long>(*steps), static_cast<unsigned long long>(*repeats), hash.c_str(),
-                median(prefill_tps), median(wall_tps), median(gpu_tps), median(gpu_ms_tok));
+                static_cast<unsigned long long>(ref_vsteps), ref_acc, median(prefill_tps), median(wall_tps), median(gpu_tps), median(gpu_ms_tok));
     for (size_t i = 0; i < gpu_tps.size(); ++i) std::printf(i ? ", %.3f" : "%.3f", gpu_tps[i]);
     std::printf("], \"output_ids\": [");
     for (size_t i = 0; i < ref_out.size(); ++i) std::printf(i ? ", %u" : "%u", ref_out[i]);

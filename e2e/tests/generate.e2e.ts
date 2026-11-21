@@ -104,6 +104,26 @@ test('delphi bench refuses missing model or invalid repeat counts', { timeout: 3
     const okPack = spawnSync(bin, ['generate', '--model', '/nonexistent', '--input-ids', '[1]', '--pack', 'bf12'], { encoding: 'utf8', timeout: remainingMs(deadline) });
     if (okPack.error) throw okPack.error;
     expect(okPack.status).toBe(3);
+    const badSpec = spawnSync(bin, ['generate', '--model', '/nonexistent', '--input-ids', '[1]', '--spec', 'bogus'], { encoding: 'utf8', timeout: remainingMs(deadline) });
+    if (badSpec.error) throw badSpec.error;
+    expect(badSpec.status).toBe(2);
+    expect(badSpec.stderr).toContain('--spec');
+    const okSpec = spawnSync(bin, ['generate', '--model', '/nonexistent', '--input-ids', '[1]', '--spec', 'auto'], { encoding: 'utf8', timeout: remainingMs(deadline) });
+    if (okSpec.error) throw okSpec.error;
+    expect(okSpec.status).toBe(3);
+  });
+});
+
+test('delphi generate batched prefill and speculative verify match --spec off token-for-token', { tags: ['model'], timeout: 900_000 }, () => {
+  const deadline = Date.now() + 900_000;
+  withBuiltDelphi(deadline, (bin) => {
+    for (const c of [fibonacci, truth.cases[2]]) {
+      const offRun = spawnSync(bin, ['generate', '--model', model, '--input-ids', JSON.stringify(c.input_ids), '--steps', '64', '--spec', 'off'], { encoding: 'utf8', timeout: remainingMs(deadline) });
+      checkRun('delphi generate --spec off', offRun);
+      const specRun = spawnSync(bin, ['generate', '--model', model, '--input-ids', JSON.stringify(c.input_ids), '--steps', '64', '--spec', 'auto'], { encoding: 'utf8', timeout: remainingMs(deadline) });
+      checkRun('delphi generate --spec auto', specRun);
+      expect((JSON.parse(specRun.stdout) as Generated).output_ids).toEqual((JSON.parse(offRun.stdout) as Generated).output_ids);
+    }
   });
 });
 
