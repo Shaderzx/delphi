@@ -1,0 +1,44 @@
+#!/usr/bin/env bash
+set -euo pipefail
+cd "$(dirname "$0")/.."
+mode="${1:---fast}"
+stage=""
+repro=""
+trap 'status=$?; if [ "$status" -ne 0 ]; then echo "ci verify: FAIL at $stage; reproduce with: $repro"; fi' EXIT
+
+stage() {
+  stage="$1"
+  repro="$2"
+  shift 2
+  echo "ci/verify: $stage"
+  "$@"
+}
+
+required_files() {
+  for f in LICENSE NOTICE README.md CITATION.cff docs/PLAN.md .coderabbit.yaml; do
+    test -s "$f" || { echo "missing $f"; return 1; }
+  done
+  grep -q "Apache License" LICENSE
+  grep -q "Shaderzx/delphi" NOTICE
+}
+
+relative_links() {
+  local broken=0
+  while IFS= read -r md; do
+    while IFS= read -r target; do
+      local path="${target%%#*}"
+      [ -z "$path" ] && continue
+      [ -e "$(dirname "$md")/$path" ] || { echo "$md -> $target"; broken=1; }
+    done < <(grep -oE '\]\([^)]+\)' "$md" | sed -E 's/^\]\((.*)\)$/\1/' | grep -vE '^(https?:|mailto:|#)')
+  done < <(git ls-files '*.md')
+  return "$broken"
+}
+
+stage required-files "ci/verify --fast" required_files
+stage relative-links "ci/verify --fast" relative_links
+stage=""
+done_stages="required-files,relative-links"
+if [ "$mode" = "--full" ]; then
+  done_stages="$done_stages (full)"
+fi
+echo "ci verify: PASS ($done_stages)"

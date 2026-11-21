@@ -1,0 +1,34 @@
+# yaml-language-server: $schema=https://coderabbit.ai/integrations/schema.v2.json
+language: "en-US"
+early_access: false
+
+reviews:
+  profile: "assertive"
+  request_changes_workflow: false
+  high_level_summary: true
+  poem: false
+  review_status: true
+  collapse_walkthrough: false
+  auto_review:
+    enabled: true
+    drafts: false
+    base_branches:
+      - main
+
+  path_instructions:
+    - path: "src/**"
+      instructions: |
+        Delphi is a single-model, single-machine inference engine. Review with this order of priority:
+        - Exactness: exact mode must stay token-identical to the engine's own non-speculative batch-1 greedy decoding. Flag any reduction whose order depends on batch size or row count, float atomics, fast-math, or implicit FMA contraction.
+        - Memory traffic: flag extra passes over weights, dequantised copies written back to memory, and per-step allocations.
+        - Metal correctness: flag missing barriers between dependent dispatches, threadgroup memory races, and spin waits across threadgroups.
+        - No code comments anywhere: names and types must carry the meaning.
+    - path: "e2e/**"
+      instructions: |
+        Tests are end-to-end only. Each test proves one behaviour, waits on outcomes rather than time, reads expected values from a source of truth, and cleans up its own state.
+    - path: "docs/**/*.md"
+      instructions: |
+        Check that every speed claim names the machine, the context length, the harness and whether it is a measurement or a ceiling.
+
+chat:
+  auto_reply: true
