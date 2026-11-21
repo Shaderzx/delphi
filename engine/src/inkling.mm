@@ -48,9 +48,17 @@ struct Mat12 {
     uint32_t elut[16] = {};
 };
 
+struct MatQ4 {
+    uint64_t q4_off = 0;
+    uint64_t sc_off = 0;
+    uint32_t rows = 0;
+    uint32_t cols = 0;
+};
+
 struct CtlWeights {
     Mat down, gain, forget;
     Mat12 down12, gf12;
+    MatQ4 down4, gf4;
 };
 
 struct LayerWeights {
@@ -59,6 +67,7 @@ struct LayerWeights {
     uint64_t attn_norm = 0, q_norm = 0, k_norm = 0, v_norm = 0, mlp_norm = 0;
     Mat wq, wr, gate_attn, sink, wk, wv, wo, dynk, dynv, router;
     Mat12 q12, k12, v12, wo12, router12;
+    MatQ4 q4, k4, v4, wo4;
     uint64_t k_sconv = 0, v_sconv = 0, attn_sconv = 0, mlp_sconv = 0;
     uint64_t q_clip = 0, r_clip = 0, rel_proj = 0, router_bias = 0;
     uint64_t w13_w = 0, w13_s = 0, w13_amax = 0, w13_denom = 0, w13_eb = 0, w13_sb = 0;
@@ -103,7 +112,7 @@ public:
     id<MTLComputePipelineState> p_embed_b, p_norm_b, p_res_b, p_ctl_norm_b, p_ctl_mix_b, p_sconv_b, p_conv_commit;
     id<MTLComputePipelineState> p_clip_b, p_clip_kv_b, p_rel_b, p_attend_b, p_route_b, p_union, p_env4_g, p_emxf8_g, p_combine_b;
     id<MTLComputePipelineState> p_ch_xnorm_b, p_ch_tau_b, p_ch_filter_b, p_ch_setup_b, p_copy_tap;
-    std::array<id<MTLComputePipelineState>, 9> p_gemv12_rows, p_gemv16_rows, p_ch_scan_rows;
+    std::array<id<MTLComputePipelineState>, 9> p_gemv12_rows, p_gemv16_rows, p_ch_scan_rows, p_gemv_q4_rows;
     id<MTLComputePipelineState> p_mtp_w1_norms, p_mtp_pack_head, p_mtp_q4, p_mtp_fold, p_mtp_fold_b, p_mtp_mix, p_mtp_norm_h, p_mtp_ctx_kv, p_mtp_embed;
     id<MTLComputePipelineState> p_mtp_qk_rope, p_mtp_attn, p_mtp_add_norm, p_mtp_add, p_mtp_silu;
     id<MTLComputePipelineState> p_mtp_base7, p_mtp_rnn_in, p_mtp_rnn_gates, p_mtp_mscan, p_mtp_mred;
@@ -112,13 +121,17 @@ public:
     id<MTLBuffer> head_q4 = nil, head_sc = nil, head_err = nil;
     id<MTLBuffer> ch_ub = nil, ch_tg_val = nil, ch_tg_row = nil, ch_state = nil, ch_count = nil, ch_cands = nil, ch_indirect = nil;
     id<MTLBuffer> bf12_sm = nil, bf12_ex = nil, bf12_ro = nil, bf12_op = nil;
+    id<MTLBuffer> lean_q4 = nil, lean_sc = nil;
     id<MTLBuffer> conv_buf = nil, conv_meta = nil;
     id<MTLBuffer> u_exp = nil, u_cnt = nil, u_pairs = nil, u_ind_w13 = nil, u_ind_w2 = nil;
     id<MTLBuffer> tap_buf = nil;
     bool cert_head_ready = false;
     bool cert_head_active = false;
     bool bf12_ready = false;
+    bool lean_q4_ready = false;
     bool mtp_ready = false;
+    uint32_t eff_top = 8;
+    std::array<double, 9> cost_ms = {0.0, 21.6, 30.1, 35.8, 40.3, 47.9, 57.6, 63.4, 71.8};
     struct MtpQ4Mat { uint64_t q4_off = 0, sc_off = 0; uint32_t rows = 0, cols = 0; };
     struct MtpLayer {
         bool local = false;
@@ -166,7 +179,7 @@ public:
         return {t.offset, uint32_t(t.shape[0]), uint32_t(t.bytes / 2 / t.shape[0])};
     }
 
-    bool load(const std::string& dir, bool use_cert_head, bool use_bf12, bool want_mtp, std::string& error) {
+    bool load(const std::string& dir, bool use_cert_head, bool use_bf12, bool want_mtp, const std::string& mode, std::string& error) {
         auto opened = open_gpu(error);
         if (!opened) return false;
         gpu = *opened;
@@ -306,6 +319,7 @@ public:
             p_gemv12_rows[r] = pipeline_for_rows(gpu, @"gemv_bf12_rows", r);
             p_gemv16_rows[r] = pipeline_for_rows(gpu, @"gemv_bf16_rows", r);
             p_ch_scan_rows[r] = pipeline_for_rows(gpu, @"cert_head_scan_rows", r);
+            p_gemv_q4_rows[r] = pipeline_for_rows(gpu, @"gemv_q4_f32_rows", r);
             p_mtp_q4_rows[r] = pipeline_for_rows(gpu, @"mtp_gemv_q4_rows", r);
         }
         arena = [gpu.device newBufferWithLength:uint64_t(slots) * MAX_BATCH * c.hidden * 4 options:MTLResourceStorageModePrivate];
@@ -395,16 +409,91 @@ public:
         conv_meta = [gpu.device newBufferWithBytes:cmeta.data() length:cmeta.size() * sizeof(ConvMetaHost) options:MTLResourceStorageModeShared];
         if (!conv_buf || !conv_meta) { error = "conv state allocation failed"; return false; }
         reset_state();
+        eff_top = (mode == "turbo") ? std::min<uint32_t>(4u, c.top) : c.top;
+        if (mode == "lean") cost_ms = {0.0, 17.1, 25.5, 31.2, 35.7, 43.3, 53.0, 58.8, 67.2};
+        else if (mode == "turbo") cost_ms = {0.0, 13.2, 18.8, 23.0, 26.8, 32.0, 38.2, 43.0, 48.5};
         if ((use_cert_head || want_mtp) && (c.hidden % 32 == 0) && c.vocab >= 64) {
             if (!build_cert_head(error)) return false;
             cert_head_active = use_cert_head;
         }
-        if (use_bf12 && (c.hidden % 16 == 0) && ((c.heads * c.head_dim) % 16 == 0) && ((c.heads * c.d_rel) % 4 == 0)) {
+        if (mode == "lean" || mode == "turbo") {
+            if ((c.hidden % 32 == 0) && ((c.heads * c.head_dim) % 32 == 0)) {
+                if (!build_lean_q4(error)) return false;
+            }
+        } else if (use_bf12 && (c.hidden % 16 == 0) && ((c.heads * c.head_dim) % 16 == 0) && ((c.heads * c.d_rel) % 4 == 0)) {
             if (!build_bf12(error)) return false;
         }
         if (want_mtp && cert_head_ready) {
             if (!load_mtp(dir, cfg, error)) return false;
         }
+        return true;
+    }
+
+    bool build_lean_q4(std::string& error) {
+        struct Q4Job { MatQ4* dst; std::vector<Mat> srcs; uint32_t rows = 0, cols = 0; };
+        std::vector<Q4Job> jobs;
+        auto add_job = [&](MatQ4* dst, std::initializer_list<Mat> mats) {
+            Q4Job j;
+            j.dst = dst;
+            for (const Mat& m : mats) {
+                j.srcs.push_back(m);
+                j.rows += m.rows;
+                j.cols = m.cols;
+            }
+            jobs.push_back(std::move(j));
+        };
+        for (uint32_t i = 0; i < c.layers; ++i) {
+            LayerWeights& w = lw[i];
+            add_job(&w.q4, {w.wq, w.wr, w.gate_attn, w.sink});
+            if (w.local) {
+                add_job(&w.k4, {w.wk});
+                add_job(&w.v4, {w.wv});
+            } else {
+                add_job(&w.k4, {w.wk, w.dynk});
+                add_job(&w.v4, {w.wv, w.dynv});
+            }
+            add_job(&w.wo4, {w.wo});
+            if (w.has_ctl) {
+                for (int k = 0; k < 4; ++k) {
+                    add_job(&w.ctl[k].down4, {w.ctl[k].down});
+                    add_job(&w.ctl[k].gf4, {w.ctl[k].gain, w.ctl[k].forget});
+                }
+            }
+        }
+        auto align256 = [](uint64_t v) { return (v + 255) / 256 * 256; };
+        uint64_t q4_tot = 0, sc_tot = 0;
+        for (Q4Job& j : jobs) {
+            uint32_t ng = j.cols / 32;
+            j.dst->q4_off = q4_tot;
+            j.dst->sc_off = sc_tot;
+            j.dst->rows = j.rows;
+            j.dst->cols = j.cols;
+            q4_tot += align256(uint64_t(j.rows) * ng * 16);
+            sc_tot += align256(uint64_t(j.rows) * ng * 2);
+        }
+        lean_q4 = [gpu.device newBufferWithLength:q4_tot options:MTLResourceStorageModePrivate];
+        lean_sc = [gpu.device newBufferWithLength:sc_tot options:MTLResourceStorageModePrivate];
+        if (!lean_q4 || !lean_sc) { error = "lean q4 buffer allocation failed"; return false; }
+        id<MTLCommandBuffer> cb = [gpu.queue commandBuffer];
+        id<MTLComputeCommandEncoder> e = [cb computeCommandEncoderWithDispatchType:MTLDispatchTypeConcurrent];
+        struct MtpQ4BuildP { uint32_t rows, cols, ng, row_off; };
+        [e setComputePipelineState:p_mtp_q4];
+        for (const Q4Job& j : jobs) {
+            uint32_t roff = 0;
+            uint32_t ng = j.cols / 32;
+            for (const Mat& m : j.srcs) {
+                MtpQ4BuildP bp{m.rows, j.cols, ng, roff};
+                [e setBuffer:file offset:m.offset atIndex:0];
+                [e setBuffer:lean_q4 offset:j.dst->q4_off atIndex:1];
+                [e setBuffer:lean_sc offset:j.dst->sc_off atIndex:2];
+                [e setBytes:&bp length:sizeof(bp) atIndex:3];
+                [e dispatchThreadgroups:MTLSizeMake(m.rows, 1, 1) threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+                roff += m.rows;
+            }
+        }
+        [e endEncoding];
+        gpu_seconds(cb);
+        lean_q4_ready = true;
         return true;
     }
 
@@ -914,7 +1003,7 @@ public:
                 w.has_ctl = true;
                 for (int k = 0; k < 4; ++k) {
                     std::string cb = L + "controllers." + cnames[k] + ".";
-                    w.ctl[k] = {make_mat(cb + "down_weight"), make_mat(cb + "gain_weight"), make_mat(cb + "forget_weight"), {}, {}};
+                    w.ctl[k] = {make_mat(cb + "down_weight"), make_mat(cb + "gain_weight"), make_mat(cb + "forget_weight"), {}, {}, {}, {}};
                 }
             }
         }
@@ -1045,6 +1134,22 @@ public:
         }
     }
 
+    struct GemvQ4BP { uint32_t rows, cols, ng, x_stride, y_stride, round_out; };
+
+    void gemv_q4_m(const MatQ4& m, id<MTLBuffer> in_buf, uint64_t in_off, uint32_t x_stride, id<MTLBuffer> out_buf, uint64_t out_off, uint32_t y_stride, uint32_t M, bool round_out = true) {
+        for (uint32_t m0 = 0; m0 < M; m0 += 8) {
+            uint32_t mb = std::min<uint32_t>(8, M - m0);
+            GemvQ4BP g{m.rows, m.cols, m.cols / 32, x_stride, y_stride, round_out ? 1u : 0u};
+            [enc setComputePipelineState:p_gemv_q4_rows[mb]];
+            [enc setBuffer:lean_q4 offset:m.q4_off atIndex:0];
+            [enc setBuffer:lean_sc offset:m.sc_off atIndex:1];
+            [enc setBuffer:in_buf offset:in_off + uint64_t(m0) * x_stride * 4 atIndex:2];
+            [enc setBuffer:out_buf offset:out_off + uint64_t(m0) * y_stride * 4 atIndex:3];
+            [enc setBytes:&g length:sizeof(g) atIndex:4];
+            grid((g.rows + 7) / 8, 256);
+        }
+    }
+
     struct NormP { uint32_t n, has_weight; float eps; };
     uint32_t norm(uint32_t in, uint64_t weight_off, uint32_t M) {
         uint32_t out = alloc();
@@ -1102,14 +1207,17 @@ public:
         [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
         together = true;
         for (int k = 0; k < 3; ++k) {
-            if (bf12_ready) gemv12_m(w.ctl[k].down12, scratch, s_normed[k], 2 * n, scratch, s_ctlh[k], 64, M);
+            if (lean_q4_ready) gemv_q4_m(w.ctl[k].down4, scratch, s_normed[k], 2 * n, scratch, s_ctlh[k], 64, M);
+            else if (bf12_ready) gemv12_m(w.ctl[k].down12, scratch, s_normed[k], 2 * n, scratch, s_ctlh[k], 64, M);
             else gemv16_m(w.ctl[k].down, scratch, s_normed[k], 2 * n, scratch, s_ctlh[k], 64, M);
         }
         together = false;
         [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
         together = true;
         for (int k = 0; k < 3; ++k) {
-            if (bf12_ready) {
+            if (lean_q4_ready) {
+                gemv_q4_m(w.ctl[k].gf4, scratch, s_ctlh[k], 64, scratch, s_gf[k], gfs, M, false);
+            } else if (bf12_ready) {
                 gemv12_m(w.ctl[k].gf12, scratch, s_ctlh[k], 64, scratch, s_gf[k], gfs, M, false);
             } else {
                 gemv16_m(w.ctl[k].gain, scratch, s_ctlh[k], 64, scratch, s_gain[k], gfs, M, false);
@@ -1147,7 +1255,10 @@ public:
         [enc setBuffer:scratch offset:s_normed[0] atIndex:2];
         [enc setBytes:&n length:4 atIndex:3];
         grid(M, 576);
-        if (bf12_ready) {
+        if (lean_q4_ready) {
+            gemv_q4_m(w.ctl[3].down4, scratch, s_normed[0], 2 * n, scratch, s_ctlh[0], 64, M);
+            gemv_q4_m(w.ctl[3].gf4, scratch, s_ctlh[0], 64, scratch, s_gf[0], gfs, M, false);
+        } else if (bf12_ready) {
             gemv12_m(w.ctl[3].down12, scratch, s_normed[0], 2 * n, scratch, s_ctlh[0], 64, M);
             gemv12_m(w.ctl[3].gf12, scratch, s_ctlh[0], 64, scratch, s_gf[0], gfs, M, false);
         } else {
@@ -1228,7 +1339,11 @@ public:
         uint32_t rdim = c.heads * c.d_rel;
         [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
         together = true;
-        if (bf12_ready) {
+        if (lean_q4_ready) {
+            gemv_q4_m(w.q4, arena, so(sq), H, scratch, s_qbundle, q_stride, M);
+            gemv_q4_m(w.k4, arena, so(sk), H, scratch, s_kbundle, kstr, M);
+            gemv_q4_m(w.v4, arena, so(sv), H, scratch, s_vbundle, kstr, M);
+        } else if (bf12_ready) {
             gemv12_m(w.q12, arena, so(sq), H, scratch, s_qbundle, q_stride, M);
             gemv12_m(w.k12, arena, so(sk), H, scratch, s_kbundle, kstr, M);
             gemv12_m(w.v12, arena, so(sv), H, scratch, s_vbundle, kstr, M);
@@ -1290,7 +1405,8 @@ public:
             grid2(c.heads, (M + 3) / 4, 128);
         }
         uint32_t out = alloc();
-        if (bf12_ready) gemv12_m(w.wo12, scratch, s_gated, qdim, arena, so(out), H, M);
+        if (lean_q4_ready) gemv_q4_m(w.wo4, scratch, s_gated, qdim, arena, so(out), H, M);
+        else if (bf12_ready) gemv12_m(w.wo12, scratch, s_gated, qdim, arena, so(out), H, M);
         else gemv16_m(w.wo, scratch, s_gated, qdim, arena, so(out), H, M);
         return out;
     }
@@ -1322,7 +1438,7 @@ public:
             grid2((H / 32 + 63) / 64, M, 64);
         }
         together = false;
-        RouteP rp{c.experts, c.top, c.route_scale};
+        RouteP rp{c.experts, eff_top, c.route_scale};
         [enc setComputePipelineState:M == 1 ? p_route : p_route_b];
         [enc setBuffer:scratch offset:s_router atIndex:0];
         [enc setBuffer:file offset:w.router_bias atIndex:1];
@@ -1331,7 +1447,7 @@ public:
         [enc setBytes:&rp length:sizeof(rp) atIndex:4];
         grid(M, 32);
         if (M > 1) {
-            UnionPP up{M, c.top, c.experts, (2 * I + 7) / 8, (H + 7) / 8};
+            UnionPP up{M, eff_top, c.experts, (2 * I + 7) / 8, (H + 7) / 8};
             [enc setComputePipelineState:p_union];
             [enc setBuffer:scratch offset:s_ids atIndex:0];
             [enc setBuffer:u_exp offset:0 atIndex:1];
@@ -1357,9 +1473,9 @@ public:
                 [enc setBuffer:scratch offset:s_ids atIndex:6];
                 [enc setBuffer:scratch offset:out_off atIndex:7];
                 [enc setBytes:&p length:sizeof(p) atIndex:8];
-                grid2((rows + 7) / 8, c.top, 256);
+                grid2((rows + 7) / 8, eff_top, 256);
             } else {
-                ExpertGP p{rows, cols, per_row ? I : H, per_row ? H : 2 * I, per_row ? 1u : 0u, c.top, is_w2 ? w.w2_eb : w.w13_eb, is_w2 ? w.w2_sb : w.w13_sb};
+                ExpertGP p{rows, cols, per_row ? I : H, per_row ? H : 2 * I, per_row ? 1u : 0u, eff_top, is_w2 ? w.w2_eb : w.w13_eb, is_w2 ? w.w2_sb : w.w13_sb};
                 [enc setComputePipelineState:w.nvfp4 ? p_env4_g : p_emxf8_g];
                 [enc setBuffer:file offset:is_w2 ? w.w2_w : w.w13_w atIndex:0];
                 [enc setBuffer:file offset:is_w2 ? w.w2_s : w.w13_s atIndex:1];
@@ -1379,7 +1495,7 @@ public:
             }
         };
         run_expert(false, 2 * I, H, s_xq, s_outer, s_gu, false);
-        uint32_t total_k = M * c.top;
+        uint32_t total_k = M * eff_top;
         if (w.nvfp4) {
             SwigluP sp{I, total_k, c.gate_cap, c.up_cap, 1u};
             [enc setComputePipelineState:p_swiglu_qnv4];
@@ -1491,7 +1607,7 @@ public:
         }
         experts(w, x, M);
         uint32_t out = alloc();
-        CombineBP cp{c.hidden, c.top, boundary ? 1u : 0u, M};
+        CombineBP cp{c.hidden, eff_top, boundary ? 1u : 0u, M};
         [enc setComputePipelineState:p_combine_b];
         [enc setBuffer:scratch offset:s_rows atIndex:0];
         [enc setBuffer:scratch offset:s_ids atIndex:1];
@@ -1668,7 +1784,7 @@ public:
         together = false;
     }
 
-    double step_rows(const uint32_t* toks, uint32_t pos0, uint32_t M, LogitsMode lmode, bool auto_commit = true, bool full_logits = false, bool capture_taps = false) {
+    double step_rows(const uint32_t* toks, uint32_t pos0, uint32_t M, LogitsMode lmode, bool auto_commit = true, bool full_logits = false, bool capture_taps = false, uint32_t ingest_pos = 0, uint32_t ingest_commit = 0) {
         next_slot = 0;
         std::memcpy(token.contents, toks, M * 4);
         id<MTLCommandBuffer> cb = [gpu.queue commandBuffer];
@@ -1676,6 +1792,9 @@ public:
         if (pending_conv_commit > 0) {
             conv_commit_encode(pending_conv_commit);
             pending_conv_commit = 0;
+        }
+        if (ingest_commit > 0 && mtp_ready) {
+            mtp_ingest_encode(ingest_pos, ingest_commit, false);
         }
         uint32_t emb = alloc();
         uint32_t H = c.hidden;
@@ -2062,10 +2181,11 @@ DecodeStats run_decode_pass(Engine& engine, const std::vector<uint32_t>& ids, ui
     bool use_spec = (spec != "off") && !logprobs;
     uint32_t pending_mtp_pos = 0;
     uint32_t pending_mtp_commit = 0;
-    static constexpr double kCostMs[9] = {0.0, 21.6, 30.1, 35.8, 40.3, 47.9, 57.6, 63.4, 71.8};
     double ema_cal = 0.90;
     double last_exp_acc = 0.0;
     bool last_was_mtp = false;
+    uint32_t mtp_miss_streak = 0;
+    uint32_t mtp_cooldown = 0;
     while (st.out.size() < steps) {
         uint64_t rem = steps - st.out.size();
         uint32_t ctx_room = pos < engine.max_context ? engine.max_context - pos : 0;
@@ -2077,41 +2197,48 @@ DecodeStats run_decode_pass(Engine& engine, const std::vector<uint32_t>& ids, ui
             uint32_t max_k = uint32_t(std::min<uint64_t>({uint64_t(Engine::MAX_BATCH - 1), rem - 1, uint64_t(ctx_room - 1)}));
             if (spec == "lookup" || spec == "auto") draft = lookup_draft(history, max_k);
             if (draft.empty() && use_mtp) {
-                st.decode_gpu += engine.mtp_propose(anchor, pos, pending_mtp_pos, pending_mtp_commit);
-                pending_mtp_commit = 0;
-                const uint32_t* dids = engine.mtp_draft_ids();
-                const float* dprobs = engine.mtp_draft_probs();
-                uint32_t k_lim = std::min<uint32_t>(7u, max_k);
-                uint32_t best_k = 0;
-                double best_rate = 1.0 / kCostMs[1];
-                double cum_p = 1.0;
-                double exp_tok = 1.0;
-                double best_exp = 0.0;
-                for (uint32_t k = 1; k <= k_lim; ++k) {
-                    double pk = std::clamp(double(dprobs[k - 1]) * ema_cal, 0.0, 0.99);
-                    cum_p *= pk;
-                    exp_tok += cum_p;
-                    double rate = exp_tok / kCostMs[k + 1];
-                    if (rate > best_rate) {
-                        best_rate = rate;
-                        best_k = k;
-                        best_exp = exp_tok - 1.0;
+                if (mtp_cooldown > 0) {
+                    mtp_cooldown--;
+                } else {
+                    st.decode_gpu += engine.mtp_propose(anchor, pos, pending_mtp_pos, pending_mtp_commit);
+                    pending_mtp_commit = 0;
+                    const uint32_t* dids = engine.mtp_draft_ids();
+                    const float* dprobs = engine.mtp_draft_probs();
+                    uint32_t k_lim = std::min<uint32_t>(7u, max_k);
+                    uint32_t best_k = 0;
+                    double base_rate = 1.0 / engine.cost_ms[1];
+                    double best_rate = base_rate;
+                    double cum_p = 1.0;
+                    double exp_tok = 1.0;
+                    double best_exp = 0.0;
+                    for (uint32_t k = 1; k <= k_lim; ++k) {
+                        double pk = std::clamp(double(dprobs[k - 1]) * ema_cal, 0.0, 0.99);
+                        cum_p *= pk;
+                        exp_tok += cum_p;
+                        double rate = exp_tok / engine.cost_ms[k + 1];
+                        if (rate > best_rate) {
+                            best_rate = rate;
+                            best_k = k;
+                            best_exp = exp_tok - 1.0;
+                        }
                     }
-                }
-                if (best_k > 0) {
-                    draft.assign(dids, dids + best_k);
-                    last_was_mtp = true;
-                    last_exp_acc = best_exp;
+                    if (best_k > 0) {
+                        draft.assign(dids, dids + best_k);
+                        last_was_mtp = true;
+                        last_exp_acc = best_exp;
+                    } else if (engine.lean_q4_ready) {
+                        mtp_miss_streak++;
+                        if (mtp_miss_streak >= 3) mtp_cooldown = std::min<uint32_t>(6u, mtp_miss_streak - 2u);
+                    }
                 }
             }
         }
-        if (use_mtp && pending_mtp_commit > 0) {
-            st.decode_gpu += engine.mtp_ingest_ctx(pending_mtp_pos, pending_mtp_commit, true);
-            pending_mtp_commit = 0;
-        }
+        uint32_t ing_pos = pending_mtp_pos;
+        uint32_t ing_commit = use_mtp ? pending_mtp_commit : 0;
+        pending_mtp_commit = 0;
         if (draft.empty()) {
             uint32_t old_pos = pos;
-            st.decode_gpu += engine.step_rows(&anchor, pos, 1, Engine::LOGITS_ALL, true, logprobs, use_mtp);
+            st.decode_gpu += engine.step_rows(&anchor, pos, 1, Engine::LOGITS_ALL, true, logprobs, use_mtp, ing_pos, ing_commit);
             pos++;
             st.verify_steps++;
             anchor = engine.chosen();
@@ -2137,7 +2264,7 @@ DecodeStats run_decode_pass(Engine& engine, const std::vector<uint32_t>& ids, ui
             batch[0] = anchor;
             for (uint32_t j = 0; j < K; ++j) batch[1 + j] = draft[j];
             uint32_t old_pos = pos;
-            st.decode_gpu += engine.step_rows(batch.data(), pos, M, Engine::LOGITS_ALL, false, false, use_mtp);
+            st.decode_gpu += engine.step_rows(batch.data(), pos, M, Engine::LOGITS_ALL, false, false, use_mtp, ing_pos, ing_commit);
             st.verify_steps++;
             uint32_t accepted = 0;
             uint32_t next_tok = 0;
@@ -2167,9 +2294,18 @@ DecodeStats run_decode_pass(Engine& engine, const std::vector<uint32_t>& ids, ui
             if (use_mtp) {
                 pending_mtp_pos = old_pos;
                 pending_mtp_commit = commit;
-                if (last_was_mtp && last_exp_acc > 0.1) {
-                    double ratio = std::clamp((double(accepted) + 0.15) / (last_exp_acc + 0.15), 0.4, 1.2);
-                    ema_cal = std::clamp(0.75 * ema_cal + 0.25 * (ema_cal * ratio), 0.45, 1.15);
+                if (last_was_mtp) {
+                    if (accepted >= 1) {
+                        mtp_miss_streak = 0;
+                        mtp_cooldown = 0;
+                    } else if (engine.lean_q4_ready) {
+                        mtp_miss_streak++;
+                        if (mtp_miss_streak >= 3) mtp_cooldown = std::min<uint32_t>(6u, mtp_miss_streak - 2u);
+                    }
+                    if (last_exp_acc > 0.1) {
+                        double ratio = std::clamp((double(accepted) + 0.15) / (last_exp_acc + 0.15), 0.4, 1.2);
+                        ema_cal = std::clamp(0.75 * ema_cal + 0.25 * (ema_cal * ratio), 0.45, 1.15);
+                    }
                 }
             }
         }
@@ -2184,7 +2320,7 @@ DecodeStats run_decode_pass(Engine& engine, const std::vector<uint32_t>& ids, ui
 
 int generate_command(int argc, char** argv) {
     std::string error;
-    auto flags = parse_flags(argc, argv, {"--model", "--input-ids", "--steps", "--head", "--pack", "--spec"}, {"--logprobs"}, error);
+    auto flags = parse_flags(argc, argv, {"--model", "--input-ids", "--steps", "--head", "--pack", "--spec", "--mode"}, {"--logprobs"}, error);
     if (!flags) return refuse(error);
     auto steps = whole_flag(*flags, "--steps", 8, 1, 4000, error);
     if (!steps) return refuse(error);
@@ -2194,6 +2330,8 @@ int generate_command(int argc, char** argv) {
     if (pack != "bf12" && pack != "off") return refuse("--pack must be bf12 or off");
     std::string spec = flags->values.count("--spec") ? flags->values["--spec"] : "auto";
     if (spec != "off" && spec != "lookup" && spec != "mtp" && spec != "auto") return refuse("--spec must be off, lookup, mtp, or auto");
+    std::string mode = flags->values.count("--mode") ? flags->values["--mode"] : "exact";
+    if (mode != "exact" && mode != "lean" && mode != "turbo") return refuse("--mode must be exact, lean, or turbo");
     if (!flags->values.count("--model") || !flags->values.count("--input-ids")) return refuse("generate needs --model DIR and --input-ids JSON");
     auto ids_opt = parse_ids(flags->values["--input-ids"], error);
     if (!ids_opt) return refuse(error);
@@ -2203,7 +2341,7 @@ int generate_command(int argc, char** argv) {
     bool use_cert = head == "exact" && !logprobs;
     bool want_mtp = (spec == "mtp" || spec == "auto") && !logprobs;
     Engine engine;
-    if (!engine.load(flags->values["--model"], use_cert, pack == "bf12", want_mtp, error)) {
+    if (!engine.load(flags->values["--model"], use_cert, pack == "bf12", want_mtp, mode, error)) {
         std::fprintf(stderr, "delphi: %s\n", error.c_str());
         return 3;
     }
@@ -2218,9 +2356,11 @@ int generate_command(int argc, char** argv) {
     DecodeStats st = run_decode_pass(engine, ids, *steps, spec, logprobs, &steps_json);
     double dec_toks = *steps > 1 ? double(*steps - 1) : 0.0;
     double acc_per_step = st.verify_steps ? double(st.spec_tokens) / double(st.verify_steps) : 1.0;
+    bool is_lossy = mode != "exact";
     std::printf("{\"output_ids\": [");
     for (size_t i = 0; i < st.out.size(); ++i) std::printf(i ? ", %u" : "%u", st.out[i]);
-    std::printf("], \"prompt_tokens\": %zu, \"prefill_tokens_per_s\": %.3f, \"decode_tokens_per_s\": %.3f, \"decode_gpu_tokens_per_s\": %.3f, \"verify_steps\": %llu, \"accepted_per_step\": %.3f%s%s%s}\n",
+    std::printf("], \"mode\": \"%s\", \"lossy\": %s, \"prompt_tokens\": %zu, \"prefill_tokens_per_s\": %.3f, \"decode_tokens_per_s\": %.3f, \"decode_gpu_tokens_per_s\": %.3f, \"verify_steps\": %llu, \"accepted_per_step\": %.3f%s%s%s}\n",
+                mode.c_str(), is_lossy ? "true" : "false",
                 ids.size(), ids.size() / st.prefill_wall, dec_toks / st.decode_wall, st.decode_gpu > 0 ? dec_toks / st.decode_gpu : 0.0,
                 static_cast<unsigned long long>(st.verify_steps), acc_per_step,
                 logprobs ? ", \"steps\": [" : "", steps_json.c_str(), logprobs ? "]" : "");
@@ -2229,7 +2369,7 @@ int generate_command(int argc, char** argv) {
 
 int bench_command(int argc, char** argv) {
     std::string error;
-    auto flags = parse_flags(argc, argv, {"--model", "--input-ids", "--steps", "--repeats", "--warmup", "--head", "--pack", "--spec"}, {}, error);
+    auto flags = parse_flags(argc, argv, {"--model", "--input-ids", "--steps", "--repeats", "--warmup", "--head", "--pack", "--spec", "--mode"}, {}, error);
     if (!flags) return refuse(error);
     auto steps = whole_flag(*flags, "--steps", 64, 2, 4000, error);
     auto repeats = steps ? whole_flag(*flags, "--repeats", 6, 1, 100, error) : std::nullopt;
@@ -2241,6 +2381,8 @@ int bench_command(int argc, char** argv) {
     if (pack != "bf12" && pack != "off") return refuse("--pack must be bf12 or off");
     std::string spec = flags->values.count("--spec") ? flags->values["--spec"] : "auto";
     if (spec != "off" && spec != "lookup" && spec != "mtp" && spec != "auto") return refuse("--spec must be off, lookup, mtp, or auto");
+    std::string mode = flags->values.count("--mode") ? flags->values["--mode"] : "exact";
+    if (mode != "exact" && mode != "lean" && mode != "turbo") return refuse("--mode must be exact, lean, or turbo");
     if (!flags->values.count("--model") || !flags->values.count("--input-ids")) return refuse("bench needs --model DIR and --input-ids JSON");
     auto ids_opt = parse_ids(flags->values["--input-ids"], error);
     if (!ids_opt) return refuse(error);
@@ -2248,7 +2390,7 @@ int bench_command(int argc, char** argv) {
     if (ids.empty()) return refuse("--input-ids must hold at least one token id");
     Engine engine;
     bool want_mtp = (spec == "mtp" || spec == "auto");
-    if (!engine.load(flags->values["--model"], head == "exact", pack == "bf12", want_mtp, error)) {
+    if (!engine.load(flags->values["--model"], head == "exact", pack == "bf12", want_mtp, mode, error)) {
         std::fprintf(stderr, "delphi: %s\n", error.c_str());
         return 3;
     }
@@ -2282,7 +2424,9 @@ int bench_command(int argc, char** argv) {
         }
     }
     std::string hash = hex64(fnv1a(ref_out.data(), ref_out.size() * sizeof(uint32_t)));
-    std::printf("{\"prompt_tokens\": %zu, \"steps\": %llu, \"repeats\": %llu, \"output_hash\": \"%s\", \"verify_steps\": %llu, \"accepted_per_step\": %.3f, \"prefill_tokens_per_s_median\": %.3f, \"decode_tokens_per_s_median\": %.3f, \"decode_gpu_tokens_per_s_median\": %.3f, \"gpu_ms_per_token_median\": %.3f, \"decode_gpu_runs\": [",
+    bool is_lossy = mode != "exact";
+    std::printf("{\"mode\": \"%s\", \"lossy\": %s, \"prompt_tokens\": %zu, \"steps\": %llu, \"repeats\": %llu, \"output_hash\": \"%s\", \"verify_steps\": %llu, \"accepted_per_step\": %.3f, \"prefill_tokens_per_s_median\": %.3f, \"decode_tokens_per_s_median\": %.3f, \"decode_gpu_tokens_per_s_median\": %.3f, \"gpu_ms_per_token_median\": %.3f, \"decode_gpu_runs\": [",
+                mode.c_str(), is_lossy ? "true" : "false",
                 ids.size(), static_cast<unsigned long long>(*steps), static_cast<unsigned long long>(*repeats), hash.c_str(),
                 static_cast<unsigned long long>(ref_vsteps), ref_acc, median(prefill_tps), median(wall_tps), median(gpu_tps), median(gpu_ms_tok));
     for (size_t i = 0; i < gpu_tps.size(); ++i) std::printf(i ? ", %.3f" : "%.3f", gpu_tps[i]);

@@ -10,7 +10,7 @@ const oraclePython = process.env.DELPHI_ORACLE_PYTHON ?? 'python3';
 const CLEANUP_RESERVE_MS = 30_000;
 
 type Case = { text: string; input_ids: number[]; output_ids: number[] };
-type Generated = { output_ids: number[]; prompt_tokens: number; decode_tokens_per_s: number; accepted_per_step?: number };
+type Generated = { output_ids: number[]; prompt_tokens: number; decode_tokens_per_s: number; accepted_per_step?: number; mode?: string; lossy?: boolean };
 
 const truth = JSON.parse(readFileSync(join(import.meta.dirname, '..', 'fixtures', 'g4-sglang-greedy.json'), 'utf8')) as { cases: Case[] };
 const fibonacci = truth.cases.find((c) => c.text.startsWith('def fibonacci'))!;
@@ -111,6 +111,29 @@ test('delphi bench refuses missing model or invalid repeat counts', { timeout: 3
     const okSpec = spawnSync(bin, ['generate', '--model', '/nonexistent', '--input-ids', '[1]', '--spec', 'auto'], { encoding: 'utf8', timeout: remainingMs(deadline) });
     if (okSpec.error) throw okSpec.error;
     expect(okSpec.status).toBe(3);
+    const badMode = spawnSync(bin, ['generate', '--model', '/nonexistent', '--input-ids', '[1]', '--mode', 'bogus'], { encoding: 'utf8', timeout: remainingMs(deadline) });
+    if (badMode.error) throw badMode.error;
+    expect(badMode.status).toBe(2);
+    expect(badMode.stderr).toContain('--mode');
+    for (const m of ['exact', 'lean', 'turbo']) {
+      const okMode = spawnSync(bin, ['generate', '--model', '/nonexistent', '--input-ids', '[1]', '--mode', m], { encoding: 'utf8', timeout: remainingMs(deadline) });
+      if (okMode.error) throw okMode.error;
+      expect(okMode.status).toBe(3);
+    }
+  });
+});
+
+test('delphi generate opt-in --mode lean and --mode turbo report mode and preserve Paris answer', { tags: ['model'], timeout: 900_000 }, () => {
+  const deadline = Date.now() + 900_000;
+  withBuiltDelphi(deadline, (bin) => {
+    for (const m of ['lean', 'turbo']) {
+      const run = spawnSync(bin, ['generate', '--model', model, '--input-ids', JSON.stringify(paris.input_ids), '--steps', '16', '--mode', m], { encoding: 'utf8', timeout: remainingMs(deadline) });
+      checkRun(`delphi generate --mode ${m}`, run);
+      const out = JSON.parse(run.stdout) as Generated;
+      expect(out.mode).toBe(m);
+      expect(out.lossy).toBe(true);
+      expect(out.output_ids[0]).toBe(paris.output_ids[0]);
+    }
   });
 });
 

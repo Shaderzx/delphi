@@ -711,7 +711,9 @@ kernel void route_batch(device const float* logits [[buffer(0)]],
         }
         float s[16];
         for (uint k = 0; k < p.top; ++k) s[k] = precise::exp(lp[k] - mx);
-        float tot = ((s[0] + s[2]) + (s[1] + s[3])) + ((s[4] + s[6]) + (s[5] + s[7]));
+        float tot = 0.0f;
+        if (p.top == 8u) tot = ((s[0] + s[2]) + (s[1] + s[3])) + ((s[4] + s[6]) + (s[5] + s[7]));
+        else for (uint k = 0; k < p.top; ++k) tot += s[k];
         for (uint k = 0; k < p.top; ++k) {
             im[k] = chosen[k];
             gm[k] = precise::exp(lp[k] - (mx + precise::log(tot))) * p.scale;
@@ -1245,4 +1247,53 @@ kernel void copy_tap_batch(device const float4* src [[buffer(0)]],
                            uint2 gid [[thread_position_in_grid]]) {
     uint i = gid.x, m = gid.y;
     if (i < p.n4) dst[(ulong(m) * 4u + p.tap_idx) * p.n4 + i] = src[ulong(m) * p.n4 + i];
+}
+
+struct GemvQ4B { uint rows; uint cols; uint ng; uint x_stride; uint y_stride; uint round_out; };
+
+kernel void gemv_q4_f32_rows(device const uint4* q4 [[buffer(0)]],
+                             device const half* sc [[buffer(1)]],
+                             device const float4* x4 [[buffer(2)]],
+                             device float* y [[buffer(3)]],
+                             constant GemvQ4B& p [[buffer(4)]],
+                             uint group [[threadgroup_position_in_grid]],
+                             uint simd [[simdgroup_index_in_threadgroup]],
+                             uint simds [[simdgroups_per_threadgroup]],
+                             uint lane [[thread_index_in_simdgroup]]) {
+    uint row = group * simds + simd;
+    if (row >= p.rows) return;
+    uint xs4 = p.x_stride / 4u;
+    device const uint4* qr = q4 + ulong(row) * p.ng;
+    device const half* sr = sc + ulong(row) * p.ng;
+    float a0 = 0, a1 = 0, a2 = 0, a3 = 0, a4 = 0, a5 = 0, a6 = 0, a7 = 0;
+    for (uint g = lane; g < p.ng; g += 32u) {
+        uint4 pk = qr[g];
+        float s = float(sr[g]);
+        uint g8 = g * 8u;
+        float d0 = 0, d1 = 0, d2 = 0, d3 = 0, d4 = 0, d5 = 0, d6 = 0, d7 = 0;
+        { float4 w = u4_lo(pk.x); if (ROWS > 0u) d0 += dot(w, x4[0ul*xs4 + g8]); if (ROWS > 1u) d1 += dot(w, x4[1ul*xs4 + g8]); if (ROWS > 2u) d2 += dot(w, x4[2ul*xs4 + g8]); if (ROWS > 3u) d3 += dot(w, x4[3ul*xs4 + g8]); if (ROWS > 4u) d4 += dot(w, x4[4ul*xs4 + g8]); if (ROWS > 5u) d5 += dot(w, x4[5ul*xs4 + g8]); if (ROWS > 6u) d6 += dot(w, x4[6ul*xs4 + g8]); if (ROWS > 7u) d7 += dot(w, x4[7ul*xs4 + g8]); }
+        { float4 w = u4_hi(pk.x); uint k = g8 + 1u; if (ROWS > 0u) d0 += dot(w, x4[0ul*xs4 + k]); if (ROWS > 1u) d1 += dot(w, x4[1ul*xs4 + k]); if (ROWS > 2u) d2 += dot(w, x4[2ul*xs4 + k]); if (ROWS > 3u) d3 += dot(w, x4[3ul*xs4 + k]); if (ROWS > 4u) d4 += dot(w, x4[4ul*xs4 + k]); if (ROWS > 5u) d5 += dot(w, x4[5ul*xs4 + k]); if (ROWS > 6u) d6 += dot(w, x4[6ul*xs4 + k]); if (ROWS > 7u) d7 += dot(w, x4[7ul*xs4 + k]); }
+        { float4 w = u4_lo(pk.y); uint k = g8 + 2u; if (ROWS > 0u) d0 += dot(w, x4[0ul*xs4 + k]); if (ROWS > 1u) d1 += dot(w, x4[1ul*xs4 + k]); if (ROWS > 2u) d2 += dot(w, x4[2ul*xs4 + k]); if (ROWS > 3u) d3 += dot(w, x4[3ul*xs4 + k]); if (ROWS > 4u) d4 += dot(w, x4[4ul*xs4 + k]); if (ROWS > 5u) d5 += dot(w, x4[5ul*xs4 + k]); if (ROWS > 6u) d6 += dot(w, x4[6ul*xs4 + k]); if (ROWS > 7u) d7 += dot(w, x4[7ul*xs4 + k]); }
+        { float4 w = u4_hi(pk.y); uint k = g8 + 3u; if (ROWS > 0u) d0 += dot(w, x4[0ul*xs4 + k]); if (ROWS > 1u) d1 += dot(w, x4[1ul*xs4 + k]); if (ROWS > 2u) d2 += dot(w, x4[2ul*xs4 + k]); if (ROWS > 3u) d3 += dot(w, x4[3ul*xs4 + k]); if (ROWS > 4u) d4 += dot(w, x4[4ul*xs4 + k]); if (ROWS > 5u) d5 += dot(w, x4[5ul*xs4 + k]); if (ROWS > 6u) d6 += dot(w, x4[6ul*xs4 + k]); if (ROWS > 7u) d7 += dot(w, x4[7ul*xs4 + k]); }
+        { float4 w = u4_lo(pk.z); uint k = g8 + 4u; if (ROWS > 0u) d0 += dot(w, x4[0ul*xs4 + k]); if (ROWS > 1u) d1 += dot(w, x4[1ul*xs4 + k]); if (ROWS > 2u) d2 += dot(w, x4[2ul*xs4 + k]); if (ROWS > 3u) d3 += dot(w, x4[3ul*xs4 + k]); if (ROWS > 4u) d4 += dot(w, x4[4ul*xs4 + k]); if (ROWS > 5u) d5 += dot(w, x4[5ul*xs4 + k]); if (ROWS > 6u) d6 += dot(w, x4[6ul*xs4 + k]); if (ROWS > 7u) d7 += dot(w, x4[7ul*xs4 + k]); }
+        { float4 w = u4_hi(pk.z); uint k = g8 + 5u; if (ROWS > 0u) d0 += dot(w, x4[0ul*xs4 + k]); if (ROWS > 1u) d1 += dot(w, x4[1ul*xs4 + k]); if (ROWS > 2u) d2 += dot(w, x4[2ul*xs4 + k]); if (ROWS > 3u) d3 += dot(w, x4[3ul*xs4 + k]); if (ROWS > 4u) d4 += dot(w, x4[4ul*xs4 + k]); if (ROWS > 5u) d5 += dot(w, x4[5ul*xs4 + k]); if (ROWS > 6u) d6 += dot(w, x4[6ul*xs4 + k]); if (ROWS > 7u) d7 += dot(w, x4[7ul*xs4 + k]); }
+        { float4 w = u4_lo(pk.w); uint k = g8 + 6u; if (ROWS > 0u) d0 += dot(w, x4[0ul*xs4 + k]); if (ROWS > 1u) d1 += dot(w, x4[1ul*xs4 + k]); if (ROWS > 2u) d2 += dot(w, x4[2ul*xs4 + k]); if (ROWS > 3u) d3 += dot(w, x4[3ul*xs4 + k]); if (ROWS > 4u) d4 += dot(w, x4[4ul*xs4 + k]); if (ROWS > 5u) d5 += dot(w, x4[5ul*xs4 + k]); if (ROWS > 6u) d6 += dot(w, x4[6ul*xs4 + k]); if (ROWS > 7u) d7 += dot(w, x4[7ul*xs4 + k]); }
+        { float4 w = u4_hi(pk.w); uint k = g8 + 7u; if (ROWS > 0u) d0 += dot(w, x4[0ul*xs4 + k]); if (ROWS > 1u) d1 += dot(w, x4[1ul*xs4 + k]); if (ROWS > 2u) d2 += dot(w, x4[2ul*xs4 + k]); if (ROWS > 3u) d3 += dot(w, x4[3ul*xs4 + k]); if (ROWS > 4u) d4 += dot(w, x4[4ul*xs4 + k]); if (ROWS > 5u) d5 += dot(w, x4[5ul*xs4 + k]); if (ROWS > 6u) d6 += dot(w, x4[6ul*xs4 + k]); if (ROWS > 7u) d7 += dot(w, x4[7ul*xs4 + k]); }
+        if (ROWS > 0u) a0 += d0 * s;
+        if (ROWS > 1u) a1 += d1 * s;
+        if (ROWS > 2u) a2 += d2 * s;
+        if (ROWS > 3u) a3 += d3 * s;
+        if (ROWS > 4u) a4 += d4 * s;
+        if (ROWS > 5u) a5 += d5 * s;
+        if (ROWS > 6u) a6 += d6 * s;
+        if (ROWS > 7u) a7 += d7 * s;
+    }
+    if (ROWS > 0u) { float t = simd_sum(a0); if (lane == 0) y[0ul * p.y_stride + row] = p.round_out ? rbf(t) : t; }
+    if (ROWS > 1u) { float t = simd_sum(a1); if (lane == 0) y[1ul * p.y_stride + row] = p.round_out ? rbf(t) : t; }
+    if (ROWS > 2u) { float t = simd_sum(a2); if (lane == 0) y[2ul * p.y_stride + row] = p.round_out ? rbf(t) : t; }
+    if (ROWS > 3u) { float t = simd_sum(a3); if (lane == 0) y[3ul * p.y_stride + row] = p.round_out ? rbf(t) : t; }
+    if (ROWS > 4u) { float t = simd_sum(a4); if (lane == 0) y[4ul * p.y_stride + row] = p.round_out ? rbf(t) : t; }
+    if (ROWS > 5u) { float t = simd_sum(a5); if (lane == 0) y[5ul * p.y_stride + row] = p.round_out ? rbf(t) : t; }
+    if (ROWS > 6u) { float t = simd_sum(a6); if (lane == 0) y[6ul * p.y_stride + row] = p.round_out ? rbf(t) : t; }
+    if (ROWS > 7u) { float t = simd_sum(a7); if (lane == 0) y[7ul * p.y_stride + row] = p.round_out ? rbf(t) : t; }
 }

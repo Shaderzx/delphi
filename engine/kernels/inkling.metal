@@ -448,7 +448,9 @@ kernel void route(device const float* logits [[buffer(0)]],
         }
         float s[16];
         for (uint k = 0; k < p.top; ++k) s[k] = precise::exp(lp[k] - m);
-        float tot = ((s[0] + s[2]) + (s[1] + s[3])) + ((s[4] + s[6]) + (s[5] + s[7]));
+        float tot = 0.0f;
+        if (p.top == 8u) tot = ((s[0] + s[2]) + (s[1] + s[3])) + ((s[4] + s[6]) + (s[5] + s[7]));
+        else for (uint k = 0; k < p.top; ++k) tot += s[k];
         for (uint k = 0; k < p.top; ++k) {
             ids[k] = chosen[k];
             gammas[k] = precise::exp(lp[k] - (m + precise::log(tot))) * p.scale;
