@@ -36,7 +36,7 @@ def load_template(path):
     env = ImmutableSandboxedEnvironment(trim_blocks=True, lstrip_blocks=True, extensions=[GenerationBlock, "jinja2.ext.loopcontrols"])
     env.filters["tojson"] = tojson
     env.globals["raise_exception"] = raise_exception
-    return env.from_string(Path(path).read_text())
+    return env.from_string(Path(path).read_text(encoding="utf-8"))
 
 
 def render(template, prompt):
@@ -58,14 +58,14 @@ def served_model(server):
 
 
 def read_prompts(path):
-    with open(path) as handle:
+    with open(path, encoding="utf-8") as handle:
         return [json.loads(line) for line in handle if line.strip()]
 
 
 def finished_ids(path):
     if not path.exists():
         return set()
-    with open(path) as handle:
+    with open(path, encoding="utf-8") as handle:
         return {json.loads(line)["id"] for line in handle if line.strip()}
 
 
@@ -115,7 +115,7 @@ def main(argv):
     lock = threading.Lock()
     failures = 0
 
-    with open(args.out, "a") as out, ThreadPoolExecutor(max_workers=args.concurrency) as pool:
+    with open(args.out, "a", encoding="utf-8") as out, ThreadPoolExecutor(max_workers=args.concurrency) as pool:
         futures = {}
         for prompt in pending:
             text = render(template, prompt)

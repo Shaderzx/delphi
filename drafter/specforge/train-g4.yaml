@@ -1,0 +1,66 @@
+model:
+  target_model_path: /content/inkling
+  target_backend: sglang
+  trust_remote_code: true
+  tokenizer_pad_token_id: 200006
+  embedding_key: model.llm.embed.weight
+  lm_head_key: model.llm.unembed.weight
+  torch_dtype: bfloat16
+
+draft: /content/delphi/drafter/specforge/inkling-2-mini-dspine12.yaml
+
+data:
+  train_data_path: /content/data/train.jsonl
+  is_preformatted: true
+  max_length: 4096
+  chat_template: inkling-thinking
+  cache_dir: /content/cache/inkling-2-mini-dspine12
+  build_dataset_num_proc: 32
+
+training:
+  num_epochs: 3
+  batch_size: 2
+  accumulation_steps: 16
+  fsdp_sharding: NO_SHARD
+  learning_rate: 6.0e-4
+  lr_scheduler: cosine
+  warmup_ratio: 0.04
+  max_grad_norm: 1.0
+  attention_backend: flex_attention
+  objective_options:
+    num_anchors: 512
+  loss:
+    execution:
+      chunk_size: 32
+  save_interval: 500
+  log_interval: 25
+  dist_timeout: 30
+  seed: 42
+
+runtime:
+  producer_lease: 16
+  producer_concurrency: 2
+  in_flight_high_watermark: 48
+  in_flight_low_watermark: 32
+
+tracking:
+  report_to: tensorboard
+
+run_id: inkling-2-mini-dspine12
+output_dir: /content/outputs/inkling-2-mini-dspine12
+
+deployment:
+  mode: disaggregated
+  trainer:
+    nnodes: 1
+    nproc_per_node: 1
+  disaggregated:
+    control_dir: /content/outputs/inkling-2-mini-dspine12/control
+    consumer_state_dir: /content/outputs/inkling-2-mini-dspine12/consumer-state
+    backend: mooncake
+    client_buffer_size: 1073741824
+    server_urls:
+      - http://127.0.0.1:30000
+    mooncake_metadata_server: http://127.0.0.1:35880/metadata
+    mooncake_master_server_addr: 127.0.0.1:35551
+    mooncake_protocol: tcp
