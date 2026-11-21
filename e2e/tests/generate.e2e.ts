@@ -10,7 +10,7 @@ const oraclePython = process.env.DELPHI_ORACLE_PYTHON ?? 'python3';
 const CLEANUP_RESERVE_MS = 30_000;
 
 type Case = { text: string; input_ids: number[]; output_ids: number[] };
-type Generated = { output_ids: number[]; prompt_tokens: number; decode_tokens_per_s: number };
+type Generated = { output_ids: number[]; prompt_tokens: number; decode_tokens_per_s: number; accepted_per_step?: number };
 
 const truth = JSON.parse(readFileSync(join(import.meta.dirname, '..', 'fixtures', 'g4-sglang-greedy.json'), 'utf8')) as { cases: Case[] };
 const fibonacci = truth.cases.find((c) => c.text.startsWith('def fibonacci'))!;
@@ -123,6 +123,21 @@ test('delphi generate batched prefill and speculative verify match --spec off to
       const specRun = spawnSync(bin, ['generate', '--model', model, '--input-ids', JSON.stringify(c.input_ids), '--steps', '64', '--spec', 'auto'], { encoding: 'utf8', timeout: remainingMs(deadline) });
       checkRun('delphi generate --spec auto', specRun);
       expect((JSON.parse(specRun.stdout) as Generated).output_ids).toEqual((JSON.parse(offRun.stdout) as Generated).output_ids);
+    }
+  });
+});
+
+test('delphi generate --spec mtp matches --spec off token-for-token with multi-token acceptance', { tags: ['model'], timeout: 900_000 }, () => {
+  const deadline = Date.now() + 900_000;
+  withBuiltDelphi(deadline, (bin) => {
+    for (const c of [fibonacci, truth.cases[2]]) {
+      const offRun = spawnSync(bin, ['generate', '--model', model, '--input-ids', JSON.stringify(c.input_ids), '--steps', '64', '--spec', 'off'], { encoding: 'utf8', timeout: remainingMs(deadline) });
+      checkRun('delphi generate --spec off', offRun);
+      const mtpRun = spawnSync(bin, ['generate', '--model', model, '--input-ids', JSON.stringify(c.input_ids), '--steps', '64', '--spec', 'mtp'], { encoding: 'utf8', timeout: remainingMs(deadline) });
+      checkRun('delphi generate --spec mtp', mtpRun);
+      const mtpOut = JSON.parse(mtpRun.stdout) as Generated;
+      expect(mtpOut.output_ids).toEqual((JSON.parse(offRun.stdout) as Generated).output_ids);
+      expect(mtpOut.accepted_per_step ?? 0).toBeGreaterThan(1.3);
     }
   });
 });
