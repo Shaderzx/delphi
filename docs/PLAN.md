@@ -122,3 +122,93 @@ M1 e2e tests, each written first and seen failing, driven through the real CLI:
 - License: Apache-2.0 with a NOTICE file and CITATION.cff. Two of three members picked it: section 4(d) makes every redistribution and derivative keep the credit, it adds a patent grant, it matches the model's license, and companies adopt it. Sol preferred AGPL-3.0 with a section 7(b) attribution term, which also reaches hosted services but costs adoption.
 - Exact mode is the headline. Lossy modes are opt-in and labelled.
 - Tests are end-to-end only, written first. CI pins every action by commit SHA and every job has a 20-minute budget.
+
+## 9. Moonshot (council round 2)
+
+Round 2 (2026-11-21) asked the same three members to aim far past 100 tok/s, using the [inference-optimisation skill](https://github.com/sybil-solutions/inference-optimisation-skill) (ceiling first, one change at a time, interleaved controls, a ledger, long-context gates). Every number is arithmetic until the ledger measures it.
+
+### Star targets
+
+| Workload | Sol floor / star | Opus floor / star | Neon floor / star | Delphi target |
+|---|---|---|---|---|
+| Exact chat | 80 / 200 | 101 / 181 | 157 / 225 | **225** |
+| Exact code | 105 / 230 | 129 / 250 | 203 / 267 | **270** |
+| Exact copy-edit and tool calls | 160 / 380 | 174 / 385 | 423 / 680 | **680** |
+| Opt-in turbo chat | 140 / 350 | 190 / 365 | 236 / 470 | **470** |
+| 16 agents, total | 135 / 380 | 385 / 501 | 405 / 707 | **700** |
+| Prefill, 4K prompt | 1,000 / 2,800 | 1,150 / 1,640 | 1,830 / 4,400 | **4,400** |
+| Confidence in own exact-chat star | 20% | 30% | 55% | |
+
+The floors are the milestone gates; the stars are what Delphi aims for. Exact means token-identical to Delphi's own non-speculative batch-1 greedy on the shipped weights.
+
+### What gets there (all three agree)
+
+| Lever | Exact? | Bytes before -> after | Kill test |
+|---|---|---|---|
+| Grouped verify: one read of each weight tile serves every verify row, fixed per-row reduction order | yes | dense 7 x 2.78 GB -> 2.78 GB per step | state drift at any row count |
+| Cheap drafter: 4-bit body, pruned 8K-32K draft vocabulary, Markov head reranks a batched shortlist | yes | 1.45 GB -> 0.15-0.20 GB per block | acceptance drops more than 0.25 tokens |
+| Certified two-stage head: INT4 (or Hadamard INT3) coarse scan, BF16 rerank of every row that could still win | yes | 926 -> 190-340 MB | one invalid bound, or p99 survivors over 20K rows |
+| Lossless BF16 packing, decoded in threadgroup memory: measured entropy 10.57 bits per weight | yes | dense 2.73 -> 1.86-2.0 GB | under 1.25x a BF16 GEMV |
+| Lossless MXFP8 and NVFP4-scale packing (NVFP4 nibbles are 3.97/4 bits: leave them) | yes | experts -130 to -350 MB per step | under 7% saved |
+| Route-aware drafting: pick chains and sibling branches by accepted tokens per new expert byte | yes | g 2.5-3 -> 1.2-2 new experts per extra row | net gain under 5% |
+| Lookup drafts from a CPU suffix automaton, width grown 8 -> 16 -> 32 only while it keeps paying | yes | copy-edit 1.23 GB -> 0.40-0.65 GB per token | measured union at 32 rows over 70 experts |
+| Decode-style verify attention: each KV tile read once for all rows | yes | 1.64 -> 0.29 GB at 2K, 7 rows | step time grows per row with context |
+| Bubble-free streaming: a low-priority dispatch warms the next visit's weights into the system cache across barriers | yes | bandwidth efficiency 0.80 -> 0.92 | chain bandwidth already over 0.9 of copy |
+| Recorded Metal 4 graph with 3-4 fat dispatches per visit, not a spin megakernel | yes | dispatch overhead 5 ms -> 0.4 ms per step | graph gaps under 0.5 ms make it moot |
+| Turbo weights: NVFP4 attention, NVFP4 last-4 experts, FP8 KV | no | 4.2 -> 2.9 GB per token | quality gate |
+| Turbo routing: adaptive top-6/7, union-capped verify routing | no | experts -19 to -22% | quality gate |
+| Lenient acceptance, chat only, off inside code, grammar and tool calls | no | +0.8-1.2 accepted tokens | repeated-line and loop count |
+| Pass skip after loop pass 2 | no, high risk | -0.53 to -1.2 GB | top-1 agreement under 97% (`is_varloop` is false) |
+
+### Rejected, with the maths
+
+- Loop-as-drafter: one drafted token reads 1.3-1.8 GB, about 0.4 of a full forward, against 0.03 for a trained drafter.
+- Pipelining across loop passes or staggering users across passes: the same core weights per token, more prelude and coda reads.
+- ANE or CPU drafting for bandwidth: same DRAM, no extra GB/s, at most 1 ms of overlap per step.
+- Low-rank attention: exact compression cannot beat the 10.6-bit entropy floor; the lossy version loses to NVFP4.
+- Entropy-coding NVFP4 nibbles: 3.97 of 4 bits are already entropy.
+- Device-wide spin megakernel: no forward-progress guarantee on Apple GPUs, saves at most about 1 ms per step.
+
+### The two numbers that decide everything
+
+- **g**: new experts each extra verify row pulls in per layer visit. Random routing gives 7.5; the plan needs 1.2-2.
+- **alpha**: chance each drafted token is accepted. The plan needs 0.85 on chat.
+
+Week one measures both from the fp32 oracle before any kernel is written.
+
+### Week one, in order
+
+1. Hardware truth: copy bandwidth, a chain of 192 dependent GEMVs with and without the cache pump, `matmul2d` FP16/INT8 at 4096^3 and 8192^3, row-invariance for M = 1..32, barrier cost. Re-anchor every ceiling if copy bandwidth is under 250 GB/s.
+2. Route overlap and acceptance from the oracle: g for chains, sibling branches and lookup rows (M = 1..32); acceptance by depth for the bundled drafter at BF16 and 4-bit, full and pruned vocabulary. g >= 5 caps chains at 3 tokens and the exact-chat star falls to about 120.
+3. Certified head: survivor counts and 100% greedy agreement on 2,000 real hidden states.
+4. Fused lossless BF16 GEMV against BF16, bit-exact.
+5. End-to-end Metal 4 verify step at M = 1..8, 2K and 32K, against the oracle.
+
+### Ledger rules (from the skill, adapted to this Mac)
+
+- Append-only `ledger.jsonl`: commit, config hash, lever, exact or turbo, workload bucket, context, k, acceptance by depth, step time split into attention / experts / head / KV / draft, GB/s per kernel class, union per visit, g, median of at least 6 runs, both neighbouring controls, power state, output-token hash, verdict and reason. `PLAN.md` and `THEORY.md` from day 0; negative results are kept.
+- One change per config, derived from `best-config.json`; control, candidate, control. Accept only if the candidate beats both controls and no bucket (chat, code, tool, copy) drops more than 3%. Repeat any surprising win.
+- The bench refuses to run off AC power, in low-power mode, with a foreign GPU process or with thermal pressure, and voids the run if any of that changed by the end. Nothing that raises a macOS permission prompt. Report minute 10 of a 10-minute soak, not the cold burst.
+- Exact gate: token-identical to non-speculative batch 1 on the whole panel, plus bitwise invariance across verify widths {1, 2, 4, 8, 16, 32} and prefill chunks {1, 64, 512, 4096}.
+- Long-context gate: three needles at 50% and 100% of 32K and 128K, found exactly, with tok/s at 32K.
+- Tokens counted from engine counters, never streamed chunks. One GPU job at a time. Every number reported as a percentage of its ceiling.
+- The skill's `ceiling.py` multiplies aggregate throughput by concurrency twice and never checks the compute limit; Delphi's ceiling script fixes both.
+
+## 10. Bespoke 12-token drafter
+
+The bundled drafter proposes at most 7 tokens per block. Delphi trains its own: a DSpine drafter (parallel drafting with adjacent causal injection through depth, [arXiv 2609.36173](https://arxiv.org/abs/2609.36173)) that proposes 12 tokens per block, trained on a Colab G4 (RTX PRO 6000 Blackwell, 96 GB). Drafter quality never affects exactness; it only changes how many tokens each verify step commits.
+
+| Choice | Value | Why |
+|---|---|---|
+| Block | 12 proposals plus the anchor | the length asked for; at union-overlap g=2 the 12th token still pays on code and copy |
+| Body | 5 DSpine layers, hidden 2304 | DSpine's depth; hidden matches the target so taps need no projection |
+| Warm start | layers from the bundled `mtp.safetensors` drafter | it already reads Inkling's hidden states |
+| Taps | layer visits 5, 17, 29, 41, 47: end of the prelude, end of each loop pass, last visit | one tap per stage of the loop |
+| Draft vocabulary | the smallest shortlist covering at least 99% of the target's greedy tokens on the training corpus (expected 16K-32K) | the head is the drafter's biggest read |
+| Mask token | an unused padding id (>= 200058) | no collision with real tokens |
+| Data | prompts from chat, code, tool-call and agent traces, answered by Inkling itself (self-distillation, greedy and T=0.7) | the drafter must imitate this target, not a dataset |
+| Teacher signal | taps and top-k logits from the target with BF16 activations (W4A16), matching Delphi's numerics | the Blackwell FP4-activation path differs slightly from Delphi's |
+| Trainer | SpecForge DSpine objective, online, with SGLang (Inkling support, PR #51926) serving the target | SpecForge's merged DSpine objective |
+| Export | 4-bit body, INT4 pruned head, INT8 Markov or transition table, loaded by Delphi's Metal drafter kernel | about 0.15-0.2 GB per block |
+
+Gate: mean accepted length on a held-out chat / code / tool panel beats the bundled drafter at the same verify cost, measured in the same replay harness, before any Metal drafter kernel is written.

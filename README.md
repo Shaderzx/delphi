@@ -13,6 +13,8 @@ Status: planning. No engine code yet. Read [docs/PLAN.md](docs/PLAN.md) for the 
 | llama.cpp, UD-Q4_K_XL | 28.4 |
 | Delphi exact, shipped weights, no speculation (ceiling) | 53 |
 | Delphi exact with speculation (milestone M3 gate) | 100 chat, 130 code |
+| Delphi moonshot targets, exact | 225 chat, 270 code, 680 copy-edit |
+| Delphi moonshot target, opt-in turbo | 470 chat |
 
 Exact means token-identical to Delphi's own plain greedy decoding on the shipped weights. Faster modes that change the output are opt-in and labelled.
 
