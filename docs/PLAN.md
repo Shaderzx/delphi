@@ -10,6 +10,8 @@ Machine: Apple M5 Pro MacBook Pro, 20-core GPU with a Neural Accelerator per cor
 
 Measured (`delphi probe bandwidth`, `bench/ledger.jsonl`, harness: Metal streaming read, context: not applicable): the median pass streams **266 GB/s** from a 4-8 GiB buffer, 87% of the spec; the best pass reaches 271-283 GB/s. Plan with 266.
 
+Measured (`delphi probe chain`, `bench/ledger.jsonl`, harness: 192 dependent 2304 x 2304 BF16 GEMVs, 2.04 GB per step, context: not applicable): one row streams 263-272 GB/s, so chaining costs nothing against the plain read. One weight read serves several verify rows at 0.98x the one-row step at 2 rows, 0.99x at 4, 1.11x at 8, 1.88x at 16 and 4.42x at 32, and every row ends on the same bits at every width from 1 to 32. Grouped verify holds up to 8 rows with the scalar kernel; wider verify needs a simdgroup-matrix kernel.
+
 Model: `thinkingmachines/Inkling-2-Mini`, Apache-2.0. Hidden 2304, 24 physical layers, 24 query / 8 KV heads, head_dim 128. Layers 6-17 are a loop core run three times per token, so a token makes 48 layer visits. MoE on every layer: 128 experts, top-8, no shared expert, intermediate 1152. Local sliding-window attention (1024) everywhere except layers 5, 11, 17 and 23. Learned relative position logits instead of RoPE, an input-dependent attention sink, an output gate, short convolutions (k=4) and attention-residual blocks of 6. Vocabulary 201,024. Bundled drafter: 3 dense layers proposing 8 tokens from hidden-state taps at visits 5, 23, 41 and 48, with a GRU Markov head.
 
 What ships in the file (1,244 tensors, 19,525,870,752 data bytes):
