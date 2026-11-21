@@ -21,7 +21,7 @@ type Gemv = {
   gb_per_s_median: number;
 };
 
-type Chain = { layers: number; n: number; mode: string; bytes_per_step: number; output_hash: string; seconds_median: number; gb_per_s_median: number };
+type Chain = { layers: number; n: number; rows: number; mode: string; bytes_per_step: number; output_hash: string; seconds_median: number; gb_per_s_median: number };
 
 function withEngine<T>(use: (delphi: (args: string[]) => string) => T): T {
   const out = mkdtempSync(join(tmpdir(), 'delphi-build-'));
@@ -109,5 +109,20 @@ test('probe chain runs 192 dependent GEMVs in one GPU submission and ends on the
     expect(chained.output_hash).toBe(stepwise.output_hash);
     expect(chained.seconds_median).toBeGreaterThan(0);
     expect(chained.gb_per_s_median).toBeCloseTo(chained.bytes_per_step / chained.seconds_median / 1e9, 3);
+  });
+});
+test('probe chain carries 8 verify rows through 192 layers on one read of each weight and ends on the same bits as one submission per layer', () => {
+  const layers = 192;
+  const n = 2304;
+  withEngine((delphi) => {
+    const args = ['chain', '--layers', String(layers), '--n', String(n), '--rows', '8', '--seed', '3', '--repeats', '6'];
+    const chained = JSON.parse(delphi([...args, '--mode', 'chained'])) as Chain;
+    const stepwise = JSON.parse(delphi([...args, '--mode', 'stepwise'])) as Chain;
+    const single = JSON.parse(delphi(['chain', '--layers', String(layers), '--n', String(n), '--seed', '3', '--repeats', '6'])) as Chain;
+    expect(chained.rows).toBe(8);
+    expect(single.rows).toBe(1);
+    expect(chained.bytes_per_step).toBe(layers * n * n * 2);
+    expect(chained.output_hash).toBe(stepwise.output_hash);
+    expect(chained.output_hash).not.toBe(single.output_hash);
   });
 });
