@@ -183,8 +183,10 @@ public:
     void bind_a(uint32_t slot, int index) { [enc setBuffer:arena offset:so(slot) atIndex:index]; }
     void bind_t(const std::string& name, int index) { [enc setBuffer:file offset:T(name).offset atIndex:index]; }
     void use(const std::string& name) { [enc setComputePipelineState:pipes.at(name)]; }
-    void grid(NSUInteger groups, NSUInteger threads) { [enc dispatchThreadgroups:MTLSizeMake(groups, 1, 1) threadsPerThreadgroup:MTLSizeMake(threads, 1, 1)]; }
-    void grid2(NSUInteger gx, NSUInteger gy, NSUInteger threads) { [enc dispatchThreadgroups:MTLSizeMake(gx, gy, 1) threadsPerThreadgroup:MTLSizeMake(threads, 1, 1)]; }
+    bool together = false;
+    void barrier() { if (!together) [enc memoryBarrierWithScope:MTLBarrierScopeBuffers]; }
+    void grid(NSUInteger groups, NSUInteger threads) { barrier(); [enc dispatchThreadgroups:MTLSizeMake(groups, 1, 1) threadsPerThreadgroup:MTLSizeMake(threads, 1, 1)]; }
+    void grid2(NSUInteger gx, NSUInteger gy, NSUInteger threads) { barrier(); [enc dispatchThreadgroups:MTLSizeMake(gx, gy, 1) threadsPerThreadgroup:MTLSizeMake(threads, 1, 1)]; }
 
     struct GemvP { uint32_t rows, cols, round_out; float scale; };
     void gemv(const std::string& weight, std::function<void(int)> in, std::function<void(int)> out, bool round_out = true) {
@@ -235,7 +237,10 @@ public:
     std::vector<uint32_t> loop_messages(const std::vector<uint32_t>& bank, uint32_t core_layer, bool attn_side) {
         std::vector<uint32_t> out;
         if (attn_side) {
+            [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+            together = true;
             for (int k = 0; k < 3; ++k) out.push_back(res(bank, -1, "loop_attn" + std::to_string(core_layer) + "_" + std::to_string(k), 1)[0]);
+            together = false;
         } else {
             out.push_back(res(bank, -1, "loop_mlp" + std::to_string(core_layer), 1)[0]);
         }
@@ -252,8 +257,11 @@ public:
         [enc setBytes:&n length:4 atIndex:3];
         grid(1, 1024);
         gemv(base + "down_weight", S("normed"), S("ctlh"));
+        [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+        together = true;
         gemv(base + "gain_weight", S("ctlh"), S("gain"), false);
         gemv(base + "forget_weight", S("ctlh"), S("forget"), false);
+        together = false;
         uint32_t out = alloc();
         use("ctl_mix");
         bind_a(dest, 0);
@@ -294,6 +302,8 @@ public:
     uint32_t attention(uint32_t layer, uint32_t visit, uint32_t sq, uint32_t sk, uint32_t sv, uint32_t pos) {
         std::string L = "layers." + std::to_string(layer) + ".attn.";
         bool local = c.local[layer];
+        [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+        together = true;
         gemv(L + "wq_du.weight", A(sq), S("q"));
         gemv(L + "wr_du.weight", A(sq), S("r"));
         gemv(L + "gate_attn.weight", A(sq), S("gate"));
@@ -301,20 +311,31 @@ public:
         gemv(L + "wk_dv.weight", A(sk), S("kraw"));
         gemv(L + "wv_dv.weight", A(sv), S("vraw"));
         uint32_t kvw = c.kv_heads * c.head_dim;
+        if (!local) {
+            gemv(L + "k_sconv.weight_proj", A(sk), S("dynk"));
+            gemv(L + "v_sconv.weight_proj", A(sv), S("dynv"));
+        }
+        together = false;
+        [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+        together = true;
         if (local) {
             sconv(S("kraw"), conv[{visit, 0}], L + "k_sconv.weight", nullptr, S("k"), kvw, false);
             sconv(S("vraw"), conv[{visit, 1}], L + "v_sconv.weight", nullptr, S("v"), kvw, false);
         } else {
-            gemv(L + "k_sconv.weight_proj", A(sk), S("dynk"));
-            gemv(L + "v_sconv.weight_proj", A(sv), S("dynv"));
             sconv(S("kraw"), conv[{visit, 0}], L + "k_sconv.static_w", S("dynk"), S("k"), kvw, true);
             sconv(S("vraw"), conv[{visit, 1}], L + "v_sconv.static_w", S("dynv"), S("v"), kvw, true);
         }
+        together = false;
+        [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+        together = true;
         float tau = local ? 1.0f : 1.0f + c.alpha * std::log(std::max((pos + 1.0f) / float(c.n_floor), 1.0f));
         clip("q", L + "q_l2_clip.scale", "qc", c.heads, c.head_dim, c.clip_qk, tau, 0);
         clip("k", "", "kc", c.kv_heads, c.head_dim, c.clip_qk, 1.0f, 0);
         clip("v", "", "vc", c.kv_heads, c.head_dim, 0, 1.0f, 1);
         clip("r", L + "rel_l2_clip.scale", "rc", c.heads, c.d_rel, c.clip_rel, tau, 0);
+        together = false;
+        [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+        together = true;
         uint32_t dims[2] = {c.d_rel, c.rel_extent};
         use("rel_bias");
         bind_s("rc", 0);
@@ -330,6 +351,7 @@ public:
         [enc setBuffer:vcache[visit] offset:0 atIndex:3];
         [enc setBytes:store length:8 atIndex:4];
         grid((kvw + 255) / 256, 256);
+        together = false;
         uint32_t start = local && pos + 1 > c.window ? pos + 1 - c.window : 0;
         AttnP a{pos, start, c.kv_heads, c.heads / c.kv_heads, c.head_dim, c.rel_extent, 1.0f / std::sqrt(float(c.head_dim))};
         use("attend");
@@ -513,7 +535,7 @@ public:
         next_slot = 0;
         *static_cast<uint32_t*>(token.contents) = tok;
         id<MTLCommandBuffer> cb = [gpu.queue commandBuffer];
-        enc = [cb computeCommandEncoder];
+        enc = [cb computeCommandEncoderWithDispatchType:MTLDispatchTypeConcurrent];
         uint32_t emb = alloc();
         uint32_t H = c.hidden;
         use("embed_row");
