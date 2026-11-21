@@ -86,11 +86,17 @@ PATCHES = [
     ),
 ]
 
+DELETION_CONTEXT = {
+    "specforge: greedy drafting treats the monotone final softcap as neutral": "    neutral_values = {\n",
+}
+
 
 def apply(name, path, old, new):
     text = path.read_text()
     if new and new in text:
         return "already applied"
+    if not new and DELETION_CONTEXT[name] not in text:
+        raise SystemExit(f"patch_upstream: {name}: context {DELETION_CONTEXT[name]!r} not found in {path}")
     if old in text:
         path.write_text(text.replace(old, new, 1))
         return "applied"

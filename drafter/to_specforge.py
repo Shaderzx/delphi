@@ -13,7 +13,7 @@ def parse_args(argv):
 
 
 def read_records(path):
-    with open(path) as handle:
+    with open(path, encoding="utf-8") as handle:
         return [json.loads(line) for line in handle if line.strip()]
 
 
@@ -35,7 +35,7 @@ def main(argv):
         print(f"to_specforge: records {foreign[:20]} come from {models}, expected {args.expect_model}", file=sys.stderr)
         return 2
     kept = list(usable(records))
-    with open(args.out, "w") as out:
+    with open(args.out, "w", encoding="utf-8") as out:
         for line in kept:
             out.write(json.dumps(line, ensure_ascii=False) + "\n")
     print(f"to_specforge: kept {len(kept)} of {len(records)} records")
