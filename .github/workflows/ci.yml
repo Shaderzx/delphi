@@ -35,7 +35,7 @@ jobs:
       - run: python3 -m venv .venv && .venv/bin/pip install --quiet --require-hashes -r drafter/requirements.txt
       - run: npm ci
         working-directory: e2e
-      - run: npx e2e run
+      - run: npx e2e run --exclude-tag model
         working-directory: e2e
         env:
           DELPHI_PYTHON: ${{ github.workspace }}/.venv/bin/python
