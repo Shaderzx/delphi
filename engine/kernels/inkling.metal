@@ -389,6 +389,16 @@ kernel void quant_mxfp8(device const float* x [[buffer(0)]],
     }
 }
 
+inline float fp4(uint code) {
+    uint mag = code & 7u;
+    float v = mag < 2u ? float(mag) * 0.5f : float(as_type<half>(ushort((mag << 9) + 0x3800u)));
+    return (code & 8u) ? -v : v;
+}
+
+inline float4 fp4x4(uint bits) {
+    return float4(fp4(bits & 15u), fp4((bits >> 4) & 15u), fp4((bits >> 8) & 15u), fp4((bits >> 12) & 15u));
+}
+
 struct Expert { uint rows; uint cols; uint in_stride; uint out_stride; uint per_row_input; ulong expert_bytes; ulong scale_bytes; };
 
 kernel void expert_nvfp4(device const uchar* w [[buffer(0)]],
@@ -413,15 +423,13 @@ kernel void expert_nvfp4(device const uchar* w [[buffer(0)]],
     device const uchar* sr = sc + ulong(e) * p.scale_bytes + ulong(row) * (p.cols / 16u);
     device const float* xr = x + (p.per_row_input ? k * p.in_stride : 0u);
     float acc = 0;
+    device const float4* x4 = (device const float4*)xr;
     for (uint b = lane; b < p.cols / 16u; b += 32u) {
         uint2 packed = *(device const uint2*)(wr + b * 8u);
         float s = e4m3[sr[b]];
-        float part = 0;
-        for (uint j = 0; j < 8; ++j) {
-            uint byte = (j < 4 ? (packed.x >> (8u * j)) : (packed.y >> (8u * (j - 4u)))) & 0xffu;
-            part += FP4_VALUES[byte & 15u] * xr[b * 16u + 2u * j] + FP4_VALUES[byte >> 4] * xr[b * 16u + 2u * j + 1u];
-        }
-        acc += part * s;
+        float4 part = fp4x4(packed.x) * x4[b * 4u] + fp4x4(packed.x >> 16) * x4[b * 4u + 1u]
+                    + fp4x4(packed.y) * x4[b * 4u + 2u] + fp4x4(packed.y >> 16) * x4[b * 4u + 3u];
+        acc += ((part.x + part.y) + (part.z + part.w)) * s;
     }
     float total = simd_sum(acc);
     if (lane == 0) {
