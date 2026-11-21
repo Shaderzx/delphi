@@ -843,3 +843,303 @@ kernel void argmax_logits(device const float* l [[buffer(0)]],
         token[0] = idx;
     }
 }
+
+struct CertHead { uint vocab; uint cols; uint ng; float cap; };
+
+inline float4 u4_lo(uint w) {
+    return float4(float(w & 15u), float((w >> 4) & 15u), float((w >> 8) & 15u), float((w >> 12) & 15u)) - 8.0f;
+}
+
+inline float4 u4_hi(uint w) {
+    return float4(float((w >> 16) & 15u), float((w >> 20) & 15u), float((w >> 24) & 15u), float((w >> 28) & 15u)) - 8.0f;
+}
+
+kernel void build_cert_head(device const uint4* w [[buffer(0)]],
+                            device uint4* q4 [[buffer(1)]],
+                            device half* sc [[buffer(2)]],
+                            device float* err [[buffer(3)]],
+                            constant CertHead& p [[buffer(4)]],
+                            uint group [[threadgroup_position_in_grid]],
+                            uint simd [[simdgroup_index_in_threadgroup]],
+                            uint simds [[simdgroups_per_threadgroup]],
+                            uint lane [[thread_index_in_simdgroup]]) {
+    uint row = group * simds + simd;
+    if (row >= p.vocab) return;
+    uint chunks = p.cols / 8u;
+    device const uint4* wr = w + ulong(row) * chunks;
+    float err2 = 0.0f;
+    for (uint g = lane; g < p.ng; g += 32u) {
+        float vals[32];
+        float amax = 0.0f;
+        for (uint u = 0; u < 4u; ++u) {
+            uint4 pk = wr[g * 4u + u];
+            uint b = u * 8u;
+            vals[b + 0u] = as_type<float>(pk.x << 16);
+            vals[b + 1u] = as_type<float>(pk.x & 0xffff0000u);
+            vals[b + 2u] = as_type<float>(pk.y << 16);
+            vals[b + 3u] = as_type<float>(pk.y & 0xffff0000u);
+            vals[b + 4u] = as_type<float>(pk.z << 16);
+            vals[b + 5u] = as_type<float>(pk.z & 0xffff0000u);
+            vals[b + 6u] = as_type<float>(pk.w << 16);
+            vals[b + 7u] = as_type<float>(pk.w & 0xffff0000u);
+            for (uint j = 0; j < 8u; ++j) amax = max(amax, fabs(vals[b + j]));
+        }
+        half sh = half(amax / 7.0f);
+        float s = float(sh);
+        float inv = s > 0.0f ? (1.0f / s) : 0.0f;
+        uint packed[4] = {0u, 0u, 0u, 0u};
+        for (uint u = 0; u < 4u; ++u) {
+            uint word = 0u;
+            for (uint j = 0; j < 8u; ++j) {
+                float v = vals[u * 8u + j];
+                int q = s > 0.0f ? clamp(int(rint(v * inv)), -7, 7) : 0;
+                float diff = v - float(q) * s;
+                err2 += diff * diff;
+                word |= uint(q + 8) << (j * 4u);
+            }
+            packed[u] = word;
+        }
+        q4[ulong(row) * p.ng + g] = uint4(packed[0], packed[1], packed[2], packed[3]);
+        sc[ulong(row) * p.ng + g] = sh;
+    }
+    float total = simd_sum(err2);
+    if (lane == 0) err[row] = precise::sqrt(total) * 1.001f + 1e-6f;
+}
+
+kernel void cert_head_xnorm(device const float4* x [[buffer(0)]],
+                            device float* state [[buffer(1)]],
+                            device uint* count [[buffer(2)]],
+                            constant uint& n [[buffer(3)]],
+                            uint tid [[thread_position_in_threadgroup]],
+                            uint threads [[threads_per_threadgroup]],
+                            uint lane [[thread_index_in_simdgroup]],
+                            uint simd [[simdgroup_index_in_threadgroup]]) {
+    threadgroup float part[20];
+    uint n4 = n / 4u;
+    float s = tid < n4 ? dot(x[tid], x[tid]) : 0.0f;
+    for (uint i = tid + threads; i < n4; i += threads) s += dot(x[i], x[i]);
+    s = simd_sum(s);
+    if (lane == 0) part[simd] = s;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid == 0) {
+        float tot = 0.0f;
+        for (uint i = 0; i < (threads + 31u) / 32u; ++i) tot += part[i];
+        state[2] = precise::sqrt(tot);
+        count[0] = 0u;
+    }
+}
+
+kernel void cert_head_scan(device const uint4* q4 [[buffer(0)]],
+                           device const half* sc [[buffer(1)]],
+                           device const float* err [[buffer(2)]],
+                           device const float4* x4 [[buffer(3)]],
+                           device const float* state [[buffer(4)]],
+                           device float* ub_out [[buffer(5)]],
+                           device float* tg_val [[buffer(6)]],
+                           device uint* tg_row [[buffer(7)]],
+                           constant CertHead& p [[buffer(8)]],
+                           uint group [[threadgroup_position_in_grid]],
+                           uint simd [[simdgroup_index_in_threadgroup]],
+                           uint simds [[simdgroups_per_threadgroup]],
+                           uint lane [[thread_index_in_simdgroup]]) {
+    threadgroup float svals[8];
+    threadgroup uint srows[8];
+    uint row = group * simds + simd;
+    if (row < p.vocab) {
+        device const uint4* qr = q4 + ulong(row) * p.ng;
+        device const half* sr = sc + ulong(row) * p.ng;
+        float acc = 0.0f;
+        for (uint g = lane; g < p.ng; g += 32u) {
+            uint4 pk = qr[g];
+            float s = float(sr[g]);
+            device const float4* xg = x4 + g * 8u;
+            float4 d = u4_lo(pk.x) * xg[0] + u4_hi(pk.x) * xg[1]
+                     + u4_lo(pk.y) * xg[2] + u4_hi(pk.y) * xg[3]
+                     + u4_lo(pk.z) * xg[4] + u4_hi(pk.z) * xg[5]
+                     + u4_lo(pk.w) * xg[6] + u4_hi(pk.w) * xg[7];
+            acc += ((d.x + d.y) + (d.z + d.w)) * s;
+        }
+        float shat = simd_sum(acc);
+        if (lane == 0) {
+            ub_out[row] = shat + state[2] * err[row];
+            svals[simd] = shat;
+            srows[simd] = row;
+        }
+    } else if (lane == 0) {
+        svals[simd] = -INFINITY;
+        srows[simd] = 0xffffffffu;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (simd == 0 && lane == 0) {
+        float bv = svals[0];
+        uint br = srows[0];
+        for (uint i = 1; i < simds; ++i) {
+            if (svals[i] > bv || (svals[i] == bv && srows[i] < br)) { bv = svals[i]; br = srows[i]; }
+        }
+        tg_val[group] = bv;
+        tg_row[group] = br;
+    }
+}
+
+struct CertTau { uint ntg; uint cols; float cap; };
+
+kernel void cert_head_tau(device const float* tg_val [[buffer(0)]],
+                          device const uint* tg_row [[buffer(1)]],
+                          device const uint4* w [[buffer(2)]],
+                          device const float4* x4 [[buffer(3)]],
+                          device float* state [[buffer(4)]],
+                          constant CertTau& p [[buffer(5)]],
+                          uint tid [[thread_position_in_threadgroup]],
+                          uint lane [[thread_index_in_simdgroup]],
+                          uint simd [[simdgroup_index_in_threadgroup]]) {
+    threadgroup float exact_s[16];
+    float bv = -INFINITY;
+    uint br = 0xffffffffu;
+    for (uint i = tid; i < p.ntg; i += 512u) {
+        float v = tg_val[i];
+        uint r = tg_row[i];
+        if (v > bv || (v == bv && r < br)) { bv = v; br = r; }
+    }
+    for (uint off = 16; off > 0; off /= 2) {
+        float ov = simd_shuffle_xor(bv, off);
+        uint oi = simd_shuffle_xor(br, off);
+        if (ov > bv || (ov == bv && oi < br)) { bv = ov; br = oi; }
+    }
+    float sv = -INFINITY;
+    if (br != 0xffffffffu) {
+        uint chunks = p.cols / 8u;
+        device const uint4* wr = w + ulong(br) * chunks;
+        float acc = 0.0f;
+        for (uint c = lane; c < chunks; c += 32u) {
+            uint4 pk = wr[c];
+            float4 a = x4[c * 2u];
+            float4 b = x4[c * 2u + 1u];
+            acc += as_type<float>(pk.x << 16) * a.x + as_type<float>(pk.x & 0xffff0000u) * a.y
+                 + as_type<float>(pk.y << 16) * a.z + as_type<float>(pk.y & 0xffff0000u) * a.w
+                 + as_type<float>(pk.z << 16) * b.x + as_type<float>(pk.z & 0xffff0000u) * b.y
+                 + as_type<float>(pk.w << 16) * b.z + as_type<float>(pk.w & 0xffff0000u) * b.w;
+        }
+        float z = rbf(simd_sum(acc));
+        sv = rbf(p.cap * precise::tanh(z / p.cap));
+    }
+    if (lane == 0) exact_s[simd] = sv;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid == 0) {
+        float tau_s = exact_s[0];
+        for (uint i = 1; i < 16u; ++i) tau_s = max(tau_s, exact_s[i]);
+        uint bits = as_type<uint>(tau_s);
+        uint exp = (bits >> 23) & 0xffu;
+        float ulp = exp > 7u ? as_type<float>((exp - 7u) << 23) : 1e-6f;
+        float s_lo = tau_s - ulp;
+        float u = clamp(s_lo / p.cap, -0.9999f, 0.9999f);
+        float z_lo = p.cap * 0.5f * precise::log((1.0f + u) / (1.0f - u));
+        state[0] = z_lo - fabs(z_lo) * 0.005f - 0.01f;
+        state[1] = tau_s;
+    }
+}
+
+kernel void cert_head_filter(device const float* ub [[buffer(0)]],
+                             device const float* state [[buffer(1)]],
+                             device atomic_uint* count [[buffer(2)]],
+                             device uint* cands [[buffer(3)]],
+                             constant uint& vocab [[buffer(4)]],
+                             uint gid [[thread_position_in_grid]],
+                             uint lane [[thread_index_in_simdgroup]]) {
+    bool keep = gid < vocab && ub[gid] >= state[0];
+    uint rank = simd_prefix_exclusive_sum(uint(keep));
+    uint tot = simd_sum(uint(keep));
+    uint base = 0u;
+    if (lane == 0 && tot > 0u) base = atomic_fetch_add_explicit(count, tot, memory_order_relaxed);
+    base = simd_broadcast_first(base);
+    if (keep) cands[base + rank] = gid;
+}
+
+kernel void cert_head_setup(device const uint* count [[buffer(0)]],
+                            device uint* indirect [[buffer(1)]]) {
+    uint c = count[0];
+    indirect[0] = max((c + 7u) / 8u, 1u);
+    indirect[1] = 1u;
+    indirect[2] = 1u;
+}
+
+kernel void cert_head_rescore(device const uint4* w [[buffer(0)]],
+                              device const float4* x4 [[buffer(1)]],
+                              device const uint* cands [[buffer(2)]],
+                              device const uint* count [[buffer(3)]],
+                              device float* out_val [[buffer(4)]],
+                              device uint* out_row [[buffer(5)]],
+                              constant CertTau& p [[buffer(6)]],
+                              uint group [[threadgroup_position_in_grid]],
+                              uint simd [[simdgroup_index_in_threadgroup]],
+                              uint simds [[simdgroups_per_threadgroup]],
+                              uint lane [[thread_index_in_simdgroup]]) {
+    threadgroup float svals[8];
+    threadgroup uint srows[8];
+    uint idx = group * simds + simd;
+    uint cnt = count[0];
+    if (idx < cnt) {
+        uint row = cands[idx];
+        uint chunks = p.cols / 8u;
+        device const uint4* wr = w + ulong(row) * chunks;
+        float acc = 0.0f;
+        for (uint c = lane; c < chunks; c += 32u) {
+            uint4 pk = wr[c];
+            float4 a = x4[c * 2u];
+            float4 b = x4[c * 2u + 1u];
+            acc += as_type<float>(pk.x << 16) * a.x + as_type<float>(pk.x & 0xffff0000u) * a.y
+                 + as_type<float>(pk.y << 16) * a.z + as_type<float>(pk.y & 0xffff0000u) * a.w
+                 + as_type<float>(pk.z << 16) * b.x + as_type<float>(pk.z & 0xffff0000u) * b.y
+                 + as_type<float>(pk.w << 16) * b.z + as_type<float>(pk.w & 0xffff0000u) * b.w;
+        }
+        float z = rbf(simd_sum(acc));
+        float sv = rbf(p.cap * precise::tanh(z / p.cap));
+        if (lane == 0) { svals[simd] = sv; srows[simd] = row; }
+    } else if (lane == 0) {
+        svals[simd] = -INFINITY;
+        srows[simd] = 0xffffffffu;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (simd == 0 && lane == 0) {
+        float bv = svals[0];
+        uint br = srows[0];
+        for (uint i = 1; i < simds; ++i) {
+            if (svals[i] > bv || (svals[i] == bv && srows[i] < br)) { bv = svals[i]; br = srows[i]; }
+        }
+        out_val[group] = bv;
+        out_row[group] = br;
+    }
+}
+
+kernel void cert_head_argmax(device const float* in_val [[buffer(0)]],
+                             device const uint* in_row [[buffer(1)]],
+                             device const uint* indirect [[buffer(2)]],
+                             device uint* token [[buffer(3)]],
+                             uint tid [[thread_position_in_threadgroup]],
+                             uint threads [[threads_per_threadgroup]],
+                             uint lane [[thread_index_in_simdgroup]],
+                             uint simd [[simdgroup_index_in_threadgroup]]) {
+    threadgroup float bv[8];
+    threadgroup uint bi[8];
+    uint ngroups = indirect[0];
+    float best = -INFINITY;
+    uint idx = 0xffffffffu;
+    for (uint i = tid; i < ngroups; i += threads) {
+        float v = in_val[i];
+        uint r = in_row[i];
+        if (v > best || (v == best && r < idx)) { best = v; idx = r; }
+    }
+    for (uint off = 16; off > 0; off /= 2) {
+        float ov = simd_shuffle_down(best, off);
+        uint oi = simd_shuffle_down(idx, off);
+        if (ov > best || (ov == best && oi < idx)) { best = ov; idx = oi; }
+    }
+    if (lane == 0) { bv[simd] = best; bi[simd] = idx; }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid == 0) {
+        best = bv[0]; idx = bi[0];
+        for (uint i = 1; i < (threads + 31u) / 32u; ++i) {
+            if (bv[i] > best || (bv[i] == best && bi[i] < idx)) { best = bv[i]; idx = bi[i]; }
+        }
+        token[0] = idx;
+    }
+}

@@ -90,6 +90,28 @@ test('delphi bench refuses missing model or invalid repeat counts', { timeout: 3
     if (badRepeats.error) throw badRepeats.error;
     expect(badRepeats.status).toBe(2);
     expect(badRepeats.stderr).toContain('--repeats');
+    const badHead = spawnSync(bin, ['generate', '--model', '/nonexistent', '--input-ids', '[1]', '--head', 'bogus'], { encoding: 'utf8', timeout: remainingMs(deadline) });
+    if (badHead.error) throw badHead.error;
+    expect(badHead.status).toBe(2);
+    expect(badHead.stderr).toContain('--head');
+    const okHead = spawnSync(bin, ['generate', '--model', '/nonexistent', '--input-ids', '[1]', '--head', 'exact'], { encoding: 'utf8', timeout: remainingMs(deadline) });
+    if (okHead.error) throw okHead.error;
+    expect(okHead.status).toBe(3);
+  });
+});
+
+test('delphi generate certified exact head matches full BF16 head token-for-token', { tags: ['model'], timeout: 900_000 }, () => {
+  const deadline = Date.now() + 900_000;
+  withBuiltDelphi(deadline, (bin) => {
+    for (const c of [fibonacci, truth.cases[2]]) {
+      const fullRun = spawnSync(bin, ['generate', '--model', model, '--input-ids', JSON.stringify(c.input_ids), '--steps', '32', '--head', 'full'], { encoding: 'utf8', timeout: remainingMs(deadline) });
+      checkRun('delphi generate --head full', fullRun);
+      const exactRun = spawnSync(bin, ['generate', '--model', model, '--input-ids', JSON.stringify(c.input_ids), '--steps', '32', '--head', 'exact'], { encoding: 'utf8', timeout: remainingMs(deadline) });
+      checkRun('delphi generate --head exact', exactRun);
+      const fullOut = (JSON.parse(fullRun.stdout) as Generated).output_ids;
+      const exactOut = (JSON.parse(exactRun.stdout) as Generated).output_ids;
+      expect(exactOut).toEqual(fullOut);
+    }
   });
 });
 

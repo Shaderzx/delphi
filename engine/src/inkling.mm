@@ -62,7 +62,9 @@ struct Config {
 };
 
 NSDictionary* json_object(NSData* data) {
-    return [NSJSONSerialization JSONObjectWithData:data options:0 error:nil];
+    if (!data) return nil;
+    id obj = [NSJSONSerialization JSONObjectWithData:data options:0 error:nil];
+    return [obj isKindOfClass:[NSDictionary class]] ? obj : nil;
 }
 
 uint32_t u(NSDictionary* d, NSString* k) { return [d[k] unsignedIntValue]; }
@@ -80,7 +82,11 @@ public:
     id<MTLComputePipelineState> p_gemv, p_norm, p_res, p_sconv, p_clip, p_clip_kv, p_rel, p_attend, p_route;
     id<MTLComputePipelineState> p_qnv4, p_qmxf8, p_env4, p_emxf8, p_swiglu, p_swiglu_qnv4, p_combine;
     id<MTLComputePipelineState> p_ctl_norm, p_ctl_mix_norm, p_embed, p_softcap, p_argmax, p_round;
+    id<MTLComputePipelineState> p_ch_build, p_ch_xnorm, p_ch_scan, p_ch_tau, p_ch_filter, p_ch_setup, p_ch_rescore, p_ch_argmax;
     id<MTLBuffer> arena, queries, logits, token, scratch;
+    id<MTLBuffer> head_q4 = nil, head_sc = nil, head_err = nil;
+    id<MTLBuffer> ch_ub = nil, ch_tg_val = nil, ch_tg_row = nil, ch_state = nil, ch_count = nil, ch_cands = nil, ch_indirect = nil;
+    bool cert_head_ready = false;
     uint64_t s_q, s_qc, s_r, s_rc, s_gate, s_sinks, s_kraw, s_vraw, s_k, s_v, s_dynk, s_dynv, s_rel, s_gated;
     uint64_t s_router, s_ids, s_gammas, s_xq, s_outer, s_gu, s_h, s_hq, s_houter, s_rows;
     uint64_t s_normed[3], s_ctlh[3], s_gain[3], s_forget[3];
@@ -101,7 +107,7 @@ public:
         return {t.offset, uint32_t(t.shape[0]), uint32_t(t.bytes / 2 / t.shape[0])};
     }
 
-    bool load(const std::string& dir, std::string& error) {
+    bool load(const std::string& dir, bool use_cert_head, std::string& error) {
         auto opened = open_gpu(error);
         if (!opened) return false;
         gpu = *opened;
@@ -186,6 +192,14 @@ public:
         p_softcap = pipeline(gpu, @"softcap_logits");
         p_argmax = pipeline(gpu, @"argmax_logits");
         p_round = pipeline(gpu, @"round_rows");
+        p_ch_build = pipeline(gpu, @"build_cert_head");
+        p_ch_xnorm = pipeline(gpu, @"cert_head_xnorm");
+        p_ch_scan = pipeline(gpu, @"cert_head_scan");
+        p_ch_tau = pipeline(gpu, @"cert_head_tau");
+        p_ch_filter = pipeline(gpu, @"cert_head_filter");
+        p_ch_setup = pipeline(gpu, @"cert_head_setup");
+        p_ch_rescore = pipeline(gpu, @"cert_head_rescore");
+        p_ch_argmax = pipeline(gpu, @"cert_head_argmax");
         arena = [gpu.device newBufferWithLength:uint64_t(slots) * c.hidden * 4 options:MTLResourceStorageModePrivate];
         if (!arena) { error = "arena allocation failed"; return false; }
         build_queries();
@@ -248,6 +262,46 @@ public:
                 conv[v][s] = b;
             }
         }
+        if (use_cert_head && (c.hidden % 32 == 0) && c.vocab >= 64) {
+            if (!build_cert_head(error)) return false;
+        }
+        return true;
+    }
+
+    struct CertHeadP { uint32_t vocab, cols, ng; float cap; };
+    struct CertTauP { uint32_t ntg, cols; float cap; };
+
+    bool build_cert_head(std::string& error) {
+        uint32_t V = c.vocab;
+        uint32_t ng = c.hidden / 32;
+        uint32_t ntg = (V + 7) / 8;
+        head_q4 = [gpu.device newBufferWithLength:uint64_t(V) * ng * 16 options:MTLResourceStorageModePrivate];
+        head_sc = [gpu.device newBufferWithLength:uint64_t(V) * ng * 2 options:MTLResourceStorageModePrivate];
+        head_err = [gpu.device newBufferWithLength:uint64_t(V) * 4 options:MTLResourceStorageModePrivate];
+        ch_ub = [gpu.device newBufferWithLength:uint64_t(V) * 4 options:MTLResourceStorageModePrivate];
+        ch_tg_val = [gpu.device newBufferWithLength:uint64_t(ntg) * 4 options:MTLResourceStorageModePrivate];
+        ch_tg_row = [gpu.device newBufferWithLength:uint64_t(ntg) * 4 options:MTLResourceStorageModePrivate];
+        ch_state = [gpu.device newBufferWithLength:16 options:MTLResourceStorageModePrivate];
+        ch_count = [gpu.device newBufferWithLength:16 options:MTLResourceStorageModeShared];
+        ch_cands = [gpu.device newBufferWithLength:uint64_t(V) * 4 options:MTLResourceStorageModePrivate];
+        ch_indirect = [gpu.device newBufferWithLength:16 options:MTLResourceStorageModePrivate];
+        if (!head_q4 || !head_sc || !head_err || !ch_ub || !ch_tg_val || !ch_tg_row || !ch_state || !ch_count || !ch_cands || !ch_indirect) {
+            error = "certified head allocation failed";
+            return false;
+        }
+        id<MTLCommandBuffer> cb = [gpu.queue commandBuffer];
+        id<MTLComputeCommandEncoder> e = [cb computeCommandEncoder];
+        CertHeadP p{V, c.hidden, ng, c.softcap};
+        [e setComputePipelineState:p_ch_build];
+        [e setBuffer:file offset:unembed_mat.offset atIndex:0];
+        [e setBuffer:head_q4 offset:0 atIndex:1];
+        [e setBuffer:head_sc offset:0 atIndex:2];
+        [e setBuffer:head_err offset:0 atIndex:3];
+        [e setBytes:&p length:sizeof(p) atIndex:4];
+        [e dispatchThreadgroups:MTLSizeMake(ntg, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        [e endEncoding];
+        gpu_seconds(cb);
+        cert_head_ready = true;
         return true;
     }
 
@@ -734,7 +788,7 @@ public:
         return {blocks, out};
     }
 
-    double step(uint32_t tok, uint32_t pos) {
+    double step(uint32_t tok, uint32_t pos, bool need_logits = true, bool full_logits = false) {
         next_slot = 0;
         *static_cast<uint32_t*>(token.contents) = tok;
         id<MTLCommandBuffer> cb = [gpu.queue commandBuffer];
@@ -764,21 +818,83 @@ public:
             for (uint32_t l = c.core_start; l < c.core_end; ++l) std::tie(blocks, partial) = layer(blocks, partial, l, pass, bank, pos);
         }
         for (uint32_t l = c.core_end; l < c.layers; ++l) std::tie(blocks, partial) = layer(blocks, partial, l, 0, {}, pos);
-        std::vector<uint32_t> src = blocks;
-        src.push_back(partial);
-        uint64_t final_noffs[3] = {final_norm_off, 0, 0};
-        uint32_t hidden = res(src, -1, q_output_off, 1, final_noffs)[0];
-        gemv_ab(unembed_mat, arena, so(hidden), logits, 0, true);
-        struct { uint32_t n, valid; float cap; } lp{c.padded_vocab, c.vocab, c.softcap};
-        [enc setComputePipelineState:p_softcap];
-        [enc setBuffer:logits offset:0 atIndex:0];
-        [enc setBytes:&lp length:sizeof(lp) atIndex:1];
-        grid((c.padded_vocab + 255) / 256, 256);
-        [enc setComputePipelineState:p_argmax];
-        [enc setBuffer:logits offset:0 atIndex:0];
-        [enc setBuffer:token offset:4 atIndex:1];
-        [enc setBytes:&c.padded_vocab length:4 atIndex:2];
-        grid(1, 1024);
+        if (need_logits) {
+            std::vector<uint32_t> src = blocks;
+            src.push_back(partial);
+            uint64_t final_noffs[3] = {final_norm_off, 0, 0};
+            uint32_t hidden = res(src, -1, q_output_off, 1, final_noffs)[0];
+            if (cert_head_ready && !full_logits) {
+                uint32_t V = c.vocab;
+                uint32_t ng = c.hidden / 32;
+                uint32_t ntg = (V + 7) / 8;
+                CertHeadP chp{V, c.hidden, ng, c.softcap};
+                CertTauP ctp{ntg, c.hidden, c.softcap};
+                [enc setComputePipelineState:p_ch_xnorm];
+                [enc setBuffer:arena offset:so(hidden) atIndex:0];
+                [enc setBuffer:ch_state offset:0 atIndex:1];
+                [enc setBuffer:ch_count offset:0 atIndex:2];
+                [enc setBytes:&H length:4 atIndex:3];
+                grid(1, 576);
+                [enc setComputePipelineState:p_ch_scan];
+                [enc setBuffer:head_q4 offset:0 atIndex:0];
+                [enc setBuffer:head_sc offset:0 atIndex:1];
+                [enc setBuffer:head_err offset:0 atIndex:2];
+                [enc setBuffer:arena offset:so(hidden) atIndex:3];
+                [enc setBuffer:ch_state offset:0 atIndex:4];
+                [enc setBuffer:ch_ub offset:0 atIndex:5];
+                [enc setBuffer:ch_tg_val offset:0 atIndex:6];
+                [enc setBuffer:ch_tg_row offset:0 atIndex:7];
+                [enc setBytes:&chp length:sizeof(chp) atIndex:8];
+                grid(ntg, 256);
+                [enc setComputePipelineState:p_ch_tau];
+                [enc setBuffer:ch_tg_val offset:0 atIndex:0];
+                [enc setBuffer:ch_tg_row offset:0 atIndex:1];
+                [enc setBuffer:file offset:unembed_mat.offset atIndex:2];
+                [enc setBuffer:arena offset:so(hidden) atIndex:3];
+                [enc setBuffer:ch_state offset:0 atIndex:4];
+                [enc setBytes:&ctp length:sizeof(ctp) atIndex:5];
+                grid(1, 512);
+                [enc setComputePipelineState:p_ch_filter];
+                [enc setBuffer:ch_ub offset:0 atIndex:0];
+                [enc setBuffer:ch_state offset:0 atIndex:1];
+                [enc setBuffer:ch_count offset:0 atIndex:2];
+                [enc setBuffer:ch_cands offset:0 atIndex:3];
+                [enc setBytes:&V length:4 atIndex:4];
+                grid((V + 255) / 256, 256);
+                [enc setComputePipelineState:p_ch_setup];
+                [enc setBuffer:ch_count offset:0 atIndex:0];
+                [enc setBuffer:ch_indirect offset:0 atIndex:1];
+                grid(1, 1);
+                [enc setComputePipelineState:p_ch_rescore];
+                [enc setBuffer:file offset:unembed_mat.offset atIndex:0];
+                [enc setBuffer:arena offset:so(hidden) atIndex:1];
+                [enc setBuffer:ch_cands offset:0 atIndex:2];
+                [enc setBuffer:ch_count offset:0 atIndex:3];
+                [enc setBuffer:ch_tg_val offset:0 atIndex:4];
+                [enc setBuffer:ch_tg_row offset:0 atIndex:5];
+                [enc setBytes:&ctp length:sizeof(ctp) atIndex:6];
+                barrier();
+                [enc dispatchThreadgroupsWithIndirectBuffer:ch_indirect indirectBufferOffset:0 threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+                [enc setComputePipelineState:p_ch_argmax];
+                [enc setBuffer:ch_tg_val offset:0 atIndex:0];
+                [enc setBuffer:ch_tg_row offset:0 atIndex:1];
+                [enc setBuffer:ch_indirect offset:0 atIndex:2];
+                [enc setBuffer:token offset:4 atIndex:3];
+                grid(1, 256);
+            } else {
+                gemv_ab(unembed_mat, arena, so(hidden), logits, 0, true);
+                struct { uint32_t n, valid; float cap; } lp{c.padded_vocab, c.vocab, c.softcap};
+                [enc setComputePipelineState:p_softcap];
+                [enc setBuffer:logits offset:0 atIndex:0];
+                [enc setBytes:&lp length:sizeof(lp) atIndex:1];
+                grid((c.padded_vocab + 255) / 256, 256);
+                [enc setComputePipelineState:p_argmax];
+                [enc setBuffer:logits offset:0 atIndex:0];
+                [enc setBuffer:token offset:4 atIndex:1];
+                [enc setBytes:&c.padded_vocab length:4 atIndex:2];
+                grid(1, 1024);
+            }
+        }
         [enc endEncoding];
         double seconds = gpu_seconds(cb);
         if (next_slot > slots) { std::fprintf(stderr, "delphi: arena overflow %u\n", next_slot); std::exit(3); }
@@ -839,17 +955,21 @@ std::optional<std::vector<uint32_t>> parse_ids(const std::string& text, std::str
 
 int generate_command(int argc, char** argv) {
     std::string error;
-    auto flags = parse_flags(argc, argv, {"--model", "--input-ids", "--steps"}, {"--logprobs"}, error);
+    auto flags = parse_flags(argc, argv, {"--model", "--input-ids", "--steps", "--head"}, {"--logprobs"}, error);
     if (!flags) return refuse(error);
     auto steps = whole_flag(*flags, "--steps", 8, 1, 4000, error);
     if (!steps) return refuse(error);
+    std::string head = flags->values.count("--head") ? flags->values["--head"] : "exact";
+    if (head != "exact" && head != "full") return refuse("--head must be exact or full");
     if (!flags->values.count("--model") || !flags->values.count("--input-ids")) return refuse("generate needs --model DIR and --input-ids JSON");
     auto ids_opt = parse_ids(flags->values["--input-ids"], error);
     if (!ids_opt) return refuse(error);
     auto& ids = *ids_opt;
     if (ids.empty()) return refuse("--input-ids must hold at least one token id");
+    bool logprobs = flags->switches.count("--logprobs") > 0;
+    bool use_cert = head == "exact" && !logprobs;
     Engine engine;
-    if (!engine.load(flags->values["--model"], error)) {
+    if (!engine.load(flags->values["--model"], use_cert, error)) {
         std::fprintf(stderr, "delphi: %s\n", error.c_str());
         return 3;
     }
@@ -860,10 +980,9 @@ int generate_command(int argc, char** argv) {
     for (uint32_t id : ids) {
         if (id >= embed_rows) return refuse("input token id out of embedding range");
     }
-    bool logprobs = flags->switches.count("--logprobs") > 0;
     uint32_t pos = 0;
     auto wall0 = std::chrono::steady_clock::now();
-    for (uint32_t t : ids) engine.step(t, pos++);
+    for (size_t i = 0; i < ids.size(); ++i) engine.step(ids[i], pos++, i + 1 == ids.size(), logprobs);
     auto wall1 = std::chrono::steady_clock::now();
     std::vector<uint32_t> out;
     std::string steps_json;
@@ -879,7 +998,7 @@ int generate_command(int argc, char** argv) {
             s << "]}";
             steps_json += s.str();
         }
-        if (i + 1 < *steps) decode_gpu += engine.step(next, pos++);
+        if (i + 1 < *steps) decode_gpu += engine.step(next, pos++, true, logprobs);
     }
     auto wall2 = std::chrono::steady_clock::now();
     double prefill_wall = std::chrono::duration<double>(wall1 - wall0).count();
@@ -894,19 +1013,21 @@ int generate_command(int argc, char** argv) {
 
 int bench_command(int argc, char** argv) {
     std::string error;
-    auto flags = parse_flags(argc, argv, {"--model", "--input-ids", "--steps", "--repeats", "--warmup"}, {}, error);
+    auto flags = parse_flags(argc, argv, {"--model", "--input-ids", "--steps", "--repeats", "--warmup", "--head"}, {}, error);
     if (!flags) return refuse(error);
     auto steps = whole_flag(*flags, "--steps", 64, 2, 4000, error);
     auto repeats = steps ? whole_flag(*flags, "--repeats", 6, 1, 100, error) : std::nullopt;
     auto warmup = repeats ? whole_flag(*flags, "--warmup", 1, 0, 10, error) : std::nullopt;
     if (!warmup) return refuse(error);
+    std::string head = flags->values.count("--head") ? flags->values["--head"] : "exact";
+    if (head != "exact" && head != "full") return refuse("--head must be exact or full");
     if (!flags->values.count("--model") || !flags->values.count("--input-ids")) return refuse("bench needs --model DIR and --input-ids JSON");
     auto ids_opt = parse_ids(flags->values["--input-ids"], error);
     if (!ids_opt) return refuse(error);
     auto& ids = *ids_opt;
     if (ids.empty()) return refuse("--input-ids must hold at least one token id");
     Engine engine;
-    if (!engine.load(flags->values["--model"], error)) {
+    if (!engine.load(flags->values["--model"], head == "exact", error)) {
         std::fprintf(stderr, "delphi: %s\n", error.c_str());
         return 3;
     }
@@ -923,7 +1044,7 @@ int bench_command(int argc, char** argv) {
         engine.reset_state();
         uint32_t pos = 0;
         auto w0 = std::chrono::steady_clock::now();
-        for (uint32_t t : ids) engine.step(t, pos++);
+        for (size_t i = 0; i < ids.size(); ++i) engine.step(ids[i], pos++, i + 1 == ids.size(), false);
         auto w1 = std::chrono::steady_clock::now();
         std::vector<uint32_t> out;
         out.reserve(*steps);
@@ -931,7 +1052,7 @@ int bench_command(int argc, char** argv) {
         for (uint64_t i = 0; i < *steps; ++i) {
             uint32_t next = engine.chosen();
             out.push_back(next);
-            if (i + 1 < *steps) dgpu += engine.step(next, pos++);
+            if (i + 1 < *steps) dgpu += engine.step(next, pos++, true, false);
         }
         auto w2 = std::chrono::steady_clock::now();
         if (ref_out.empty()) {
