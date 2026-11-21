@@ -20,4 +20,4 @@ Exact means token-identical to Delphi's own plain greedy decoding on the shipped
 
 ## Using Delphi in your project
 
-Delphi is licensed under [Apache-2.0](LICENSE). If you ship Delphi or anything built from it, keep the [NOTICE](NOTICE) file with it, as section 4(d) of the license requires. To cite it, use [CITATION.cff](CITATION.cff).
+Delphi is licensed under [Apache-2.0](LICENSE). If you distribute Delphi or anything built from it, include the attribution notices from [NOTICE](NOTICE), as section 4(d) of the license requires: in a NOTICE file, in your source or documentation, or wherever your third-party notices appear. To cite it, use [CITATION.cff](CITATION.cff).

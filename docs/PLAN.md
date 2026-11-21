@@ -1,6 +1,8 @@
 # Delphi plan
 
-Council round 1 (2026-11-21): Claude Opus 5.5 (xhigh), GPT-6.2 Sol (xhigh), Gemini 4 Neon (xhigh). Two members read the real safetensors headers; the numbers below come from those headers, not from parameter counts. Every tok/s figure here is a ceiling or a target until a ledger row measures it.
+Council round 1 (2026-11-21): Claude Opus 5.5 (xhigh), GPT-6.2 Sol (xhigh), Gemini 4 Neon (xhigh). Two members read the real safetensors headers; the numbers below come from those headers, not from parameter counts.
+
+How to read every speed number in this file: the machine is the M5 Pro below; decoding is one stream (batch 1) unless a row says otherwise; context is 2K tokens unless a row names another length. None of them is a measurement yet. Ceilings and projections come from the byte model in section 2: bytes read per step divided by bandwidth (307 GB/s spec, 260-275 GB/s assumed sustained), times committed tokens per step. Measured numbers will come only from `delphi bench`, logged in `ledger.jsonl`, and will say so.
 
 ## 1. The machine and the model
 
@@ -66,7 +68,7 @@ Compute is not the limit. A token costs about 10.8 GFLOP; the GPU has tens of TF
 - Lookup drafts: suffix matching over prompt and output for copies, edits and tool calls, with longer chains when the match is long.
 - Chain, not tree. Each extra verify row pulls in about g new experts per visit (g = 2-3 is the planning guess; nobody has measured it), so a row costs 1.7-2.5 ms and the best chain is about 3-6 tokens. Adaptive length: `k* = argmax (E[accepted] + 1) / cost(k)` from a measured cost table.
 
-Round-1 projections (Opus), tok/s at g=2 / g=3:
+Round-1 projections (Opus), tok/s at g=2 / g=3; byte model of section 2 at 260 GB/s, 2K context, batch 1, drafter 1.2 ms and 0.6 ms overhead per step; projections, not measurements:
 
 | Weights | prose | chat | code |
 |---|---|---|---|
@@ -84,6 +86,8 @@ Copy-heavy edits with lookup drafts: about 250 tok/s on lean weights.
 - E2, faithful (against R1): shipped weights top-1 agreement >= 99.8% and KL <= 0.002; lean weights KL <= 0.02 and HumanEval within 2 points.
 
 ## 6. Milestones
+
+Gates are measurements on the M5 Pro through `delphi bench` (batch 1, 2K context unless the gate names another), each logged in `ledger.jsonl`.
 
 | | Proves | Gate |
 |---|---|---|
@@ -119,7 +123,7 @@ M1 e2e tests, each written first and seen failing, driven through the real CLI:
 ## 8. Decisions
 
 - Name: Delphi.
-- License: Apache-2.0 with a NOTICE file and CITATION.cff. Two of three members picked it: section 4(d) makes every redistribution and derivative keep the credit, it adds a patent grant, it matches the model's license, and companies adopt it. Sol preferred AGPL-3.0 with a section 7(b) attribution term, which also reaches hosted services but costs adoption.
+- License: Apache-2.0 with a NOTICE file and CITATION.cff. Two of three members picked it: section 4(d) makes every distributed copy or derivative include the attribution notices, it adds a patent grant, it matches the model's license, and companies adopt it. Sol preferred AGPL-3.0 with a section 7(b) attribution term, which also reaches hosted services but costs adoption.
 - Exact mode is the headline. Lossy modes are opt-in and labelled.
 - Tests are end-to-end only, written first. CI pins every action by commit SHA and every job has a 20-minute budget.
 
@@ -139,7 +143,7 @@ Round 2 (2026-11-21) asked the same three members to aim far past 100 tok/s, usi
 | Prefill, 4K prompt | 1,000 / 2,800 | 1,150 / 1,640 | 1,830 / 4,400 | **4,400** |
 | Confidence in own exact-chat star | 20% | 30% | 55% | |
 
-The floors are the milestone gates; the stars are what Delphi aims for. Exact means token-identical to Delphi's own non-speculative batch-1 greedy on the shipped weights.
+All rows: projections from each member's byte model (bytes per step over 225-275 GB/s, times committed tokens per step), M5 Pro, batch 1 per stream, 2K context, not measurements. Prefill rows are compute projections at an assumed 10-35 TFLOPS. The floors are the milestone gates; the stars are what Delphi aims for. Exact means token-identical to Delphi's own non-speculative batch-1 greedy on the shipped weights.
 
 ### What gets there (all three agree)
 

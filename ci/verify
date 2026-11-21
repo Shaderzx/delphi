@@ -22,15 +22,28 @@ required_files() {
   grep -q "Shaderzx/delphi" NOTICE
 }
 
+link_targets() {
+  local inline reference
+  inline="$(grep -oE '\]\([^)]+\)' "$1")" || [ $? -eq 1 ]
+  reference="$(grep -oE '^ {0,3}\[[^]]+\]:[[:space:]]*[^[:space:]]+' "$1")" || [ $? -eq 1 ]
+  {
+    printf '%s\n' "$inline" | sed -E 's/^\]\((.*)\)$/\1/'
+    printf '%s\n' "$reference" | sed -E 's/^ {0,3}\[[^]]+\]:[[:space:]]*//'
+  } | awk 'NF { print $1 }' | sed -E 's/^<(.*)>$/\1/'
+}
+
 relative_links() {
-  local broken=0
+  local files md targets target path broken=0
+  files="$(git ls-files '*.md')"
+  [ -n "$files" ] || { echo "no tracked markdown files"; return 1; }
   while IFS= read -r md; do
+    targets="$(link_targets "$md")"
     while IFS= read -r target; do
-      local path="${target%%#*}"
-      [ -z "$path" ] && continue
+      case "$target" in ''|http:*|https:*|mailto:*|'#'*) continue ;; esac
+      path="${target%%#*}"
       [ -e "$(dirname "$md")/$path" ] || { echo "$md -> $target"; broken=1; }
-    done < <(grep -oE '\]\([^)]+\)' "$md" | sed -E 's/^\]\((.*)\)$/\1/' | grep -vE '^(https?:|mailto:|#)')
-  done < <(git ls-files '*.md')
+    done <<< "$targets"
+  done <<< "$files"
   return "$broken"
 }
 
