@@ -84,6 +84,15 @@ class Checkpoint:
             return E4M3[raw]
         return np.asarray(raw, dtype=F32)
 
+    def f32_row(self, name, row):
+        info = self.header[name]
+        raw = self.raw(name)[row]
+        if info["dtype"] == "BF16":
+            return (raw.astype(np.uint32) << 16).view(F32)
+        if info["dtype"] == "F8_E4M3":
+            return E4M3[raw]
+        return np.asarray(raw, dtype=F32)
+
     def has(self, name):
         return name in self.header
 
@@ -402,7 +411,7 @@ class Inkling:
         return blocks, bf16(partial + attention + conv)
 
     def step(self, token, pos, cache, trace=None):
-        embed = self.ck.f32(self.p + "embed.weight")[token]
+        embed = self.ck.f32_row(self.p + "embed.weight", token)
         x = rms_norm(embed, self.w("embed_norm.weight"))
         state = ([], x)
         for layer in range(self.core.start):

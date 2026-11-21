@@ -7,7 +7,7 @@
 
 namespace {
 
-constexpr const char* kUsage = "usage: delphi generate --model DIR --input-ids JSON [--steps N] | delphi probe bandwidth|gemv|chain [options]";
+constexpr const char* kUsage = "usage: delphi generate --model DIR --input-ids JSON [--steps N] [--logprobs] | delphi probe bandwidth|gemv|chain [options]";
 
 int probe_command(int argc, char** argv) {
     std::string name = argc >= 1 ? argv[0] : "";

@@ -3,7 +3,8 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "test": "e2e run"
+    "test": "e2e run --exclude-tag model",
+    "test:model": "e2e run --tag model"
   },
   "devDependencies": {
     "e2e": "0.24.0"

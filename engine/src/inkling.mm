@@ -80,39 +80,62 @@ public:
              f(t, @"qk_l2_clip_threshold"), f(t, @"rel_l2_clip_threshold"), f(t, @"log_scaling_alpha"), f(t, @"mlp_gate_softcap"),
              f(t, @"mlp_up_softcap"), f(t, @"route_scale"), f(t, @"final_logit_softcapping"), {}};
         c.local.assign(c.layers, false);
-        for (NSNumber* n in t[@"local_layer_ids"]) c.local[n.unsignedIntValue] = true;
+        if (c.top != 8) { error = "only num_experts_per_tok == 8 is supported"; return false; }
+        for (NSNumber* n in t[@"local_layer_ids"]) {
+            long long lid = n.longLongValue;
+            if (lid < 0 || static_cast<uint64_t>(lid) >= c.layers) { error = "local_layer_ids contains out-of-range layer index"; return false; }
+            c.local[static_cast<size_t>(lid)] = true;
+        }
         NSArray* files = [[[NSFileManager defaultManager] contentsOfDirectoryAtPath:base error:nil] filteredArrayUsingPredicate:[NSPredicate predicateWithFormat:@"SELF BEGINSWITH 'model' AND SELF ENDSWITH '.safetensors'"]];
         if (files.count != 1) { error = "expected one model*.safetensors file"; return false; }
         std::string path = std::string(base.UTF8String) + "/" + [files[0] UTF8String];
         int fd = ::open(path.c_str(), O_RDONLY);
+        if (fd < 0) { error = "failed to open checkpoint: " + path; return false; }
         struct stat st;
-        fstat(fd, &st);
+        if (fstat(fd, &st) != 0 || st.st_size < 8) { ::close(fd); error = "failed to stat checkpoint or file too small: " + path; return false; }
+        uint64_t file_size = static_cast<uint64_t>(st.st_size);
         size_t page = getpagesize();
-        size_t mapped = (st.st_size + page - 1) / page * page;
+        size_t mapped = (file_size + page - 1) / page * page;
         void* data = mmap(nullptr, mapped, PROT_READ, MAP_PRIVATE, fd, 0);
         ::close(fd);
         if (data == MAP_FAILED) { error = "mmap failed"; return false; }
-        if (mapped > gpu.device.maxBufferLength) { error = "model file larger than maxBufferLength"; return false; }
-        file = [gpu.device newBufferWithBytesNoCopy:data length:mapped options:MTLResourceStorageModeShared deallocator:nil];
+        if (mapped > gpu.device.maxBufferLength) { munmap(data, mapped); error = "model file larger than maxBufferLength"; return false; }
         uint64_t header = *static_cast<uint64_t*>(data);
+        if (header > file_size - 8) { munmap(data, mapped); error = "checkpoint header exceeds file size"; return false; }
         NSDictionary* h = json_object([NSData dataWithBytesNoCopy:static_cast<char*>(data) + 8 length:header freeWhenDone:NO]);
+        if (![h isKindOfClass:[NSDictionary class]]) { munmap(data, mapped); error = "invalid safetensors header json"; return false; }
+        uint64_t data_base = 8 + header;
         for (NSString* name in h) {
             if ([name isEqualToString:@"__metadata__"]) continue;
             NSDictionary* info = h[name];
+            NSArray* offs = info[@"data_offsets"];
+            if (![offs isKindOfClass:[NSArray class]] || offs.count != 2) { munmap(data, mapped); error = "invalid tensor offsets"; return false; }
+            uint64_t start = [offs[0] unsignedLongLongValue];
+            uint64_t end = [offs[1] unsignedLongLongValue];
+            if (end < start || end > file_size - data_base) { munmap(data, mapped); error = "checkpoint tensor span exceeds file size"; return false; }
             Tensor tensor;
-            tensor.offset = 8 + header + [info[@"data_offsets"][0] unsignedLongLongValue];
-            tensor.bytes = [info[@"data_offsets"][1] unsignedLongLongValue] - [info[@"data_offsets"][0] unsignedLongLongValue];
+            tensor.offset = data_base + start;
+            tensor.bytes = end - start;
             tensor.dtype = [info[@"dtype"] UTF8String];
             for (NSNumber* n in info[@"shape"]) tensor.shape.push_back(n.unsignedLongLongValue);
+            if (tensor.dtype == "BF16" && tensor.shape.size() == 2 && (tensor.offset % 16) != 0) {
+                munmap(data, mapped);
+                error = std::string("BF16 matrix not 16-byte aligned: ") + name.UTF8String;
+                return false;
+            }
             tensors[name.UTF8String] = tensor;
         }
+        file = [gpu.device newBufferWithBytesNoCopy:data length:mapped options:MTLResourceStorageModeShared deallocator:nil];
+        if (!file) { munmap(data, mapped); error = "newBufferWithBytesNoCopy failed"; return false; }
         for (NSString* name in @[@"gemv_bf16", @"rms_norm", @"attn_res", @"sconv", @"clip_rows", @"rel_bias", @"attend", @"gate_out", @"kv_store", @"route",
                                  @"quant_nvfp4", @"quant_mxfp8", @"expert_nvfp4", @"expert_mxfp8", @"swiglu", @"combine", @"ctl_normed", @"ctl_mix",
                                  @"embed_row", @"softcap_logits", @"argmax_logits", @"round_rows"]) {
             pipes[name.UTF8String] = pipeline(gpu, name);
         }
         arena = [gpu.device newBufferWithLength:uint64_t(slots) * c.hidden * 4 options:MTLResourceStorageModePrivate];
+        if (!arena) { error = "arena allocation failed"; return false; }
         build_queries();
+        if (!queries) { error = "queries allocation failed"; return false; }
         std::vector<float> table(256);
         for (int b = 0; b < 256; ++b) {
             int e = (b >> 3) & 15, m = b & 7;
@@ -123,6 +146,7 @@ public:
         lut = [gpu.device newBufferWithBytes:table.data() length:1024 options:MTLResourceStorageModeShared];
         logits = [gpu.device newBufferWithLength:uint64_t(c.padded_vocab) * 4 options:MTLResourceStorageModeShared];
         token = [gpu.device newBufferWithLength:16 options:MTLResourceStorageModeShared];
+        if (!lut || !logits || !token) { error = "workspace allocation failed"; return false; }
         uint32_t H = c.hidden, I = c.inter, K = c.top;
         std::vector<std::pair<std::string, uint64_t>> plan = {
             {"q", c.heads * c.head_dim}, {"qc", c.heads * c.head_dim}, {"r", c.heads * c.d_rel}, {"rc", c.heads * c.d_rel}, {"gate", c.heads * c.head_dim},
@@ -135,14 +159,18 @@ public:
         uint64_t at = 0;
         for (auto& [name, n] : plan) { scratch_slots[name] = {at, n}; at += (n * 4 + 255) / 256 * 256; }
         scratch = [gpu.device newBufferWithLength:at options:MTLResourceStorageModePrivate];
+        if (!scratch) { error = "scratch allocation failed"; return false; }
         uint32_t visits = c.layers + (c.passes - 1) * (c.core_end - c.core_start);
         for (uint32_t v = 0; v < visits; ++v) {
-            kcache.push_back([gpu.device newBufferWithLength:uint64_t(max_context) * c.kv_heads * c.head_dim * 4 options:MTLResourceStorageModePrivate]);
-            vcache.push_back([gpu.device newBufferWithLength:uint64_t(max_context) * c.kv_heads * c.head_dim * 4 options:MTLResourceStorageModePrivate]);
+            id<MTLBuffer> kb = [gpu.device newBufferWithLength:uint64_t(max_context) * c.kv_heads * c.head_dim * 4 options:MTLResourceStorageModePrivate];
+            id<MTLBuffer> vb = [gpu.device newBufferWithLength:uint64_t(max_context) * c.kv_heads * c.head_dim * 4 options:MTLResourceStorageModePrivate];
+            if (!kb || !vb) { error = "kv cache allocation failed"; return false; }
+            kcache.push_back(kb);
+            vcache.push_back(vb);
             for (int s = 0; s < 4; ++s) {
                 uint64_t width = s < 2 ? c.kv_heads * c.head_dim : c.hidden;
                 id<MTLBuffer> b = [gpu.device newBufferWithLength:3 * width * 4 options:MTLResourceStorageModeShared];
-                memset(b.contents, 0, 3 * width * 4);
+                if (!b) { error = "conv state allocation failed"; return false; }
                 conv[{v, s}] = b;
             }
         }
@@ -611,12 +639,24 @@ public:
     }
 };
 
-std::vector<uint32_t> parse_ids(const std::string& text) {
+std::optional<std::vector<uint32_t>> parse_ids(const std::string& text, std::string& error) {
+    NSData* data = [NSData dataWithBytes:text.data() length:text.size()];
+    NSError* err = nil;
+    id parsed = [NSJSONSerialization JSONObjectWithData:data options:0 error:&err];
+    if (![parsed isKindOfClass:[NSArray class]]) { error = "--input-ids must be a JSON array of non-negative integers"; return std::nullopt; }
     std::vector<uint32_t> ids;
-    std::string digits;
-    for (char ch : text + ",") {
-        if (isdigit(static_cast<unsigned char>(ch))) digits += ch;
-        else if (!digits.empty()) { ids.push_back(uint32_t(std::stoul(digits))); digits.clear(); }
+    for (id item in static_cast<NSArray*>(parsed)) {
+        if (![item isKindOfClass:[NSNumber class]] || CFGetTypeID((__bridge CFTypeRef)item) == CFBooleanGetTypeID()) {
+            error = "--input-ids elements must be non-negative integers";
+            return std::nullopt;
+        }
+        NSNumber* num = static_cast<NSNumber*>(item);
+        double dv = num.doubleValue;
+        if (!std::isfinite(dv) || dv < 0.0 || std::floor(dv) != dv || dv > double(UINT32_MAX)) {
+            error = "--input-ids elements must be integers in [0, 2^32-1]";
+            return std::nullopt;
+        }
+        ids.push_back(static_cast<uint32_t>(num.unsignedLongLongValue));
     }
     return ids;
 }
@@ -630,12 +670,21 @@ int generate_command(int argc, char** argv) {
     auto steps = whole_flag(*flags, "--steps", 8, 1, 4000, error);
     if (!steps) return refuse(error);
     if (!flags->values.count("--model") || !flags->values.count("--input-ids")) return refuse("generate needs --model DIR and --input-ids JSON");
-    auto ids = parse_ids(flags->values["--input-ids"]);
+    auto ids_opt = parse_ids(flags->values["--input-ids"], error);
+    if (!ids_opt) return refuse(error);
+    auto& ids = *ids_opt;
     if (ids.empty()) return refuse("--input-ids must hold at least one token id");
     Engine engine;
     if (!engine.load(flags->values["--model"], error)) {
         std::fprintf(stderr, "delphi: %s\n", error.c_str());
         return 3;
+    }
+    if (ids.size() > engine.max_context || (*steps - 1) > engine.max_context - ids.size()) {
+        return refuse("prompt plus generated steps exceeds 4096-token context");
+    }
+    uint64_t embed_rows = engine.T("embed.weight").shape[0];
+    for (uint32_t id : ids) {
+        if (id >= embed_rows) return refuse("input token id out of embedding range");
     }
     bool logprobs = flags->switches.count("--logprobs") > 0;
     uint32_t pos = 0;
