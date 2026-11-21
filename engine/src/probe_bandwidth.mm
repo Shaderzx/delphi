@@ -10,7 +10,7 @@ namespace {
 
 constexpr NSUInteger kThreadsPerGroup = 1024;
 constexpr NSUInteger kGroups = 160;
-constexpr uint64_t kMaxMib = (uint64_t{UINT32_MAX} + 1) * 16 / (1024 * 1024) - 1;
+constexpr uint64_t kMaxMib = ((uint64_t{UINT32_MAX} + 1) - kThreadsPerGroup * kGroups) * 16 / (1024 * 1024);
 
 double stream_pass(const Gpu& gpu, id<MTLComputePipelineState> state, NSArray<id<MTLBuffer>>* buffers, uint32_t count4) {
     id<MTLCommandBuffer> commands = [gpu.queue commandBuffer];

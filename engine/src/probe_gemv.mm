@@ -10,6 +10,7 @@
 namespace {
 
 constexpr NSUInteger kSimdsPerGroup = 8;
+constexpr uint64_t kFillThreads = 1024 * 256;
 constexpr uint64_t kMaxRows = 32;
 constexpr uint32_t kValuesExact = 0;
 constexpr uint32_t kValuesRough = 1;
@@ -155,8 +156,8 @@ int probe_chain(int argc, char** argv) {
         return refuse(error);
     }
     uint64_t layer_count = *n * *n;
-    if (*layers * layer_count > UINT32_MAX) {
-        return refuse("--layers times --n squared must stay under 2^32 weights");
+    if (*layers * layer_count > UINT32_MAX - kFillThreads) {
+        return refuse("--layers times --n squared must stay under 2^32 weights minus one fill stride");
     }
     auto gpu = open_gpu(error);
     if (!gpu) {
