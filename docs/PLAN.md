@@ -2,13 +2,13 @@
 
 Council round 1 (2026-11-21): Claude Opus 5.5 (xhigh), GPT-6.2 Sol (xhigh), Gemini 4 Neon (xhigh). Two members read the real safetensors headers; the numbers below come from those headers, not from parameter counts.
 
-How to read every speed number in this file: the machine is the M5 Pro below; decoding is one stream (batch 1) unless a row says otherwise; context is 2K tokens unless a row names another length. None of them is a measurement yet. Ceilings and projections come from the byte model in section 2: bytes read per step divided by bandwidth (307 GB/s spec, 260-275 GB/s assumed sustained), times committed tokens per step. Measured numbers will come only from `delphi bench`, logged in `ledger.jsonl`, and will say so.
+How to read every speed number in this file: the machine is the M5 Pro below; decoding is one stream (batch 1) unless a row says otherwise; context is 2K tokens unless a row names another length. Ceilings and projections come from the byte model in section 2: bytes read per step divided by bandwidth (307 GB/s spec, 266 GB/s measured sustained), times committed tokens per step. Measured token rates will come only from `delphi bench`, logged in `bench/ledger.jsonl`, and will say so. One exception: raw memory bandwidth comes from `delphi probe bandwidth`, is a measurement, and has no token context (context: not applicable).
 
 ## 1. The machine and the model
 
 Machine: Apple M5 Pro MacBook Pro, 20-core GPU with a Neural Accelerator per core (FP16/INT8 matmul), Metal 4, 18-core CPU, 16-core ANE, 64 GB unified memory, 307 GB/s on the spec sheet, 24-48 MB system-level cache (to be measured in M0).
 
-Measured (`delphi probe bandwidth`, `bench/ledger.jsonl`): the GPU streams **274 GB/s** from a 4-8 GiB buffer, 89% of the spec. Every ceiling below that says 260-275 GB/s sustained now has its number.
+Measured (`delphi probe bandwidth`, `bench/ledger.jsonl`, harness: Metal streaming read, context: not applicable): the median pass streams **266 GB/s** from a 4-8 GiB buffer, 87% of the spec; the best pass reaches 271-283 GB/s. Plan with 266.
 
 Model: `thinkingmachines/Inkling-2-Mini`, Apache-2.0. Hidden 2304, 24 physical layers, 24 query / 8 KV heads, head_dim 128. Layers 6-17 are a loop core run three times per token, so a token makes 48 layer visits. MoE on every layer: 128 experts, top-8, no shared expert, intermediate 1152. Local sliding-window attention (1024) everywhere except layers 5, 11, 17 and 23. Learned relative position logits instead of RoPE, an input-dependent attention sink, an output gate, short convolutions (k=4) and attention-residual blocks of 6. Vocabulary 201,024. Bundled drafter: 3 dense layers proposing 8 tokens from hidden-state taps at visits 5, 23, 41 and 48, with a GRU Markov head.
 
