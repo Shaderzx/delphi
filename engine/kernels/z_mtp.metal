@@ -327,7 +327,7 @@ kernel void mtp_gemv_q4_rows(device const uint4* q4 [[buffer(0)]],
     if (ROWS > 7u) { float t = simd_sum(a7) + bv; if (lane == 0) y[7ul * p.y_stride + row] = p.round_out ? rbf(t) : t; }
 }
 
-struct MtpCtxKvP { uint kv_heads; uint head_dim; uint pos0; float eps; float log_theta; };
+struct MtpCtxKvP { uint kv_heads; uint head_dim; uint pos0; uint kv_cap; float eps; float log_theta; };
 
 kernel void mtp_ctx_kv_store(device const float* ctx_kv [[buffer(0)]],
                              device const ushort* k_norm [[buffer(1)]],
@@ -356,7 +356,7 @@ kernel void mtp_ctx_kv_store(device const float* ctx_kv [[buffer(0)]],
     float r2 = a2 * c0 + a0 * s0;
     float r1 = a1 * c1 - a3 * s1;
     float r3 = a3 * c1 + a1 * s1;
-    ulong dst = ulong(p.pos0 + m) * kvw + h * p.head_dim;
+    ulong dst = ulong((p.pos0 + m) % p.kv_cap) * kvw + h * p.head_dim;
     kcache[dst + lane] = f2bf(r0);
     kcache[dst + lane + 32u] = f2bf(r1);
     kcache[dst + lane + 64u] = f2bf(r2);
@@ -452,7 +452,7 @@ kernel void mtp_qk_norm_rope(device float* qkv [[buffer(0)]],
     ptr[lane + 96u] = rbf(a3 * c1 + a1 * s1);
 }
 
-struct MtpAttnP { uint prefix_len; uint ctx_start; uint q_heads; uint kv_heads; uint group; uint qkv_stride; uint q_dim; uint kv_dim; float scale; };
+struct MtpAttnP { uint prefix_len; uint ctx_start; uint q_heads; uint kv_heads; uint group; uint qkv_stride; uint q_dim; uint kv_dim; uint kv_cap; float scale; };
 
 kernel void mtp_attend_block(device const float* qkv [[buffer(0)]],
                              device const ushort4* kc [[buffer(1)]],
@@ -477,7 +477,7 @@ kernel void mtp_attend_block(device const float* qkv [[buffer(0)]],
         float4 k4, v4;
         if (t < ctx_cnt) {
             uint kp = p.ctx_start + t;
-            ulong base = (ulong(kp) * p.kv_heads + kvh) * 32u + lane;
+            ulong base = (ulong(kp % p.kv_cap) * p.kv_heads + kvh) * 32u + lane;
             ushort4 ku = kc[base];
             ushort4 vu = vc[base];
             k4 = float4(bfv(ku.x), bfv(ku.y), bfv(ku.z), bfv(ku.w));

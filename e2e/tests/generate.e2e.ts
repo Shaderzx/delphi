@@ -127,6 +127,21 @@ test('delphi generate batched prefill and speculative verify match --spec off to
   });
 });
 
+test('delphi generate retrieves a needle past 4096 tokens using 32K ring-KV', { tags: ['model'], timeout: 900_000 }, () => {
+  const deadline = Date.now() + 900_000;
+  withBuiltDelphi(deadline, (bin) => {
+    const needle = [371, 153536, 150406, 149884, 220, 19, 22, 17, 24, 16, 13, 198];
+    const filler = [...truth.cases[2].input_ids, 198];
+    const prompt: number[] = [...needle];
+    while (prompt.length < 4600) prompt.push(...filler);
+    prompt.push(371, 153536, 150406, 149884, 220);
+    const run = spawnSync(bin, ['generate', '--model', model, '--input-ids', JSON.stringify(prompt), '--steps', '6', '--spec', 'auto'], { encoding: 'utf8', timeout: remainingMs(deadline) });
+    checkRun('delphi generate 4.6k needle', run);
+    const out = JSON.parse(run.stdout) as Generated;
+    expect(out.output_ids.slice(0, 5)).toEqual([19, 22, 17, 24, 16]);
+  });
+});
+
 test('delphi generate --spec mtp matches --spec off token-for-token with multi-token acceptance', { tags: ['model'], timeout: 900_000 }, () => {
   const deadline = Date.now() + 900_000;
   withBuiltDelphi(deadline, (bin) => {

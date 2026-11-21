@@ -503,7 +503,7 @@ kernel void clip_rows_batch(device const float* x [[buffer(0)]],
     }
 }
 
-struct ClipKvB { uint width; uint pos0; uint kv_stride; uint in_stride; uint mode; float threshold; };
+struct ClipKvB { uint width; uint pos0; uint kv_stride; uint in_stride; uint mode; uint kv_cap; float threshold; };
 
 kernel void clip_kv_store_batch(device const float* x [[buffer(0)]],
                                 device ushort* cache [[buffer(1)]],
@@ -522,7 +522,7 @@ kernel void clip_kv_store_batch(device const float* x [[buffer(0)]],
     }
     s = simd_sum(s);
     float coeff = p.mode == 1u ? (1.0f / precise::sqrt(s / float(p.width) + 1e-6f)) : min(p.threshold / (1e-6f + precise::sqrt(s)), 1.0f);
-    device ushort* dst = cache + ulong(p.pos0 + m) * p.kv_stride + row * p.width;
+    device ushort* dst = cache + ulong((p.pos0 + m) % p.kv_cap) * p.kv_stride + row * p.width;
     n = 0;
     for (uint i = lane; i < p.width; i += 32u, ++n) dst[i] = f2bf(v[n] * coeff);
 }
@@ -542,7 +542,7 @@ kernel void rel_bias_batch(device const float* r [[buffer(0)]],
     rel[ulong(m) * p.heads * p.extent + h * p.extent + d] = rbf(acc);
 }
 
-struct AttnB { uint pos0; uint rows; uint window; uint is_local; uint kv_heads; uint group; uint head_dim; uint extent; uint heads; uint q_stride; uint gate_stride; uint gate_off; uint sink_off; uint out_stride; float scale; };
+struct AttnB { uint pos0; uint rows; uint window; uint is_local; uint kv_heads; uint group; uint head_dim; uint extent; uint heads; uint q_stride; uint gate_stride; uint gate_off; uint sink_off; uint out_stride; uint kv_cap; float scale; };
 
 kernel void attend_gated_batch(device const float4* q [[buffer(0)]],
                                device const ushort4* kc [[buffer(1)]],
@@ -575,7 +575,7 @@ kernel void attend_gated_batch(device const float4* q [[buffer(0)]],
     uint count = pos_last - kv_start + 1u;
     for (uint t = simd; t < count; t += 4u) {
         uint kp = kv_start + t;
-        ulong base = (ulong(kp) * p.kv_heads + kvh) * 32u + lane;
+        ulong base = (ulong(kp % p.kv_cap) * p.kv_heads + kvh) * 32u + lane;
         ushort4 ku = kc[base];
         float4 k4 = float4(bfv(ku.x), bfv(ku.y), bfv(ku.z), bfv(ku.w));
         ushort4 vu = vc[base];

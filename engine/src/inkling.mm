@@ -147,10 +147,11 @@ public:
     uint64_t s_router, s_ids, s_gammas, s_xq, s_outer, s_gu, s_h, s_hq, s_houter, s_rows;
     uint64_t s_normed[3], s_ctlh[3], s_gf[3], s_gain[3], s_forget[3];
     std::vector<id<MTLBuffer>> kcache, vcache;
+    std::vector<uint32_t> kv_cap, m_kv_cap;
     std::vector<std::array<uint64_t, 4>> conv_off;
     uint32_t conv_count = 0;
     uint32_t pending_conv_commit = 0;
-    uint32_t max_context = 4096;
+    uint32_t max_context = 32768;
     uint32_t next_slot = 0;
     uint32_t slots = 1024;
     std::vector<uint64_t> q_attn_off, q_mlp_off, q_loop_attn_off, q_loop_mlp_off;
@@ -372,9 +373,13 @@ public:
         struct ConvMetaHost { uint32_t offset_f, width; };
         std::vector<ConvMetaHost> cmeta;
         uint64_t conv_floats = 0;
+        uint32_t core_len = c.core_end > c.core_start ? (c.core_end - c.core_start) : 1;
         for (uint32_t v = 0; v < visits; ++v) {
-            id<MTLBuffer> kb = [gpu.device newBufferWithLength:uint64_t(max_context) * c.kv_heads * c.head_dim * 2 options:MTLResourceStorageModePrivate];
-            id<MTLBuffer> vb = [gpu.device newBufferWithLength:uint64_t(max_context) * c.kv_heads * c.head_dim * 2 options:MTLResourceStorageModePrivate];
+            uint32_t lid = v < c.layers ? v : (c.core_start + (v - c.layers) % core_len);
+            uint32_t cap = c.local[lid] ? std::min<uint32_t>(max_context, c.window + MAX_BATCH * 2) : max_context;
+            kv_cap.push_back(cap);
+            id<MTLBuffer> kb = [gpu.device newBufferWithLength:uint64_t(cap) * c.kv_heads * c.head_dim * 2 options:MTLResourceStorageModePrivate];
+            id<MTLBuffer> vb = [gpu.device newBufferWithLength:uint64_t(cap) * c.kv_heads * c.head_dim * 2 options:MTLResourceStorageModePrivate];
             if (!kb || !vb) { error = "kv cache allocation failed"; return false; }
             kcache.push_back(kb);
             vcache.push_back(vb);
@@ -560,8 +565,10 @@ public:
         uint32_t kvw = mc.kv_heads * mc.head_dim;
         uint32_t qdim = mc.heads * mc.head_dim;
         for (uint32_t i = 0; i < mc.layers; ++i) {
-            m_kcache.push_back([gpu.device newBufferWithLength:uint64_t(max_context) * kvw * 2 options:MTLResourceStorageModePrivate]);
-            m_vcache.push_back([gpu.device newBufferWithLength:uint64_t(max_context) * kvw * 2 options:MTLResourceStorageModePrivate]);
+            uint32_t mcap = mlw[i].local ? std::min<uint32_t>(max_context, mc.window + MAX_BATCH * 2) : max_context;
+            m_kv_cap.push_back(mcap);
+            m_kcache.push_back([gpu.device newBufferWithLength:uint64_t(mcap) * kvw * 2 options:MTLResourceStorageModePrivate]);
+            m_vcache.push_back([gpu.device newBufferWithLength:uint64_t(mcap) * kvw * 2 options:MTLResourceStorageModePrivate]);
         }
         m_f_rnn = [gpu.device newBufferWithLength:uint64_t(mc.hidden) * 2 options:MTLResourceStorageModePrivate];
         m_ctx_x = [gpu.device newBufferWithLength:uint64_t(MAX_BATCH) * mc.hidden * 2 options:MTLResourceStorageModePrivate];
@@ -1199,9 +1206,9 @@ public:
         grid2(rows, M, 32);
     }
 
-    struct ClipKvBP { uint32_t width, pos0, kv_stride, in_stride, mode; float threshold; };
-    void clip_kv_run(uint64_t in_off, id<MTLBuffer> cache, uint32_t rows, uint32_t width, uint32_t pos0, uint32_t kv_stride, uint32_t in_stride, uint32_t mode, float thr, uint32_t M) {
-        ClipKvBP p{width, pos0, kv_stride, in_stride, mode, thr};
+    struct ClipKvBP { uint32_t width, pos0, kv_stride, in_stride, mode, kv_cap; float threshold; };
+    void clip_kv_run(uint64_t in_off, id<MTLBuffer> cache, uint32_t rows, uint32_t width, uint32_t pos0, uint32_t kv_stride, uint32_t in_stride, uint32_t mode, uint32_t cap, float thr, uint32_t M) {
+        ClipKvBP p{width, pos0, kv_stride, in_stride, mode, cap, thr};
         [enc setComputePipelineState:p_clip_kv_b];
         [enc setBuffer:scratch offset:in_off atIndex:0];
         [enc setBuffer:cache offset:0 atIndex:1];
@@ -1209,8 +1216,8 @@ public:
         grid2(rows, M, 32);
     }
 
-    struct AttnP { uint32_t pos, start, kv_heads, group, head_dim, extent; float scale; };
-    struct AttnBP { uint32_t pos0, rows, window, is_local, kv_heads, group, head_dim, extent, heads, q_stride, gate_stride, gate_off, sink_off, out_stride; float scale; };
+    struct AttnP { uint32_t pos, start, kv_heads, group, head_dim, extent, kv_cap; float scale; };
+    struct AttnBP { uint32_t pos0, rows, window, is_local, kv_heads, group, head_dim, extent, heads, q_stride, gate_stride, gate_off, sink_off, out_stride, kv_cap; float scale; };
     struct RelBP { uint32_t d_rel, extent, heads; };
 
     uint32_t attention(const LayerWeights& w, uint32_t visit, uint32_t sq, uint32_t sk, uint32_t sv, uint32_t pos0, uint32_t M) {
@@ -1247,8 +1254,8 @@ public:
         together = false;
         [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
         together = true;
-        clip_kv_run(s_k, kcache[visit], c.kv_heads, c.head_dim, pos0, kvw, kvw, 0, c.clip_qk, M);
-        clip_kv_run(s_v, vcache[visit], c.kv_heads, c.head_dim, pos0, kvw, kvw, 1, 0.0f, M);
+        clip_kv_run(s_k, kcache[visit], c.kv_heads, c.head_dim, pos0, kvw, kvw, 0, kv_cap[visit], c.clip_qk, M);
+        clip_kv_run(s_v, vcache[visit], c.kv_heads, c.head_dim, pos0, kvw, kvw, 1, kv_cap[visit], 0.0f, M);
         RelBP rbp{c.d_rel, c.rel_extent, c.heads};
         [enc setComputePipelineState:p_rel_b];
         [enc setBuffer:scratch offset:s_rc atIndex:0];
@@ -1259,7 +1266,7 @@ public:
         together = false;
         if (M == 1) {
             uint32_t start = w.local && pos0 + 1 > c.window ? pos0 + 1 - c.window : 0;
-            AttnP a{pos0, start, c.kv_heads, c.heads / c.kv_heads, c.head_dim, c.rel_extent, 1.0f / std::sqrt(float(c.head_dim))};
+            AttnP a{pos0, start, c.kv_heads, c.heads / c.kv_heads, c.head_dim, c.rel_extent, kv_cap[visit], 1.0f / std::sqrt(float(c.head_dim))};
             [enc setComputePipelineState:p_attend];
             [enc setBuffer:scratch offset:s_qc atIndex:0];
             [enc setBuffer:kcache[visit] offset:0 atIndex:1];
@@ -1271,7 +1278,7 @@ public:
             [enc setBytes:&a length:sizeof(a) atIndex:7];
             grid(c.heads, 128);
         } else {
-            AttnBP a{pos0, M, c.window, w.local ? 1u : 0u, c.kv_heads, c.heads / c.kv_heads, c.head_dim, c.rel_extent, c.heads, qdim, q_stride, qdim + rdim, qdim * 2 + rdim, qdim, 1.0f / std::sqrt(float(c.head_dim))};
+            AttnBP a{pos0, M, c.window, w.local ? 1u : 0u, c.kv_heads, c.heads / c.kv_heads, c.head_dim, c.rel_extent, c.heads, qdim, q_stride, qdim + rdim, qdim * 2 + rdim, qdim, kv_cap[visit], 1.0f / std::sqrt(float(c.head_dim))};
             [enc setComputePipelineState:p_attend_b];
             [enc setBuffer:scratch offset:s_qc atIndex:0];
             [enc setBuffer:kcache[visit] offset:0 atIndex:1];
@@ -1735,10 +1742,10 @@ public:
 
     struct MtpMixPP { uint32_t hidden, alpha_row, row_start; float eps; };
     struct MtpGemvQ4PP { uint32_t rows, cols, ng, x_stride, y_stride, round_out, has_bias; };
-    struct MtpCtxKvPP { uint32_t kv_heads, head_dim, pos0; float eps, log_theta; };
+    struct MtpCtxKvPP { uint32_t kv_heads, head_dim, pos0, kv_cap; float eps, log_theta; };
     struct MtpEmbedPP { uint32_t hidden; float eps; };
     struct MtpQkRopePP { uint32_t q_heads, kv_heads, head_dim, qkv_stride, pos0; float eps, log_theta; };
-    struct MtpAttnPP { uint32_t prefix_len, ctx_start, q_heads, kv_heads, group, qkv_stride, q_dim, kv_dim; float scale; };
+    struct MtpAttnPP { uint32_t prefix_len, ctx_start, q_heads, kv_heads, group, qkv_stride, q_dim, kv_dim, kv_cap; float scale; };
     struct MtpBasePP { uint32_t vocab, ng, xs4; };
     struct MtpRnnInPP { uint32_t rank, hidden, step; };
     struct MtpMarkovPP { uint32_t dvocab, step; float cap, inv_temp; };
@@ -1772,7 +1779,7 @@ public:
                 [enc setBytes:&mp length:sizeof(mp) atIndex:4];
                 grid(mb, 576);
                 mtp_gemv_q4(ml.kv_ctx, m_ctx_x, H, m_ctx_kv, 2 * kvw, mb, false);
-                MtpCtxKvPP kp{mc.kv_heads, mc.head_dim, pos0 + off, mc.eps, mc.log_theta};
+                MtpCtxKvPP kp{mc.kv_heads, mc.head_dim, pos0 + off, m_kv_cap[i], mc.eps, mc.log_theta};
                 [enc setComputePipelineState:p_mtp_ctx_kv];
                 [enc setBuffer:m_ctx_kv offset:0 atIndex:0];
                 [enc setBuffer:mtp_file offset:ml.k_norm_ctx atIndex:1];
@@ -1839,7 +1846,7 @@ public:
             [enc setBytes:&rp length:sizeof(rp) atIndex:3];
             grid2(mc.heads + mc.kv_heads, 8, 32);
             uint32_t ctx_start = (ml.local && prefix_len > mc.window) ? (prefix_len - mc.window) : 0;
-            MtpAttnPP ap{prefix_len, ctx_start, mc.heads, mc.kv_heads, mc.heads / mc.kv_heads, qkv_stride, qdim, kvw, 1.0f / std::sqrt(float(mc.head_dim))};
+            MtpAttnPP ap{prefix_len, ctx_start, mc.heads, mc.kv_heads, mc.heads / mc.kv_heads, qkv_stride, qdim, kvw, m_kv_cap[i], 1.0f / std::sqrt(float(mc.head_dim))};
             [enc setComputePipelineState:p_mtp_attn];
             [enc setBuffer:m_qkv offset:0 atIndex:0];
             [enc setBuffer:m_kcache[i] offset:0 atIndex:1];
@@ -2201,7 +2208,7 @@ int generate_command(int argc, char** argv) {
         return 3;
     }
     if (ids.size() > engine.max_context || (*steps - 1) > engine.max_context - ids.size()) {
-        return refuse("prompt plus generated steps exceeds 4096-token context");
+        return refuse("prompt plus generated steps exceeds 32768-token context");
     }
     uint64_t embed_rows = engine.T("embed.weight").shape[0];
     for (uint32_t id : ids) {
@@ -2246,7 +2253,7 @@ int bench_command(int argc, char** argv) {
         return 3;
     }
     if (ids.size() > engine.max_context || (*steps - 1) > engine.max_context - ids.size()) {
-        return refuse("prompt plus generated steps exceeds 4096-token context");
+        return refuse("prompt plus generated steps exceeds 32768-token context");
     }
     uint64_t embed_rows = engine.T("embed.weight").shape[0];
     for (uint32_t id : ids) {

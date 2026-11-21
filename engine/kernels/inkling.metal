@@ -307,7 +307,7 @@ kernel void clip_rows(device const float* x [[buffer(0)]],
     }
 }
 
-struct ClipKv { uint width; uint pos; uint stride; uint mode; float threshold; };
+struct ClipKv { uint width; uint pos; uint stride; uint mode; uint kv_cap; float threshold; };
 
 kernel void clip_kv_store(device const float* x [[buffer(0)]],
                           device ushort* cache [[buffer(1)]],
@@ -324,7 +324,7 @@ kernel void clip_kv_store(device const float* x [[buffer(0)]],
     }
     s = simd_sum(s);
     float coeff = p.mode == 1u ? (1.0f / precise::sqrt(s / float(p.width) + 1e-6f)) : min(p.threshold / (1e-6f + precise::sqrt(s)), 1.0f);
-    device ushort* dst = cache + ulong(p.pos) * p.stride + row * p.width;
+    device ushort* dst = cache + ulong(p.pos % p.kv_cap) * p.stride + row * p.width;
     n = 0;
     for (uint i = lane; i < p.width; i += 32u, ++n) {
         dst[i] = f2bf(v[n] * coeff);
@@ -343,7 +343,7 @@ kernel void rel_bias(device const float* r [[buffer(0)]],
     rel[h * dims.y + d] = rbf(acc);
 }
 
-struct Attn { uint pos; uint start; uint kv_heads; uint group; uint head_dim; uint extent; float scale; };
+struct Attn { uint pos; uint start; uint kv_heads; uint group; uint head_dim; uint extent; uint kv_cap; float scale; };
 
 kernel void attend_gated(device const float4* q [[buffer(0)]],
                          device const ushort4* kc [[buffer(1)]],
@@ -367,7 +367,7 @@ kernel void attend_gated(device const float4* q [[buffer(0)]],
     float4 o4 = 0.0f;
     for (uint t = simd; t < count; t += 4u) {
         uint kp = p.start + t;
-        ulong base = (ulong(kp) * p.kv_heads + kvh) * 32u + lane;
+        ulong base = (ulong(kp % p.kv_cap) * p.kv_heads + kvh) * 32u + lane;
         ushort4 ku = kc[base];
         float4 k4 = float4(bfv(ku.x), bfv(ku.y), bfv(ku.z), bfv(ku.w));
         float s = simd_sum(dot(q4, k4)) * p.scale;
