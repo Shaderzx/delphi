@@ -71,3 +71,6 @@ test('probe bandwidth refuses a buffer size whose byte count would overflow', ()
 test('probe bandwidth refuses a repeat count larger than the engine can count', () => {
   expectRefused(probe(['--repeats', '4294967296']), '--repeats');
 });
+test('probe bandwidth refuses a buffer whose 16-byte count would wrap the kernel loop counter', () => {
+  expectRefused(probe(['--mib', '65533']), '--mib');
+});
