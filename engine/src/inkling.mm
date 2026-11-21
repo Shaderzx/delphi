@@ -6,15 +6,15 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <array>
 #include <chrono>
-#include <functional>
-#include <tuple>
 #include <cmath>
 #include <cstdio>
-#include <fstream>
+#include <cstring>
 #include <map>
 #include <sstream>
 #include <string>
+#include <tuple>
 #include <vector>
 
 #import <Foundation/Foundation.h>
@@ -31,6 +31,29 @@ struct Tensor {
     std::vector<uint64_t> shape;
 };
 
+struct Mat {
+    uint64_t offset = 0;
+    uint32_t rows = 0;
+    uint32_t cols = 0;
+};
+
+struct CtlWeights {
+    Mat down, gain, forget;
+};
+
+struct LayerWeights {
+    bool local = false;
+    bool nvfp4 = false;
+    uint64_t attn_norm = 0, q_norm = 0, k_norm = 0, v_norm = 0, mlp_norm = 0;
+    Mat wq, wr, gate_attn, sink, wk, wv, wo, dynk, dynv, router;
+    uint64_t k_sconv = 0, v_sconv = 0, attn_sconv = 0, mlp_sconv = 0;
+    uint64_t q_clip = 0, r_clip = 0, rel_proj = 0, router_bias = 0;
+    uint64_t w13_w = 0, w13_s = 0, w13_amax = 0, w13_denom = 0, w13_eb = 0, w13_sb = 0;
+    uint64_t w2_w = 0, w2_s = 0, w2_amax = 0, w2_denom = 0, w2_eb = 0, w2_sb = 0;
+    bool has_ctl = false;
+    std::array<CtlWeights, 4> ctl;
+};
+
 struct Config {
     uint32_t hidden, layers, heads, kv_heads, head_dim, d_rel, rel_extent, window, block, experts, top, inter, vocab, padded_vocab;
     uint32_t core_start, core_end, passes, n_floor;
@@ -45,24 +68,38 @@ NSDictionary* json_object(NSData* data) {
 uint32_t u(NSDictionary* d, NSString* k) { return [d[k] unsignedIntValue]; }
 float f(NSDictionary* d, NSString* k) { return [d[k] floatValue]; }
 
-struct Slot { uint32_t index; };
-
 class Engine {
 public:
     Gpu gpu;
     Config c{};
     std::map<std::string, Tensor> tensors;
+    std::vector<LayerWeights> lw;
+    uint64_t embed_off = 0, embed_norm_off = 0, final_norm_off = 0;
+    Mat unembed_mat{};
     id<MTLBuffer> file = nil;
-    std::map<std::string, id<MTLComputePipelineState>> pipes;
-    id<MTLBuffer> arena, queries, lut, logits, token, scratch;
-    std::map<std::string, std::pair<uint64_t, uint64_t>> scratch_slots;
+    id<MTLComputePipelineState> p_gemv, p_norm, p_res, p_sconv, p_clip, p_clip_kv, p_rel, p_attend, p_route;
+    id<MTLComputePipelineState> p_qnv4, p_qmxf8, p_env4, p_emxf8, p_swiglu, p_swiglu_qnv4, p_combine;
+    id<MTLComputePipelineState> p_ctl_norm, p_ctl_mix_norm, p_embed, p_softcap, p_argmax, p_round;
+    id<MTLBuffer> arena, queries, logits, token, scratch;
+    uint64_t s_q, s_qc, s_r, s_rc, s_gate, s_sinks, s_kraw, s_vraw, s_k, s_v, s_dynk, s_dynv, s_rel, s_gated;
+    uint64_t s_router, s_ids, s_gammas, s_xq, s_outer, s_gu, s_h, s_hq, s_houter, s_rows;
+    uint64_t s_normed[3], s_ctlh[3], s_gain[3], s_forget[3];
     std::vector<id<MTLBuffer>> kcache, vcache;
-    std::map<std::pair<uint32_t, int>, id<MTLBuffer>> conv;
+    std::vector<std::array<id<MTLBuffer>, 4>> conv;
     uint32_t max_context = 4096;
     uint32_t next_slot = 0;
     uint32_t slots = 4096;
-    std::map<std::string, uint64_t> query_offsets;
+    std::vector<uint64_t> q_attn_off, q_mlp_off, q_loop_attn_off, q_loop_mlp_off;
+    uint64_t q_output_off = 0;
     id<MTLComputeCommandEncoder> enc = nil;
+    bool together = false;
+
+    const Tensor& T(const std::string& name) const { return tensors.at("model.llm." + name); }
+
+    Mat make_mat(const std::string& name) const {
+        const Tensor& t = T(name);
+        return {t.offset, uint32_t(t.shape[0]), uint32_t(t.bytes / 2 / t.shape[0])};
+    }
 
     bool load(const std::string& dir, std::string& error) {
         auto opened = open_gpu(error);
@@ -127,43 +164,80 @@ public:
         }
         file = [gpu.device newBufferWithBytesNoCopy:data length:mapped options:MTLResourceStorageModeShared deallocator:nil];
         if (!file) { munmap(data, mapped); error = "newBufferWithBytesNoCopy failed"; return false; }
-        for (NSString* name in @[@"gemv_bf16", @"rms_norm", @"attn_res", @"sconv", @"clip_rows", @"rel_bias", @"attend", @"gate_out", @"kv_store", @"route",
-                                 @"quant_nvfp4", @"quant_mxfp8", @"expert_nvfp4", @"expert_mxfp8", @"swiglu", @"combine", @"ctl_normed", @"ctl_mix",
-                                 @"embed_row", @"softcap_logits", @"argmax_logits", @"round_rows"]) {
-            pipes[name.UTF8String] = pipeline(gpu, name);
-        }
+        p_gemv = pipeline(gpu, @"gemv_bf16");
+        p_norm = pipeline(gpu, @"rms_norm");
+        p_res = pipeline(gpu, @"attn_res");
+        p_sconv = pipeline(gpu, @"sconv");
+        p_clip = pipeline(gpu, @"clip_rows");
+        p_clip_kv = pipeline(gpu, @"clip_kv_store");
+        p_rel = pipeline(gpu, @"rel_bias");
+        p_attend = pipeline(gpu, @"attend_gated");
+        p_route = pipeline(gpu, @"route");
+        p_qnv4 = pipeline(gpu, @"quant_nvfp4");
+        p_qmxf8 = pipeline(gpu, @"quant_mxfp8");
+        p_env4 = pipeline(gpu, @"expert_nvfp4");
+        p_emxf8 = pipeline(gpu, @"expert_mxfp8");
+        p_swiglu = pipeline(gpu, @"swiglu");
+        p_swiglu_qnv4 = pipeline(gpu, @"swiglu_quant_nvfp4");
+        p_combine = pipeline(gpu, @"combine");
+        p_ctl_norm = pipeline(gpu, @"ctl_normed");
+        p_ctl_mix_norm = pipeline(gpu, @"ctl_mix_norm");
+        p_embed = pipeline(gpu, @"embed_row");
+        p_softcap = pipeline(gpu, @"softcap_logits");
+        p_argmax = pipeline(gpu, @"argmax_logits");
+        p_round = pipeline(gpu, @"round_rows");
         arena = [gpu.device newBufferWithLength:uint64_t(slots) * c.hidden * 4 options:MTLResourceStorageModePrivate];
         if (!arena) { error = "arena allocation failed"; return false; }
         build_queries();
         if (!queries) { error = "queries allocation failed"; return false; }
-        std::vector<float> table(256);
-        for (int b = 0; b < 256; ++b) {
-            int e = (b >> 3) & 15, m = b & 7;
-            float v = e == 0 ? m / 8.0f * std::ldexp(1.0f, -6) : (1 + m / 8.0f) * std::ldexp(1.0f, e - 7);
-            if (e == 15 && m == 7) v = NAN;
-            table[b] = (b & 0x80) ? -v : v;
-        }
-        lut = [gpu.device newBufferWithBytes:table.data() length:1024 options:MTLResourceStorageModeShared];
+        resolve_weights();
         logits = [gpu.device newBufferWithLength:uint64_t(c.padded_vocab) * 4 options:MTLResourceStorageModeShared];
         token = [gpu.device newBufferWithLength:16 options:MTLResourceStorageModeShared];
-        if (!lut || !logits || !token) { error = "workspace allocation failed"; return false; }
+        if (!logits || !token) { error = "workspace allocation failed"; return false; }
         uint32_t H = c.hidden, I = c.inter, K = c.top;
-        std::vector<std::pair<std::string, uint64_t>> plan = {
-            {"q", c.heads * c.head_dim}, {"qc", c.heads * c.head_dim}, {"r", c.heads * c.d_rel}, {"rc", c.heads * c.d_rel}, {"gate", c.heads * c.head_dim},
-            {"sinks", c.heads}, {"kraw", c.kv_heads * c.head_dim}, {"vraw", c.kv_heads * c.head_dim}, {"k", c.kv_heads * c.head_dim},
-            {"kc", c.kv_heads * c.head_dim}, {"v", c.kv_heads * c.head_dim}, {"vc", c.kv_heads * c.head_dim}, {"dynk", c.kv_heads * 4},
-            {"dynv", c.kv_heads * 4}, {"rel", c.heads * c.rel_extent}, {"o", c.heads * c.head_dim}, {"lse", c.heads},
-            {"gated", c.heads * c.head_dim}, {"router", c.experts}, {"ids", 16}, {"gammas", 16}, {"xq", H}, {"outer", 16},
-            {"gu", K * 2 * I}, {"h", K * I}, {"hq", K * I}, {"houter", 16}, {"rows", K * H}, {"normed", 2 * H}, {"ctlh", 64},
-            {"gain", H}, {"forget", H}};
         uint64_t at = 0;
-        for (auto& [name, n] : plan) { scratch_slots[name] = {at, n}; at += (n * 4 + 255) / 256 * 256; }
+        auto slot_alloc = [&](uint64_t count) {
+            uint64_t off = at;
+            at += (count * 4 + 255) / 256 * 256;
+            return off;
+        };
+        s_q = slot_alloc(c.heads * c.head_dim);
+        s_qc = slot_alloc(c.heads * c.head_dim);
+        s_r = slot_alloc(c.heads * c.d_rel);
+        s_rc = slot_alloc(c.heads * c.d_rel);
+        s_gate = slot_alloc(c.heads * c.head_dim);
+        s_sinks = slot_alloc(c.heads);
+        s_kraw = slot_alloc(c.kv_heads * c.head_dim);
+        s_vraw = slot_alloc(c.kv_heads * c.head_dim);
+        s_k = slot_alloc(c.kv_heads * c.head_dim);
+        s_v = slot_alloc(c.kv_heads * c.head_dim);
+        s_dynk = slot_alloc(c.kv_heads * 4);
+        s_dynv = slot_alloc(c.kv_heads * 4);
+        s_rel = slot_alloc(c.heads * c.rel_extent);
+        s_gated = slot_alloc(c.heads * c.head_dim);
+        s_router = slot_alloc(c.experts);
+        s_ids = slot_alloc(16);
+        s_gammas = slot_alloc(16);
+        s_xq = slot_alloc(H);
+        s_outer = slot_alloc(16);
+        s_gu = slot_alloc(K * 2 * I);
+        s_h = slot_alloc(K * I);
+        s_hq = slot_alloc(K * I);
+        s_houter = slot_alloc(16);
+        s_rows = slot_alloc(K * H);
+        for (int k = 0; k < 3; ++k) {
+            s_normed[k] = slot_alloc(2 * H);
+            s_ctlh[k] = slot_alloc(64);
+            s_gain[k] = slot_alloc(H);
+            s_forget[k] = slot_alloc(H);
+        }
         scratch = [gpu.device newBufferWithLength:at options:MTLResourceStorageModePrivate];
         if (!scratch) { error = "scratch allocation failed"; return false; }
         uint32_t visits = c.layers + (c.passes - 1) * (c.core_end - c.core_start);
+        conv.resize(visits);
         for (uint32_t v = 0; v < visits; ++v) {
-            id<MTLBuffer> kb = [gpu.device newBufferWithLength:uint64_t(max_context) * c.kv_heads * c.head_dim * 4 options:MTLResourceStorageModePrivate];
-            id<MTLBuffer> vb = [gpu.device newBufferWithLength:uint64_t(max_context) * c.kv_heads * c.head_dim * 4 options:MTLResourceStorageModePrivate];
+            id<MTLBuffer> kb = [gpu.device newBufferWithLength:uint64_t(max_context) * c.kv_heads * c.head_dim * 2 options:MTLResourceStorageModePrivate];
+            id<MTLBuffer> vb = [gpu.device newBufferWithLength:uint64_t(max_context) * c.kv_heads * c.head_dim * 2 options:MTLResourceStorageModePrivate];
             if (!kb || !vb) { error = "kv cache allocation failed"; return false; }
             kcache.push_back(kb);
             vcache.push_back(vb);
@@ -171,237 +245,332 @@ public:
                 uint64_t width = s < 2 ? c.kv_heads * c.head_dim : c.hidden;
                 id<MTLBuffer> b = [gpu.device newBufferWithLength:3 * width * 4 options:MTLResourceStorageModeShared];
                 if (!b) { error = "conv state allocation failed"; return false; }
-                conv[{v, s}] = b;
+                conv[v][s] = b;
             }
         }
         return true;
     }
 
+    void resolve_weights() {
+        embed_off = T("embed.weight").offset;
+        embed_norm_off = T("embed_norm.weight").offset;
+        final_norm_off = T("norm.weight").offset;
+        unembed_mat = make_mat("unembed.weight");
+        lw.resize(c.layers);
+        const char* cnames[4] = {"attn", "k", "v", "mlp"};
+        for (uint32_t i = 0; i < c.layers; ++i) {
+            LayerWeights& w = lw[i];
+            std::string L = "layers." + std::to_string(i) + ".";
+            std::string A = L + "attn.";
+            std::string M = L + "mlp.";
+            w.local = c.local[i];
+            if (w.local) {
+                w.attn_norm = T(L + "attn_norm.weight").offset;
+            } else {
+                w.q_norm = T(L + "q_input_norm.weight").offset;
+                w.k_norm = T(L + "k_input_norm.weight").offset;
+                w.v_norm = T(L + "v_input_norm.weight").offset;
+            }
+            w.mlp_norm = T(L + "mlp_norm.weight").offset;
+            w.wq = make_mat(A + "wq_du.weight");
+            w.wr = make_mat(A + "wr_du.weight");
+            w.gate_attn = make_mat(A + "gate_attn.weight");
+            w.sink = make_mat(A + "attn_sink_proj.weight");
+            w.wk = make_mat(A + "wk_dv.weight");
+            w.wv = make_mat(A + "wv_dv.weight");
+            w.wo = make_mat(A + "wo_ud.weight");
+            if (w.local) {
+                w.k_sconv = T(A + "k_sconv.weight").offset;
+                w.v_sconv = T(A + "v_sconv.weight").offset;
+            } else {
+                w.dynk = make_mat(A + "k_sconv.weight_proj");
+                w.dynv = make_mat(A + "v_sconv.weight_proj");
+                w.k_sconv = T(A + "k_sconv.static_w").offset;
+                w.v_sconv = T(A + "v_sconv.static_w").offset;
+            }
+            w.q_clip = T(A + "q_l2_clip.scale").offset;
+            w.r_clip = T(A + "rel_l2_clip.scale").offset;
+            w.rel_proj = T(A + "rel_logits_proj.proj").offset;
+            w.attn_sconv = T(L + "attn_sconv.weight").offset;
+            w.mlp_sconv = T(L + "mlp_sconv.weight").offset;
+            w.router = make_mat(M + "gate.weight");
+            w.router_bias = T(M + "gate.bias").offset;
+            const Tensor& w13 = T(M + "experts.w13_weight");
+            const Tensor& s13 = T(M + "experts.w13_weight_scale");
+            const Tensor& w2 = T(M + "experts.w2_weight");
+            const Tensor& s2 = T(M + "experts.w2_weight_scale");
+            w.nvfp4 = w13.dtype == "U8";
+            w.w13_w = w13.offset; w.w13_s = s13.offset; w.w13_eb = w13.bytes / c.experts; w.w13_sb = s13.bytes / c.experts;
+            w.w2_w = w2.offset; w.w2_s = s2.offset; w.w2_eb = w2.bytes / c.experts; w.w2_sb = s2.bytes / c.experts;
+            if (w.nvfp4) {
+                w.w13_amax = T(M + "experts.w13_weight_amax").offset;
+                w.w13_denom = T(M + "experts.w13_weight_outer_scale_denominator").offset;
+                w.w2_amax = T(M + "experts.w2_weight_amax").offset;
+                w.w2_denom = T(M + "experts.w2_weight_outer_scale_denominator").offset;
+            }
+            if (i >= c.core_start && i < c.core_end) {
+                w.has_ctl = true;
+                for (int k = 0; k < 4; ++k) {
+                    std::string cb = L + "controllers." + cnames[k] + ".";
+                    w.ctl[k] = {make_mat(cb + "down_weight"), make_mat(cb + "gain_weight"), make_mat(cb + "forget_weight")};
+                }
+            }
+        }
+    }
+
     void build_queries() {
         std::vector<float> all;
         float scale = 1.0f / std::sqrt(float(c.hidden));
-        auto add = [&](const std::string& key, const std::string& name, uint64_t row_offset, uint64_t rows) {
-            query_offsets[key] = all.size() * 4;
+        auto append_rows = [&](const std::string& name, uint64_t row_offset, uint64_t rows) {
             const Tensor& t = tensors.at(name);
             const float* src = reinterpret_cast<const float*>(static_cast<const char*>(file.contents) + t.offset) + row_offset * c.hidden;
             for (uint64_t i = 0; i < rows * c.hidden; ++i) all.push_back(src[i] * scale);
-            while (all.size() % 64) all.push_back(0);
         };
+        auto align64 = [&]() { while (all.size() % 64) all.push_back(0); };
         std::string p = "model.llm.attn_res.";
-        for (uint32_t i = 1; i < c.layers; ++i) add("attn" + std::to_string(i), p + "attn_queries." + std::to_string(i - 1), 0, c.local[i] ? 1 : 3);
-        for (uint32_t i = 0; i < c.layers; ++i) add("mlp" + std::to_string(i), p + "mlp_queries." + std::to_string(i), 0, 1);
-        add("output", p + "output_query", 0, 1);
+        q_attn_off.assign(c.layers, 0);
+        for (uint32_t i = 1; i < c.layers; ++i) {
+            q_attn_off[i] = all.size() * 4;
+            append_rows(p + "attn_queries." + std::to_string(i - 1), 0, c.local[i] ? 1 : 3);
+            align64();
+        }
+        q_mlp_off.assign(c.layers, 0);
+        for (uint32_t i = 0; i < c.layers; ++i) {
+            q_mlp_off[i] = all.size() * 4;
+            append_rows(p + "mlp_queries." + std::to_string(i), 0, 1);
+            align64();
+        }
+        q_output_off = all.size() * 4;
+        append_rows(p + "output_query", 0, 1);
+        align64();
         uint32_t core = c.core_end - c.core_start;
+        q_loop_attn_off.assign(core, 0);
+        q_loop_mlp_off.assign(core, 0);
         for (uint32_t l = 0; l < core; ++l) {
-            add("loop_attn" + std::to_string(l) + "_0", "model.llm.middle_cycle_cross_pass_queries", 2 * l, 1);
-            uint64_t a = all.size();
-            add("loop_attn" + std::to_string(l) + "_1", "model.llm.middle_cycle_cross_pass_kv_queries", 2 * l, 1);
-            add("loop_attn" + std::to_string(l) + "_2", "model.llm.middle_cycle_cross_pass_kv_queries", 2 * l + 1, 1);
-            (void)a;
-            add("loop_mlp" + std::to_string(l), "model.llm.middle_cycle_cross_pass_queries", 2 * l + 1, 1);
+            q_loop_attn_off[l] = all.size() * 4;
+            append_rows("model.llm.middle_cycle_cross_pass_queries", 2 * l, 1);
+            append_rows("model.llm.middle_cycle_cross_pass_kv_queries", 2 * l, 1);
+            append_rows("model.llm.middle_cycle_cross_pass_kv_queries", 2 * l + 1, 1);
+            align64();
+            q_loop_mlp_off[l] = all.size() * 4;
+            append_rows("model.llm.middle_cycle_cross_pass_queries", 2 * l + 1, 1);
+            align64();
         }
         queries = [gpu.device newBufferWithBytes:all.data() length:all.size() * 4 options:MTLResourceStorageModeShared];
     }
 
-    const Tensor& T(const std::string& name) { return tensors.at("model.llm." + name); }
     uint64_t so(uint32_t slot) const { return uint64_t(slot) * c.hidden * 4; }
     uint32_t alloc() { return next_slot++; }
 
-    void bind_s(const std::string& name, int index) { [enc setBuffer:scratch offset:scratch_slots.at(name).first atIndex:index]; }
-    void bind_a(uint32_t slot, int index) { [enc setBuffer:arena offset:so(slot) atIndex:index]; }
-    void bind_t(const std::string& name, int index) { [enc setBuffer:file offset:T(name).offset atIndex:index]; }
-    void use(const std::string& name) { [enc setComputePipelineState:pipes.at(name)]; }
-    bool together = false;
     void barrier() { if (!together) [enc memoryBarrierWithScope:MTLBarrierScopeBuffers]; }
     void grid(NSUInteger groups, NSUInteger threads) { barrier(); [enc dispatchThreadgroups:MTLSizeMake(groups, 1, 1) threadsPerThreadgroup:MTLSizeMake(threads, 1, 1)]; }
     void grid2(NSUInteger gx, NSUInteger gy, NSUInteger threads) { barrier(); [enc dispatchThreadgroups:MTLSizeMake(gx, gy, 1) threadsPerThreadgroup:MTLSizeMake(threads, 1, 1)]; }
 
     struct GemvP { uint32_t rows, cols, round_out; float scale; };
-    void gemv(const std::string& weight, std::function<void(int)> in, std::function<void(int)> out, bool round_out = true) {
-        const Tensor& t = T(weight);
-        GemvP g{uint32_t(t.shape[0]), uint32_t(t.bytes / 2 / t.shape[0]), round_out ? 1u : 0u, 1.0f};
-        use("gemv_bf16");
-        bind_t(weight, 0);
-        in(1);
-        out(2);
+    void gemv_ab(const Mat& m, id<MTLBuffer> in_buf, uint64_t in_off, id<MTLBuffer> out_buf, uint64_t out_off, bool round_out = true) {
+        GemvP g{m.rows, m.cols, round_out ? 1u : 0u, 1.0f};
+        [enc setComputePipelineState:p_gemv];
+        [enc setBuffer:file offset:m.offset atIndex:0];
+        [enc setBuffer:in_buf offset:in_off atIndex:1];
+        [enc setBuffer:out_buf offset:out_off atIndex:2];
         [enc setBytes:&g length:sizeof(g) atIndex:3];
         grid((g.rows + 7) / 8, 256);
     }
-    std::function<void(int)> S(const std::string& name) { return [this, name](int i) { bind_s(name, i); }; }
-    std::function<void(int)> A(uint32_t slot) { return [this, slot](int i) { bind_a(slot, i); }; }
 
     struct NormP { uint32_t n, has_weight; float eps; };
-    uint32_t norm(uint32_t in, const std::string& weight) {
+    uint32_t norm(uint32_t in, uint64_t weight_off) {
         uint32_t out = alloc();
         NormP p{c.hidden, 1, 1e-6f};
-        use("rms_norm");
-        bind_a(in, 0);
-        bind_t(weight, 1);
-        bind_a(out, 2);
+        [enc setComputePipelineState:p_norm];
+        [enc setBuffer:arena offset:so(in) atIndex:0];
+        [enc setBuffer:file offset:weight_off atIndex:1];
+        [enc setBuffer:arena offset:so(out) atIndex:2];
         [enc setBytes:&p length:sizeof(p) atIndex:3];
-        grid(1, 1024);
+        grid(1, 576);
         return out;
     }
 
-    struct ResP { uint32_t n, sources; int32_t addend; uint32_t queries, normalize, offs[8], outs[3]; };
-    std::vector<uint32_t> res(const std::vector<uint32_t>& sources, int addend, const std::string& query, uint32_t nq) {
+    struct ResP { uint32_t n, sources; int32_t addend; uint32_t queries, normalize, has_norm, offs[8], outs[3]; uint32_t pad; uint64_t norm_offs[3]; };
+    std::vector<uint32_t> res(const std::vector<uint32_t>& sources, int addend, uint64_t query_off, uint32_t nq, const uint64_t* norm_offs = nullptr) {
         ResP p{};
         p.n = c.hidden;
         p.sources = uint32_t(sources.size());
         p.addend = addend >= 0 ? int32_t(addend * c.hidden) : -1;
         p.queries = nq;
         p.normalize = 1;
+        p.has_norm = norm_offs ? 1u : 0u;
         for (size_t i = 0; i < sources.size(); ++i) p.offs[i] = sources[i] * c.hidden;
         std::vector<uint32_t> outs;
-        for (uint32_t k = 0; k < nq; ++k) { outs.push_back(alloc()); p.outs[k] = outs.back() * c.hidden; }
-        use("attn_res");
+        for (uint32_t k = 0; k < nq; ++k) {
+            outs.push_back(alloc());
+            p.outs[k] = outs.back() * c.hidden;
+            if (norm_offs) p.norm_offs[k] = norm_offs[k];
+        }
+        [enc setComputePipelineState:p_res];
         [enc setBuffer:arena offset:0 atIndex:0];
-        [enc setBuffer:queries offset:query_offsets.at(query) atIndex:1];
-        [enc setBytes:&p length:sizeof(p) atIndex:2];
-        grid(1, 1024);
+        [enc setBuffer:queries offset:query_off atIndex:1];
+        [enc setBuffer:file offset:0 atIndex:2];
+        [enc setBytes:&p length:sizeof(p) atIndex:3];
+        grid(1, 576);
         return outs;
     }
 
-    std::vector<uint32_t> loop_messages(const std::vector<uint32_t>& bank, uint32_t core_layer, bool attn_side) {
-        std::vector<uint32_t> out;
-        if (attn_side) {
-            [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
-            together = true;
-            for (int k = 0; k < 3; ++k) out.push_back(res(bank, -1, "loop_attn" + std::to_string(core_layer) + "_" + std::to_string(k), 1)[0]);
-            together = false;
-        } else {
-            out.push_back(res(bank, -1, "loop_mlp" + std::to_string(core_layer), 1)[0]);
-        }
-        return out;
-    }
-
-    uint32_t controller(uint32_t layer, const std::string& name, uint32_t dest, uint32_t message) {
-        std::string base = "layers." + std::to_string(layer) + ".controllers." + name + ".";
+    std::array<uint32_t, 3> controllers_attn_norm(const LayerWeights& w, const uint32_t dests[3], const uint32_t msgs[3], const uint64_t norm_offs[3]) {
         uint32_t n = c.hidden;
-        use("ctl_normed");
-        bind_a(dest, 0);
-        bind_a(message, 1);
-        bind_s("normed", 2);
-        [enc setBytes:&n length:4 atIndex:3];
-        grid(1, 1024);
-        gemv(base + "down_weight", S("normed"), S("ctlh"));
         [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
         together = true;
-        gemv(base + "gain_weight", S("ctlh"), S("gain"), false);
-        gemv(base + "forget_weight", S("ctlh"), S("forget"), false);
+        for (int k = 0; k < 3; ++k) {
+            [enc setComputePipelineState:p_ctl_norm];
+            [enc setBuffer:arena offset:so(dests[k]) atIndex:0];
+            [enc setBuffer:arena offset:so(msgs[k]) atIndex:1];
+            [enc setBuffer:scratch offset:s_normed[k] atIndex:2];
+            [enc setBytes:&n length:4 atIndex:3];
+            grid(1, 576);
+        }
+        together = false;
+        [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+        together = true;
+        for (int k = 0; k < 3; ++k) {
+            gemv_ab(w.ctl[k].down, scratch, s_normed[k], scratch, s_ctlh[k]);
+        }
+        together = false;
+        [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+        together = true;
+        for (int k = 0; k < 3; ++k) {
+            gemv_ab(w.ctl[k].gain, scratch, s_ctlh[k], scratch, s_gain[k], false);
+            gemv_ab(w.ctl[k].forget, scratch, s_ctlh[k], scratch, s_forget[k], false);
+        }
+        together = false;
+        [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+        together = true;
+        std::array<uint32_t, 3> outs;
+        for (int k = 0; k < 3; ++k) {
+            outs[k] = alloc();
+            [enc setComputePipelineState:p_ctl_mix_norm];
+            [enc setBuffer:arena offset:so(dests[k]) atIndex:0];
+            [enc setBuffer:arena offset:so(msgs[k]) atIndex:1];
+            [enc setBuffer:scratch offset:s_gain[k] atIndex:2];
+            [enc setBuffer:scratch offset:s_forget[k] atIndex:3];
+            [enc setBuffer:file offset:norm_offs[k] atIndex:4];
+            [enc setBuffer:arena offset:so(outs[k]) atIndex:5];
+            [enc setBytes:&n length:4 atIndex:6];
+            grid(1, 576);
+        }
+        together = false;
+        return outs;
+    }
+
+    uint32_t controller_mlp_norm(const LayerWeights& w, uint32_t dest, uint32_t msg) {
+        uint32_t n = c.hidden;
+        [enc setComputePipelineState:p_ctl_norm];
+        [enc setBuffer:arena offset:so(dest) atIndex:0];
+        [enc setBuffer:arena offset:so(msg) atIndex:1];
+        [enc setBuffer:scratch offset:s_normed[0] atIndex:2];
+        [enc setBytes:&n length:4 atIndex:3];
+        grid(1, 576);
+        gemv_ab(w.ctl[3].down, scratch, s_normed[0], scratch, s_ctlh[0]);
+        [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+        together = true;
+        gemv_ab(w.ctl[3].gain, scratch, s_ctlh[0], scratch, s_gain[0], false);
+        gemv_ab(w.ctl[3].forget, scratch, s_ctlh[0], scratch, s_forget[0], false);
         together = false;
         uint32_t out = alloc();
-        use("ctl_mix");
-        bind_a(dest, 0);
-        bind_a(message, 1);
-        bind_s("gain", 2);
-        bind_s("forget", 3);
-        bind_a(out, 4);
-        [enc setBytes:&n length:4 atIndex:5];
-        grid((n + 255) / 256, 256);
+        [enc setComputePipelineState:p_ctl_mix_norm];
+        [enc setBuffer:arena offset:so(dest) atIndex:0];
+        [enc setBuffer:arena offset:so(msg) atIndex:1];
+        [enc setBuffer:scratch offset:s_gain[0] atIndex:2];
+        [enc setBuffer:scratch offset:s_forget[0] atIndex:3];
+        [enc setBuffer:file offset:w.mlp_norm atIndex:4];
+        [enc setBuffer:arena offset:so(out) atIndex:5];
+        [enc setBytes:&n length:4 atIndex:6];
+        grid(1, 576);
         return out;
     }
 
     struct ConvP { uint32_t channels, dynamic, head_dim; float scale; };
-    void sconv(std::function<void(int)> x, id<MTLBuffer> state, const std::string& weight, std::function<void(int)> dyn, std::function<void(int)> y, uint32_t channels, bool dynamic) {
+    void sconv_run(id<MTLBuffer> xb, uint64_t xoff, id<MTLBuffer> state, uint64_t woff, uint64_t dynoff, id<MTLBuffer> yb, uint64_t yoff, uint32_t channels, bool dynamic) {
         ConvP p{channels, dynamic ? 1u : 0u, c.head_dim, dynamic ? 1.0f / 3.0f : 0.4472135955f};
-        use("sconv");
-        x(0);
+        [enc setComputePipelineState:p_sconv];
+        [enc setBuffer:xb offset:xoff atIndex:0];
         [enc setBuffer:state offset:0 atIndex:1];
-        bind_t(weight, 2);
-        if (dynamic) dyn(3); else bind_s("dynk", 3);
-        y(4);
+        [enc setBuffer:file offset:woff atIndex:2];
+        [enc setBuffer:scratch offset:dynoff atIndex:3];
+        [enc setBuffer:yb offset:yoff atIndex:4];
         [enc setBytes:&p length:sizeof(p) atIndex:5];
         grid((channels + 255) / 256, 256);
     }
 
     struct ClipP { uint32_t width, has_scale; float threshold, tau; uint32_t mode; };
-    void clip(const std::string& in, const std::string& scale, const std::string& out, uint32_t rows, uint32_t width, float thr, float tau, uint32_t mode) {
-        ClipP p{width, scale.empty() ? 0u : 1u, thr, tau, mode};
-        use("clip_rows");
-        bind_s(in, 0);
-        if (scale.empty()) bind_s(in, 1); else bind_t(scale, 1);
-        bind_s(out, 2);
+    void clip_run(uint64_t in_off, uint64_t scale_off, uint64_t out_off, uint32_t rows, uint32_t width, float thr, float tau, uint32_t mode) {
+        ClipP p{width, scale_off ? 1u : 0u, thr, tau, mode};
+        [enc setComputePipelineState:p_clip];
+        [enc setBuffer:scratch offset:in_off atIndex:0];
+        if (scale_off) [enc setBuffer:file offset:scale_off atIndex:1]; else [enc setBuffer:scratch offset:in_off atIndex:1];
+        [enc setBuffer:scratch offset:out_off atIndex:2];
         [enc setBytes:&p length:sizeof(p) atIndex:3];
         grid(rows, 32);
     }
 
+    struct ClipKvP { uint32_t width, pos, stride, mode; float threshold; };
+    void clip_kv_run(uint64_t in_off, id<MTLBuffer> cache, uint32_t rows, uint32_t width, uint32_t pos, uint32_t stride, uint32_t mode, float thr) {
+        ClipKvP p{width, pos, stride, mode, thr};
+        [enc setComputePipelineState:p_clip_kv];
+        [enc setBuffer:scratch offset:in_off atIndex:0];
+        [enc setBuffer:cache offset:0 atIndex:1];
+        [enc setBytes:&p length:sizeof(p) atIndex:2];
+        grid(rows, 32);
+    }
+
     struct AttnP { uint32_t pos, start, kv_heads, group, head_dim, extent; float scale; };
-    uint32_t attention(uint32_t layer, uint32_t visit, uint32_t sq, uint32_t sk, uint32_t sv, uint32_t pos) {
-        std::string L = "layers." + std::to_string(layer) + ".attn.";
-        bool local = c.local[layer];
-        [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
-        together = true;
-        gemv(L + "wq_du.weight", A(sq), S("q"));
-        gemv(L + "wr_du.weight", A(sq), S("r"));
-        gemv(L + "gate_attn.weight", A(sq), S("gate"));
-        gemv(L + "attn_sink_proj.weight", A(sq), S("sinks"));
-        gemv(L + "wk_dv.weight", A(sk), S("kraw"));
-        gemv(L + "wv_dv.weight", A(sv), S("vraw"));
+    uint32_t attention(const LayerWeights& w, uint32_t visit, uint32_t sq, uint32_t sk, uint32_t sv, uint32_t pos) {
         uint32_t kvw = c.kv_heads * c.head_dim;
-        if (!local) {
-            gemv(L + "k_sconv.weight_proj", A(sk), S("dynk"));
-            gemv(L + "v_sconv.weight_proj", A(sv), S("dynv"));
+        [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+        together = true;
+        gemv_ab(w.wq, arena, so(sq), scratch, s_q);
+        gemv_ab(w.wr, arena, so(sq), scratch, s_r);
+        gemv_ab(w.gate_attn, arena, so(sq), scratch, s_gate);
+        gemv_ab(w.sink, arena, so(sq), scratch, s_sinks);
+        gemv_ab(w.wk, arena, so(sk), scratch, s_kraw);
+        gemv_ab(w.wv, arena, so(sv), scratch, s_vraw);
+        if (!w.local) {
+            gemv_ab(w.dynk, arena, so(sk), scratch, s_dynk);
+            gemv_ab(w.dynv, arena, so(sv), scratch, s_dynv);
         }
         together = false;
         [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
         together = true;
-        if (local) {
-            sconv(S("kraw"), conv[{visit, 0}], L + "k_sconv.weight", nullptr, S("k"), kvw, false);
-            sconv(S("vraw"), conv[{visit, 1}], L + "v_sconv.weight", nullptr, S("v"), kvw, false);
-        } else {
-            sconv(S("kraw"), conv[{visit, 0}], L + "k_sconv.static_w", S("dynk"), S("k"), kvw, true);
-            sconv(S("vraw"), conv[{visit, 1}], L + "v_sconv.static_w", S("dynv"), S("v"), kvw, true);
-        }
+        float tau = w.local ? 1.0f : 1.0f + c.alpha * std::log(std::max((pos + 1.0f) / float(c.n_floor), 1.0f));
+        sconv_run(scratch, s_kraw, conv[visit][0], w.k_sconv, s_dynk, scratch, s_k, kvw, !w.local);
+        sconv_run(scratch, s_vraw, conv[visit][1], w.v_sconv, s_dynv, scratch, s_v, kvw, !w.local);
+        clip_run(s_q, w.q_clip, s_qc, c.heads, c.head_dim, c.clip_qk, tau, 0);
+        clip_run(s_r, w.r_clip, s_rc, c.heads, c.d_rel, c.clip_rel, tau, 0);
         together = false;
         [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
         together = true;
-        float tau = local ? 1.0f : 1.0f + c.alpha * std::log(std::max((pos + 1.0f) / float(c.n_floor), 1.0f));
-        clip("q", L + "q_l2_clip.scale", "qc", c.heads, c.head_dim, c.clip_qk, tau, 0);
-        clip("k", "", "kc", c.kv_heads, c.head_dim, c.clip_qk, 1.0f, 0);
-        clip("v", "", "vc", c.kv_heads, c.head_dim, 0, 1.0f, 1);
-        clip("r", L + "rel_l2_clip.scale", "rc", c.heads, c.d_rel, c.clip_rel, tau, 0);
-        together = false;
-        [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
-        together = true;
+        clip_kv_run(s_k, kcache[visit], c.kv_heads, c.head_dim, pos, kvw, 0, c.clip_qk);
+        clip_kv_run(s_v, vcache[visit], c.kv_heads, c.head_dim, pos, kvw, 1, 0.0f);
         uint32_t dims[2] = {c.d_rel, c.rel_extent};
-        use("rel_bias");
-        bind_s("rc", 0);
-        bind_t(L + "rel_logits_proj.proj", 1);
-        bind_s("rel", 2);
+        [enc setComputePipelineState:p_rel];
+        [enc setBuffer:scratch offset:s_rc atIndex:0];
+        [enc setBuffer:file offset:w.rel_proj atIndex:1];
+        [enc setBuffer:scratch offset:s_rel atIndex:2];
         [enc setBytes:dims length:8 atIndex:3];
         [enc dispatchThreadgroups:MTLSizeMake((c.rel_extent + 255) / 256, c.heads, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
-        uint32_t store[2] = {pos, kvw};
-        use("kv_store");
-        bind_s("kc", 0);
-        bind_s("vc", 1);
-        [enc setBuffer:kcache[visit] offset:0 atIndex:2];
-        [enc setBuffer:vcache[visit] offset:0 atIndex:3];
-        [enc setBytes:store length:8 atIndex:4];
-        grid((kvw + 255) / 256, 256);
         together = false;
-        uint32_t start = local && pos + 1 > c.window ? pos + 1 - c.window : 0;
+        uint32_t start = w.local && pos + 1 > c.window ? pos + 1 - c.window : 0;
         AttnP a{pos, start, c.kv_heads, c.heads / c.kv_heads, c.head_dim, c.rel_extent, 1.0f / std::sqrt(float(c.head_dim))};
-        use("attend");
-        bind_s("qc", 0);
+        [enc setComputePipelineState:p_attend];
+        [enc setBuffer:scratch offset:s_qc atIndex:0];
         [enc setBuffer:kcache[visit] offset:0 atIndex:1];
         [enc setBuffer:vcache[visit] offset:0 atIndex:2];
-        bind_s("rel", 3);
-        bind_s("o", 4);
-        bind_s("lse", 5);
-        [enc setBytes:&a length:sizeof(a) atIndex:6];
-        grid(c.heads, 256);
-        uint32_t gd[2] = {c.heads, c.head_dim};
-        use("gate_out");
-        bind_s("o", 0);
-        bind_s("gate", 1);
-        bind_s("lse", 2);
-        bind_s("sinks", 3);
-        bind_s("gated", 4);
-        [enc setBytes:gd length:8 atIndex:5];
-        grid((c.heads * c.head_dim + 255) / 256, 256);
+        [enc setBuffer:scratch offset:s_rel atIndex:3];
+        [enc setBuffer:scratch offset:s_gate atIndex:4];
+        [enc setBuffer:scratch offset:s_sinks atIndex:5];
+        [enc setBuffer:scratch offset:s_gated atIndex:6];
+        [enc setBytes:&a length:sizeof(a) atIndex:7];
+        grid(c.heads, 128);
         uint32_t out = alloc();
-        gemv(L + "wo_ud.weight", S("gated"), A(out));
+        gemv_ab(w.wo, scratch, s_gated, arena, so(out));
         return out;
     }
 
@@ -409,150 +578,156 @@ public:
     struct ExpertP { uint32_t rows, cols, in_stride, out_stride, per_row_input; uint32_t pad; uint64_t expert_bytes, scale_bytes; };
     struct SwigluP { uint32_t inter, top; float gate_cap, up_cap; uint32_t round_out; };
 
-    void experts(uint32_t layer, uint32_t x) {
-        std::string M = "layers." + std::to_string(layer) + ".mlp.";
-        gemv(M + "gate.weight", A(x), S("router"), false);
-        RouteP rp{c.experts, c.top, c.route_scale};
-        use("route");
-        bind_s("router", 0);
-        bind_t(M + "gate.bias", 1);
-        bind_s("ids", 2);
-        bind_s("gammas", 3);
-        [enc setBytes:&rp length:sizeof(rp) atIndex:4];
-        grid(1, 256);
-        bool nv = T(M + "experts.w13_weight").dtype == "U8";
+    void experts(const LayerWeights& w, uint32_t x) {
         uint32_t H = c.hidden, I = c.inter;
-        auto run_expert = [&](const std::string& w, uint32_t rows, uint32_t cols, const std::string& in, const std::string& outer, const std::string& out, bool per_row) {
-            const Tensor& wt = T(M + "experts." + w + "_weight");
-            const Tensor& st = T(M + "experts." + w + "_weight_scale");
-            ExpertP p{rows, cols, per_row ? I : 0u, per_row ? H : 2 * I, per_row ? 1u : 0u, 0, wt.bytes / c.experts, st.bytes / c.experts};
-            use(nv ? "expert_nvfp4" : "expert_mxfp8");
-            bind_t(M + "experts." + w + "_weight", 0);
-            bind_t(M + "experts." + w + "_weight_scale", 1);
-            if (nv) {
-                bind_t(M + "experts." + w + "_weight_amax", 2);
-                bind_t(M + "experts." + w + "_weight_outer_scale_denominator", 3);
-                bind_s(outer, 5);
-            }
-            bind_s(in, 4);
-            bind_s("ids", 6);
-            bind_s(out, 7);
-            [enc setBytes:&p length:sizeof(p) atIndex:8];
-            [enc setBuffer:lut offset:0 atIndex:9];
-            grid2((rows + 7) / 8, c.top, 256);
-        };
-        if (nv) {
-            use("quant_nvfp4");
-            bind_a(x, 0);
-            bind_s("xq", 1);
-            bind_s("outer", 2);
+        [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+        together = true;
+        gemv_ab(w.router, arena, so(x), scratch, s_router, false);
+        if (w.nvfp4) {
+            [enc setComputePipelineState:p_qnv4];
+            [enc setBuffer:arena offset:so(x) atIndex:0];
+            [enc setBuffer:scratch offset:s_xq atIndex:1];
+            [enc setBuffer:scratch offset:s_outer atIndex:2];
             [enc setBytes:&H length:4 atIndex:3];
-            grid(1, 256);
+            grid(1, 160);
         } else {
-            use("quant_mxfp8");
-            bind_a(x, 0);
-            bind_s("xq", 1);
+            [enc setComputePipelineState:p_qmxf8];
+            [enc setBuffer:arena offset:so(x) atIndex:0];
+            [enc setBuffer:scratch offset:s_xq atIndex:1];
             [enc setBytes:&H length:4 atIndex:2];
             grid2((H / 32 + 63) / 64, 1, 64);
         }
-        run_expert("w13", 2 * I, H, "xq", "outer", "gu", false);
-        if (!nv) {
+        together = false;
+        RouteP rp{c.experts, c.top, c.route_scale};
+        [enc setComputePipelineState:p_route];
+        [enc setBuffer:scratch offset:s_router atIndex:0];
+        [enc setBuffer:file offset:w.router_bias atIndex:1];
+        [enc setBuffer:scratch offset:s_ids atIndex:2];
+        [enc setBuffer:scratch offset:s_gammas atIndex:3];
+        [enc setBytes:&rp length:sizeof(rp) atIndex:4];
+        grid(1, 32);
+        auto run_expert = [&](bool is_w2, uint32_t rows, uint32_t cols, uint64_t in_off, uint64_t outer_off, uint64_t out_off, bool per_row) {
+            ExpertP p{rows, cols, per_row ? I : 0u, per_row ? H : 2 * I, per_row ? 1u : 0u, 0, is_w2 ? w.w2_eb : w.w13_eb, is_w2 ? w.w2_sb : w.w13_sb};
+            [enc setComputePipelineState:w.nvfp4 ? p_env4 : p_emxf8];
+            [enc setBuffer:file offset:is_w2 ? w.w2_w : w.w13_w atIndex:0];
+            [enc setBuffer:file offset:is_w2 ? w.w2_s : w.w13_s atIndex:1];
+            if (w.nvfp4) {
+                [enc setBuffer:file offset:is_w2 ? w.w2_amax : w.w13_amax atIndex:2];
+                [enc setBuffer:file offset:is_w2 ? w.w2_denom : w.w13_denom atIndex:3];
+                [enc setBuffer:scratch offset:outer_off atIndex:5];
+            }
+            [enc setBuffer:scratch offset:in_off atIndex:4];
+            [enc setBuffer:scratch offset:s_ids atIndex:6];
+            [enc setBuffer:scratch offset:out_off atIndex:7];
+            [enc setBytes:&p length:sizeof(p) atIndex:8];
+            grid2((rows + 7) / 8, c.top, 256);
+        };
+        run_expert(false, 2 * I, H, s_xq, s_outer, s_gu, false);
+        if (w.nvfp4) {
+            SwigluP sp{I, c.top, c.gate_cap, c.up_cap, 1u};
+            [enc setComputePipelineState:p_swiglu_qnv4];
+            [enc setBuffer:scratch offset:s_gu atIndex:0];
+            [enc setBuffer:scratch offset:s_gammas atIndex:1];
+            [enc setBuffer:scratch offset:s_hq atIndex:2];
+            [enc setBuffer:scratch offset:s_houter atIndex:3];
+            [enc setBytes:&sp length:sizeof(sp) atIndex:4];
+            grid(c.top, 128);
+        } else {
             uint32_t n = c.top * 2 * I;
-            use("round_rows");
-            bind_s("gu", 0);
+            [enc setComputePipelineState:p_round];
+            [enc setBuffer:scratch offset:s_gu atIndex:0];
             [enc setBytes:&n length:4 atIndex:1];
             grid((n + 255) / 256, 256);
-        }
-        SwigluP sp{I, c.top, c.gate_cap, c.up_cap, nv ? 1u : 0u};
-        use("swiglu");
-        bind_s("gu", 0);
-        bind_s("gammas", 1);
-        bind_s("h", 2);
-        [enc setBytes:&sp length:sizeof(sp) atIndex:3];
-        grid2((I + 255) / 256, c.top, 256);
-        if (nv) {
-            use("quant_nvfp4");
-            bind_s("h", 0);
-            bind_s("hq", 1);
-            bind_s("houter", 2);
-            [enc setBytes:&I length:4 atIndex:3];
-            grid(c.top, 256);
-        } else {
-            use("quant_mxfp8");
-            bind_s("h", 0);
-            bind_s("hq", 1);
+            SwigluP sp{I, c.top, c.gate_cap, c.up_cap, 0u};
+            [enc setComputePipelineState:p_swiglu];
+            [enc setBuffer:scratch offset:s_gu atIndex:0];
+            [enc setBuffer:scratch offset:s_gammas atIndex:1];
+            [enc setBuffer:scratch offset:s_h atIndex:2];
+            [enc setBytes:&sp length:sizeof(sp) atIndex:3];
+            grid2((I + 255) / 256, c.top, 256);
+            [enc setComputePipelineState:p_qmxf8];
+            [enc setBuffer:scratch offset:s_h atIndex:0];
+            [enc setBuffer:scratch offset:s_hq atIndex:1];
             [enc setBytes:&I length:4 atIndex:2];
             grid2((I / 32 + 63) / 64, c.top, 64);
         }
-        run_expert("w2", H, I, "hq", "houter", "rows", true);
+        run_expert(true, H, I, s_hq, s_houter, s_rows, true);
     }
 
     struct CombineP { uint32_t n, top, boundary; };
 
-    std::pair<std::vector<uint32_t>, uint32_t> layer(std::vector<uint32_t> blocks, uint32_t partial, uint32_t layer, uint32_t pass, const std::vector<uint32_t>& bank, uint32_t pos) {
-        uint32_t visit = pass == 0 ? layer : c.layers + (pass - 1) * (c.core_end - c.core_start) + (layer - c.core_start);
-        bool local = c.local[layer];
-        std::string L = "layers." + std::to_string(layer) + ".";
-        std::vector<uint32_t> streams;
-        if (blocks.empty()) {
-            streams.assign(local ? 1 : 3, partial);
+    std::pair<std::vector<uint32_t>, uint32_t> layer(std::vector<uint32_t> blocks, uint32_t partial, uint32_t layer_idx, uint32_t pass, const std::vector<uint32_t>& bank, uint32_t pos) {
+        const LayerWeights& w = lw[layer_idx];
+        uint32_t visit = pass == 0 ? layer_idx : c.layers + (pass - 1) * (c.core_end - c.core_start) + (layer_idx - c.core_start);
+        uint32_t sq, sk, sv;
+        uint32_t core_layer = layer_idx - c.core_start;
+        if (!bank.empty()) {
+            std::vector<uint32_t> src = blocks;
+            src.push_back(partial);
+            [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+            together = true;
+            auto streams = res(src, -1, q_attn_off[layer_idx], w.local ? 1 : 3);
+            auto messages = res(bank, -1, q_loop_attn_off[core_layer], 3);
+            together = false;
+            uint32_t dests[3] = {streams[0], w.local ? streams[0] : streams[1], w.local ? streams[0] : streams[2]};
+            uint32_t msgs[3] = {messages[0], messages[1], messages[2]};
+            uint64_t noffs[3] = {w.local ? w.attn_norm : w.q_norm, w.local ? w.attn_norm : w.k_norm, w.local ? w.attn_norm : w.v_norm};
+            auto norms = controllers_attn_norm(w, dests, msgs, noffs);
+            sq = norms[0]; sk = norms[1]; sv = norms[2];
+        } else if (blocks.empty()) {
+            if (w.local) {
+                sq = sk = sv = norm(partial, w.attn_norm);
+            } else {
+                [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+                together = true;
+                sq = norm(partial, w.q_norm);
+                sk = norm(partial, w.k_norm);
+                sv = norm(partial, w.v_norm);
+                together = false;
+            }
         } else {
             std::vector<uint32_t> src = blocks;
             src.push_back(partial);
-            streams = res(src, -1, "attn" + std::to_string(layer), local ? 1 : 3);
-        }
-        uint32_t sq, sk, sv;
-        uint32_t core_layer = layer - c.core_start;
-        if (!bank.empty()) {
-            auto messages = loop_messages(bank, core_layer, true);
-            const char* names[3] = {"attn", "k", "v"};
-            std::vector<uint32_t> mixed;
-            for (int k = 0; k < 3; ++k) mixed.push_back(controller(layer, names[k], local ? streams[0] : streams[k], messages[k]));
-            if (local) {
-                sq = norm(mixed[0], L + "attn_norm.weight");
-                sk = norm(mixed[1], L + "attn_norm.weight");
-                sv = norm(mixed[2], L + "attn_norm.weight");
+            if (w.local) {
+                uint64_t noffs[3] = {w.attn_norm, 0, 0};
+                sq = sk = sv = res(src, -1, q_attn_off[layer_idx], 1, noffs)[0];
             } else {
-                sq = norm(mixed[0], L + "q_input_norm.weight");
-                sk = norm(mixed[1], L + "k_input_norm.weight");
-                sv = norm(mixed[2], L + "v_input_norm.weight");
+                uint64_t noffs[3] = {w.q_norm, w.k_norm, w.v_norm};
+                auto norms = res(src, -1, q_attn_off[layer_idx], 3, noffs);
+                sq = norms[0]; sk = norms[1]; sv = norms[2];
             }
-        } else if (local) {
-            sq = sk = sv = norm(streams[0], L + "attn_norm.weight");
-        } else {
-            sq = norm(streams[0], L + "q_input_norm.weight");
-            sk = norm(streams[1], L + "k_input_norm.weight");
-            sv = norm(streams[2], L + "v_input_norm.weight");
         }
-        uint32_t att = attention(layer, visit, sq, sk, sv, pos);
+        uint32_t att = attention(w, visit, sq, sk, sv, pos);
         uint32_t attc = alloc();
-        sconv(A(att), conv[{visit, 2}], L + "attn_sconv.weight", nullptr, A(attc), c.hidden, false);
-        bool boundary = layer % c.block == 0;
-        uint32_t mlp_in;
+        sconv_run(arena, so(att), conv[visit][2], w.attn_sconv, s_dynk, arena, so(attc), c.hidden, false);
+        bool boundary = layer_idx % c.block == 0;
         std::vector<uint32_t> src = blocks;
         src.push_back(partial);
-        if (boundary) {
-            src.push_back(attc);
-            mlp_in = res(src, -1, "mlp" + std::to_string(layer), 1)[0];
-        } else {
-            mlp_in = res(src, int(attc), "mlp" + std::to_string(layer), 1)[0];
-        }
+        int mlp_addend = boundary ? -1 : int(attc);
+        if (boundary) src.push_back(attc);
+        uint32_t x;
         if (!bank.empty()) {
-            auto messages = loop_messages(bank, core_layer, false);
-            mlp_in = controller(layer, "mlp", mlp_in, messages[0]);
+            [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+            together = true;
+            uint32_t mlp_in = res(src, mlp_addend, q_mlp_off[layer_idx], 1)[0];
+            uint32_t msg = res(bank, -1, q_loop_mlp_off[core_layer], 1)[0];
+            together = false;
+            x = controller_mlp_norm(w, mlp_in, msg);
+        } else {
+            uint64_t noffs[3] = {w.mlp_norm, 0, 0};
+            x = res(src, mlp_addend, q_mlp_off[layer_idx], 1, noffs)[0];
         }
-        uint32_t x = norm(mlp_in, L + "mlp_norm.weight");
-        experts(layer, x);
+        experts(w, x);
         uint32_t out = alloc();
         CombineP cp{c.hidden, c.top, boundary ? 1u : 0u};
-        use("combine");
-        bind_s("rows", 0);
-        bind_s("ids", 1);
-        bind_a(attc, 2);
-        bind_a(partial, 3);
-        [enc setBuffer:conv[{visit, 3}] offset:0 atIndex:4];
-        bind_t(L + "mlp_sconv.weight", 5);
-        bind_a(out, 6);
+        [enc setComputePipelineState:p_combine];
+        [enc setBuffer:scratch offset:s_rows atIndex:0];
+        [enc setBuffer:scratch offset:s_ids atIndex:1];
+        [enc setBuffer:arena offset:so(attc) atIndex:2];
+        [enc setBuffer:arena offset:so(partial) atIndex:3];
+        [enc setBuffer:conv[visit][3] offset:0 atIndex:4];
+        [enc setBuffer:file offset:w.mlp_sconv atIndex:5];
+        [enc setBuffer:arena offset:so(out) atIndex:6];
         [enc setBytes:&cp length:sizeof(cp) atIndex:7];
         grid((c.hidden + 255) / 256, 256);
         if (boundary) blocks.push_back(partial);
@@ -566,13 +741,13 @@ public:
         enc = [cb computeCommandEncoderWithDispatchType:MTLDispatchTypeConcurrent];
         uint32_t emb = alloc();
         uint32_t H = c.hidden;
-        use("embed_row");
-        bind_t("embed.weight", 0);
+        [enc setComputePipelineState:p_embed];
+        [enc setBuffer:file offset:embed_off atIndex:0];
         [enc setBuffer:token offset:0 atIndex:1];
-        bind_a(emb, 2);
+        [enc setBuffer:arena offset:so(emb) atIndex:2];
         [enc setBytes:&H length:4 atIndex:3];
         grid((H + 255) / 256, 256);
-        uint32_t x = norm(emb, "embed_norm.weight");
+        uint32_t x = norm(emb, embed_norm_off);
         std::vector<uint32_t> blocks;
         uint32_t partial = x;
         for (uint32_t l = 0; l < c.core_start; ++l) std::tie(blocks, partial) = layer(blocks, partial, l, 0, {}, pos);
@@ -591,22 +766,15 @@ public:
         for (uint32_t l = c.core_end; l < c.layers; ++l) std::tie(blocks, partial) = layer(blocks, partial, l, 0, {}, pos);
         std::vector<uint32_t> src = blocks;
         src.push_back(partial);
-        uint32_t final = res(src, -1, "output", 1)[0];
-        uint32_t hidden = norm(final, "norm.weight");
-        const Tensor& un = T("unembed.weight");
-        GemvP g{uint32_t(un.shape[0]), uint32_t(un.shape[1]), 1u, 1.0f};
-        use("gemv_bf16");
-        bind_t("unembed.weight", 0);
-        bind_a(hidden, 1);
-        [enc setBuffer:logits offset:0 atIndex:2];
-        [enc setBytes:&g length:sizeof(g) atIndex:3];
-        grid((g.rows + 7) / 8, 256);
+        uint64_t final_noffs[3] = {final_norm_off, 0, 0};
+        uint32_t hidden = res(src, -1, q_output_off, 1, final_noffs)[0];
+        gemv_ab(unembed_mat, arena, so(hidden), logits, 0, true);
         struct { uint32_t n, valid; float cap; } lp{c.padded_vocab, c.vocab, c.softcap};
-        use("softcap_logits");
+        [enc setComputePipelineState:p_softcap];
         [enc setBuffer:logits offset:0 atIndex:0];
         [enc setBytes:&lp length:sizeof(lp) atIndex:1];
         grid((c.padded_vocab + 255) / 256, 256);
-        use("argmax_logits");
+        [enc setComputePipelineState:p_argmax];
         [enc setBuffer:logits offset:0 atIndex:0];
         [enc setBuffer:token offset:4 atIndex:1];
         [enc setBytes:&c.padded_vocab length:4 atIndex:2];
@@ -618,8 +786,8 @@ public:
     }
 
     void reset_state() {
-        for (auto& [key, b] : conv) {
-            std::memset(b.contents, 0, b.length);
+        for (auto& arr : conv) {
+            for (int s = 0; s < 4; ++s) std::memset(arr[s].contents, 0, arr[s].length);
         }
     }
 
