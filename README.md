@@ -6,7 +6,7 @@ Status: working Metal C++20 engine with exact single-stream decode, certified tw
 
 ## Measured performance (Apple M5 Pro, AC power)
 
-All rows are uncontended medians of 6 warm runs (64 decode steps) via `delphi bench` unless noted. Exact mode is 100% token-identical to `--spec off` greedy on shipped weights (verified 32/32 against SGLang G4 on `fibonacci` and 12/12 against the fp32 numpy oracle on `paris`).
+Waves 1-5 are uncontended medians of 6 warm runs (64 decode steps, context 5-116 tokens) via `delphi bench`; the Wave 0 baseline (`30.7` wall / `32.1` GPU) comes from the initial two-run `delphi generate` baseline (`30.82 / 30.60` wall) and its 6-repeat `delphi bench` interleaved controls (`32.13-32.16` GPU / `30.68-30.69` wall) logged in Wave 1 of [bench/ledger.jsonl](bench/ledger.jsonl). Exact mode is 100% token-identical to `--spec off` greedy on shipped weights (verified 32/32 against SGLang G4 on `fibonacci` and 12/12 against the fp32 numpy oracle on `paris`).
 
 | Build / Mode | Exact? | Plain (`--spec off`) GPU / wall | `story` (`--spec auto`) GPU / wall | `fibonacci` (`--spec auto`) GPU / wall | `copy_code` (`--spec auto`) GPU / wall | Prefill (`M=8`) |
 |---|---|---:|---:|---:|---:|---:|

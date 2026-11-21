@@ -642,14 +642,18 @@ kernel void attend_gated_batch(device const float4* q [[buffer(0)]],
         so[simd][lane] = oj;
         threadgroup_barrier(mem_flags::mem_threadgroup);
         if (simd == 0) {
-            float mx = max(max(sm[0], sm[1]), max(sm[2], sm[3]));
+            uint qpos = pos_first + j;
+            uint qstart = (p.is_local && qpos + 1u > p.window) ? (qpos + 1u - p.window) : 0u;
+            uint shift = (qstart - kv_start) & 3u;
+            float mx = max(max(sm[shift], sm[(shift + 1u) & 3u]), max(sm[(shift + 2u) & 3u], sm[(shift + 3u) & 3u]));
             float tot = 0.0f;
             float4 acc = 0.0f;
             for (uint s = 0; s < 4u; ++s) {
-                if (sm[s] != -INFINITY) {
-                    float w = precise::exp(sm[s] - mx);
-                    tot += sl[s] * w;
-                    acc += so[s][lane] * w;
+                uint bs = (s + shift) & 3u;
+                if (sm[bs] != -INFINITY) {
+                    float w = precise::exp(sm[bs] - mx);
+                    tot += sl[bs] * w;
+                    acc += so[bs][lane] * w;
                 }
             }
             float lse = mx + precise::log(tot);
@@ -1205,9 +1209,13 @@ kernel void cert_head_tau_batch(device const float* tg_val [[buffer(0)]],
         uint exp = (bits >> 23) & 0xffu;
         float ulp = exp > 7u ? as_type<float>((exp - 7u) << 23) : 1e-6f;
         float s_lo = tau_s - ulp;
-        float u = clamp(s_lo / p.cap, -0.9999f, 0.9999f);
-        float z_lo = p.cap * 0.5f * precise::log((1.0f + u) / (1.0f - u));
-        state[m * 4u + 0u] = z_lo - fabs(z_lo) * 0.005f - 0.01f;
+        if (s_lo <= -p.cap) {
+            state[m * 4u + 0u] = -INFINITY;
+        } else {
+            float u = clamp(s_lo / p.cap, -0.9999f, 0.9999f);
+            float z_lo = p.cap * 0.5f * precise::log((1.0f + u) / (1.0f - u));
+            state[m * 4u + 0u] = z_lo - fabs(z_lo) * 0.005f - 0.01f;
+        }
         state[m * 4u + 1u] = tau_s;
     }
 }

@@ -196,6 +196,7 @@ public:
              f(t, @"mlp_up_softcap"), f(t, @"route_scale"), f(t, @"final_logit_softcapping"), {}};
         c.local.assign(c.layers, false);
         if (c.top != 8) { error = "only num_experts_per_tok == 8 is supported"; return false; }
+        if (c.inter > 2048) { error = "intermediate_size > 2048 is not supported"; return false; }
         for (NSNumber* n in t[@"local_layer_ids"]) {
             long long lid = n.longLongValue;
             if (lid < 0 || static_cast<uint64_t>(lid) >= c.layers) { error = "local_layer_ids contains out-of-range layer index"; return false; }
@@ -545,6 +546,28 @@ public:
         mc.eps = f(m, @"rms_norm_eps");
         mc.log_theta = std::log(f(m, @"rope_theta"));
         if (mc.hidden != c.hidden || mc.block_size != 8 || mc.rank != 256 || mc.head_dim != 128 || mc.layers == 0) return true;
+        auto require_mt = [&](const std::string& n) -> bool {
+            if (mtp_tensors.find(n) != mtp_tensors.end()) return true;
+            error = "missing mtp tensor: " + n;
+            return false;
+        };
+        for (const std::string& n : std::vector<std::string>{
+                 "fuse_weight", "mask_embed", "norm.weight", "markov_head.dflare_norm.weight",
+                 "markov_head.markov_w1.weight", "markov_head.rnn_proj.bias", "markov_head.rnn_proj.weight",
+                 "markov_head.hidden_out.weight", "markov_head.hidden_out.bias"}) {
+            if (!require_mt(n)) return false;
+        }
+        for (uint32_t i = 0; i < mc.layers; ++i) {
+            std::string L = "layers." + std::to_string(i) + ".";
+            for (const std::string& s : std::vector<std::string>{
+                     "dflare_norm.weight", "input_layernorm.weight", "post_attention_layernorm.weight",
+                     "self_attn.q_norm.weight", "self_attn.k_norm.weight", "self_attn.k_norm_ctx.weight",
+                     "self_attn.k_proj_ctx.weight", "self_attn.v_proj_ctx.weight", "self_attn.q_proj.weight",
+                     "self_attn.k_proj.weight", "self_attn.v_proj.weight", "self_attn.o_proj.weight",
+                     "mlp.gate_proj.weight", "mlp.up_proj.weight", "mlp.down_proj.weight"}) {
+                if (!require_mt(L + s)) return false;
+            }
+        }
         auto MT = [&](const std::string& n) -> const Tensor& { return mtp_tensors.at(n); };
         auto bf16_to_f32 = [](uint16_t b) {
             uint32_t bits = uint32_t(b) << 16;
@@ -656,8 +679,11 @@ public:
         for (uint32_t i = 0; i < mc.layers; ++i) {
             uint32_t mcap = mlw[i].local ? std::min<uint32_t>(max_context, mc.window + MAX_BATCH * 2) : max_context;
             m_kv_cap.push_back(mcap);
-            m_kcache.push_back([gpu.device newBufferWithLength:uint64_t(mcap) * kvw * 2 options:MTLResourceStorageModePrivate]);
-            m_vcache.push_back([gpu.device newBufferWithLength:uint64_t(mcap) * kvw * 2 options:MTLResourceStorageModePrivate]);
+            id<MTLBuffer> kb = [gpu.device newBufferWithLength:uint64_t(mcap) * kvw * 2 options:MTLResourceStorageModePrivate];
+            id<MTLBuffer> vb = [gpu.device newBufferWithLength:uint64_t(mcap) * kvw * 2 options:MTLResourceStorageModePrivate];
+            if (!kb || !vb) { error = "mtp kv cache allocation failed"; return false; }
+            m_kcache.push_back(kb);
+            m_vcache.push_back(vb);
         }
         m_f_rnn = [gpu.device newBufferWithLength:uint64_t(mc.hidden) * 2 options:MTLResourceStorageModePrivate];
         m_ctx_x = [gpu.device newBufferWithLength:uint64_t(MAX_BATCH) * mc.hidden * 2 options:MTLResourceStorageModePrivate];
@@ -679,7 +705,9 @@ public:
         m_tg_row = [gpu.device newBufferWithLength:uint64_t(mntg) * 4 options:MTLResourceStorageModePrivate];
         m_tg_sum = [gpu.device newBufferWithLength:uint64_t(mntg) * 4 options:MTLResourceStorageModePrivate];
         m_out = [gpu.device newBufferWithLength:128 options:MTLResourceStorageModeShared];
-        if (!m_alpha || !m_q4 || !m_sc || !m_vocab_ids || !m_head_q4 || !m_head_sc || !m_fold_q4 || !m_fold_sc || !m_fold_b || !m_base_logits || !m_out) {
+        if (!m_alpha || !m_q4 || !m_sc || !m_vocab_ids || !m_head_q4 || !m_head_sc || !m_fold_q4 || !m_fold_sc || !m_fold_b
+            || !m_f_rnn || !m_ctx_x || !m_ctx_kv || !m_h || !m_hn || !m_h1 || !m_qkv || !m_attn_out || !m_gu || !m_mlp_h
+            || !m_base_logits || !m_rnn_state || !m_rnn_in || !m_rnn_proj_out || !m_latent || !m_tg_val || !m_tg_row || !m_tg_sum || !m_out) {
             error = "mtp buffer allocation failed";
             return false;
         }

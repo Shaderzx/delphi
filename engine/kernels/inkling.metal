@@ -1034,9 +1034,13 @@ kernel void cert_head_tau(device const float* tg_val [[buffer(0)]],
         uint exp = (bits >> 23) & 0xffu;
         float ulp = exp > 7u ? as_type<float>((exp - 7u) << 23) : 1e-6f;
         float s_lo = tau_s - ulp;
-        float u = clamp(s_lo / p.cap, -0.9999f, 0.9999f);
-        float z_lo = p.cap * 0.5f * precise::log((1.0f + u) / (1.0f - u));
-        state[0] = z_lo - fabs(z_lo) * 0.005f - 0.01f;
+        if (s_lo <= -p.cap) {
+            state[0] = -INFINITY;
+        } else {
+            float u = clamp(s_lo / p.cap, -0.9999f, 0.9999f);
+            float z_lo = p.cap * 0.5f * precise::log((1.0f + u) / (1.0f - u));
+            state[0] = z_lo - fabs(z_lo) * 0.005f - 0.01f;
+        }
         state[1] = tau_s;
     }
 }
