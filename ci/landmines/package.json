@@ -1,0 +1,10 @@
+{
+  "name": "fleet-landmines",
+  "private": true,
+  "type": "module",
+  "description": "Fleet's pinned Oxlint and @interfere/landmines, run by landmines.mjs",
+  "devDependencies": {
+    "@interfere/landmines": "0.1.1",
+    "oxlint": "1.81.0"
+  }
+}
