@@ -5,6 +5,7 @@ constant uint GOLDEN = 0x9e3779b9u;
 constant uint INPUT_SALT = 0xa5a5a5a5u;
 constant uint VALUES_EXACT = 0u;
 constant uint MAX_ROWS = 32u;
+constant uint ROWS [[function_constant(0)]];
 
 struct FillShape {
     uint seed;
@@ -80,16 +81,16 @@ kernel void gemv_rows(device const uint4* w [[buffer(0)]],
     uint chunks = s.k / 8u;
     device const uint4* wr = w + row * chunks;
     float acc[MAX_ROWS];
-    for (uint m = 0; m < s.rows; ++m) {
+    for (uint m = 0; m < ROWS; ++m) {
         acc[m] = 0.0f;
     }
     for (uint c = lane; c < chunks; c += 32u) {
         uint4 packed = wr[c];
-        for (uint m = 0; m < s.rows; ++m) {
+        for (uint m = 0; m < ROWS; ++m) {
             acc[m] += dot8(packed, x + (m * chunks + c) * 2u);
         }
     }
-    for (uint m = 0; m < s.rows; ++m) {
+    for (uint m = 0; m < ROWS; ++m) {
         float total = simd_sum(acc[m]);
         if (lane == 0) {
             y[m * s.n + row] = total * s.scale;

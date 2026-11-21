@@ -34,8 +34,8 @@ struct Kernels {
     id<MTLComputePipelineState> gemv;
 };
 
-Kernels kernels(const Gpu& gpu) {
-    return {pipeline(gpu, @"fill_weights"), pipeline(gpu, @"fill_inputs"), pipeline(gpu, @"gemv_rows")};
+Kernels kernels(const Gpu& gpu, uint64_t rows) {
+    return {pipeline(gpu, @"fill_weights"), pipeline(gpu, @"fill_inputs"), pipeline_for_rows(gpu, @"gemv_rows", static_cast<uint32_t>(rows))};
 }
 
 void fill(id<MTLComputeCommandEncoder> encoder, id<MTLComputePipelineState> state, id<MTLBuffer> buffer, FillShape shape) {
@@ -95,7 +95,7 @@ int probe_gemv(int argc, char** argv) {
     if (!gpu) {
         return gpu_failure(error);
     }
-    Kernels kern = kernels(*gpu);
+    Kernels kern = kernels(*gpu, *rows);
     uint32_t code = values_code(*values);
     uint64_t weight_count = *n * *k;
     id<MTLBuffer> w = [gpu->device newBufferWithLength:weight_count * 2 options:MTLResourceStorageModePrivate];
@@ -141,13 +141,14 @@ int probe_gemv(int argc, char** argv) {
 
 int probe_chain(int argc, char** argv) {
     std::string error;
-    auto flags = parse_flags(argc, argv, {"--layers", "--n", "--seed", "--mode", "--repeats"}, {}, error);
+    auto flags = parse_flags(argc, argv, {"--layers", "--n", "--rows", "--seed", "--mode", "--repeats"}, {}, error);
     if (!flags) {
         return refuse(error);
     }
     auto layers = whole_flag(*flags, "--layers", 192, 1, 1024, error);
     auto n = layers ? width_flag(*flags, "--n", 2304, 8192, error) : std::nullopt;
-    auto seed = n ? whole_flag(*flags, "--seed", 1, 0, UINT32_MAX, error) : std::nullopt;
+    auto rows = n ? whole_flag(*flags, "--rows", 1, 1, kMaxRows, error) : std::nullopt;
+    auto seed = rows ? whole_flag(*flags, "--seed", 1, 0, UINT32_MAX, error) : std::nullopt;
     auto repeats = seed ? whole_flag(*flags, "--repeats", 6, 1, 1000, error) : std::nullopt;
     auto mode = repeats ? choice_flag(*flags, "--mode", {"chained", "stepwise"}, error) : std::nullopt;
     if (!mode) {
@@ -161,9 +162,9 @@ int probe_chain(int argc, char** argv) {
     if (!gpu) {
         return gpu_failure(error);
     }
-    Kernels kern = kernels(*gpu);
+    Kernels kern = kernels(*gpu, *rows);
     uint64_t bytes = *layers * layer_count * 2;
-    NSUInteger vector_bytes = *n * sizeof(float);
+    NSUInteger vector_bytes = *rows * *n * sizeof(float);
     id<MTLBuffer> w = [gpu->device newBufferWithLength:bytes options:MTLResourceStorageModePrivate];
     id<MTLBuffer> start = [gpu->device newBufferWithLength:vector_bytes options:MTLResourceStorageModePrivate];
     id<MTLBuffer> ping = [gpu->device newBufferWithLength:vector_bytes options:MTLResourceStorageModeShared];
@@ -174,10 +175,10 @@ int probe_chain(int argc, char** argv) {
     id<MTLCommandBuffer> setup = [gpu->queue commandBuffer];
     id<MTLComputeCommandEncoder> encoder = [setup computeCommandEncoder];
     fill(encoder, kern.weights, w, {static_cast<uint32_t>(*seed), kValuesRough, 0, static_cast<uint32_t>(*layers * layer_count)});
-    fill(encoder, kern.inputs, start, {static_cast<uint32_t>(*seed), kValuesRough, 0, static_cast<uint32_t>(*n)});
+    fill(encoder, kern.inputs, start, {static_cast<uint32_t>(*seed), kValuesRough, 0, static_cast<uint32_t>(*rows * *n)});
     [encoder endEncoding];
     gpu_seconds(setup);
-    GemvShape shape{1, static_cast<uint32_t>(*n), static_cast<uint32_t>(*n), std::sqrt(12.0f / static_cast<float>(*n))};
+    GemvShape shape{static_cast<uint32_t>(*rows), static_cast<uint32_t>(*n), static_cast<uint32_t>(*n), std::sqrt(12.0f / static_cast<float>(*n))};
     bool chained = *mode == "chained";
     std::vector<double> passes;
     std::string hash;
@@ -212,8 +213,8 @@ int probe_chain(int argc, char** argv) {
         hash = seen;
     }
     double middle = median(passes);
-    std::printf("{\"layers\": %llu, \"n\": %llu, \"mode\": \"%s\", \"bytes_per_step\": %llu, \"output_hash\": \"%s\", \"repeats\": %llu, \"seconds_median\": %.9f, \"gb_per_s_median\": %.6f}\n",
-                static_cast<unsigned long long>(*layers), static_cast<unsigned long long>(*n), mode->c_str(),
+    std::printf("{\"layers\": %llu, \"n\": %llu, \"rows\": %llu, \"mode\": \"%s\", \"bytes_per_step\": %llu, \"output_hash\": \"%s\", \"repeats\": %llu, \"seconds_median\": %.9f, \"gb_per_s_median\": %.6f}\n",
+                static_cast<unsigned long long>(*layers), static_cast<unsigned long long>(*n), static_cast<unsigned long long>(*rows), mode->c_str(),
                 static_cast<unsigned long long>(bytes), hash.c_str(), static_cast<unsigned long long>(*repeats), middle, bytes / middle / 1e9);
     return 0;
 }

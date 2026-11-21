@@ -24,15 +24,29 @@ std::optional<Gpu> open_gpu(std::string& error) {
     return Gpu{device, [device newCommandQueue], library};
 }
 
-id<MTLComputePipelineState> pipeline(const Gpu& gpu, NSString* name) {
-    NSError* error = nil;
-    id<MTLFunction> function = [gpu.library newFunctionWithName:name];
-    id<MTLComputePipelineState> state = [gpu.device newComputePipelineStateWithFunction:function error:&error];
+namespace {
+
+id<MTLComputePipelineState> pipeline_from(const Gpu& gpu, id<MTLFunction> function, NSString* name, NSError* error) {
+    id<MTLComputePipelineState> state = function ? [gpu.device newComputePipelineStateWithFunction:function error:&error] : nil;
     if (!state) {
         std::fprintf(stderr, "delphi: pipeline %s: %s\n", name.UTF8String, error.localizedDescription.UTF8String);
         std::exit(3);
     }
     return state;
+}
+
+}
+
+id<MTLComputePipelineState> pipeline(const Gpu& gpu, NSString* name) {
+    return pipeline_from(gpu, [gpu.library newFunctionWithName:name], name, nil);
+}
+
+id<MTLComputePipelineState> pipeline_for_rows(const Gpu& gpu, NSString* name, uint32_t rows) {
+    MTLFunctionConstantValues* constants = [MTLFunctionConstantValues new];
+    [constants setConstantValue:&rows type:MTLDataTypeUInt atIndex:0];
+    NSError* error = nil;
+    id<MTLFunction> function = [gpu.library newFunctionWithName:name constantValues:constants error:&error];
+    return pipeline_from(gpu, function, name, error);
 }
 
 double gpu_seconds(id<MTLCommandBuffer> commands) {
