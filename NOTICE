@@ -4,6 +4,10 @@ Copyright 2026 Shad (github.com/Shaderzx)
 This product includes software developed by Shad as part of Delphi,
 https://github.com/Shaderzx/delphi
 
+drafter/templates/inkling-2-mini.jinja is the chat template of
+thinkingmachines/Inkling-2-Mini, Copyright Thinking Machines Lab, Inc.,
+licensed under the Apache License, Version 2.0.
+
 If you distribute Delphi or a derivative work, section 4(d) of the
 Apache License, Version 2.0 requires you to include the attribution
 notices in this NOTICE file, in one of the places that section allows:

@@ -47,11 +47,24 @@ relative_links() {
   return "$broken"
 }
 
+python_with_requirements() {
+  local venv=".venv"
+  [ -x "$venv/bin/python" ] || python3 -m venv "$venv"
+  "$venv/bin/pip" install --quiet -r drafter/requirements.txt
+}
+
+e2e_suite() {
+  (cd e2e && npm ci --silent && DELPHI_PYTHON="$PWD/../.venv/bin/python" npx e2e run)
+}
+
 stage required-files "ci/verify --fast" required_files
 stage relative-links "ci/verify --fast" relative_links
-stage=""
 done_stages="required-files,relative-links"
 if [ "$mode" = "--full" ]; then
-  done_stages="$done_stages (full)"
+  stage python-requirements "ci/verify --full" python_with_requirements
+  stage e2e "ci/verify --full" e2e_suite
+  stage landmines "node ci/landmines/landmines.mjs --base ${CI_VERIFY_BASE:-origin/main}" node ci/landmines/landmines.mjs --base "${CI_VERIFY_BASE:-origin/main}"
+  done_stages="$done_stages,python-requirements,e2e,landmines"
 fi
+stage=""
 echo "ci verify: PASS ($done_stages)"
