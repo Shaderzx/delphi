@@ -1,0 +1,9 @@
+cff-version: 1.2.0
+message: "If you use Delphi, please cite it as below."
+title: "Delphi: a single-model Metal 4 inference engine for Inkling 2 Mini on Apple M5 Pro"
+authors:
+  - alias: "Shaderzx"
+    name: "Shad"
+repository-code: "https://github.com/Shaderzx/delphi"
+license: Apache-2.0
+date-released: 2026-11-21
