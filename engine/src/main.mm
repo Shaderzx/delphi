@@ -1,6 +1,8 @@
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
 
+#include <algorithm>
+#include <climits>
 #include <cstdio>
 #include <cstdlib>
 #include <optional>
@@ -13,6 +15,7 @@ namespace {
 
 constexpr NSUInteger kThreadsPerGroup = 1024;
 constexpr NSUInteger kGroups = 160;
+constexpr uint64_t kMaxMib = (uint64_t{UINT32_MAX} + 1) * 16 / (1024 * 1024);
 
 struct ProbeOptions {
     uint64_t mib = 1024;
@@ -24,6 +27,7 @@ struct ProbeResult {
     uint64_t bytes = 0;
     int repeats = 0;
     double seconds_best = 0;
+    double seconds_median = 0;
     uint32_t checksum = 0;
 };
 
@@ -50,15 +54,15 @@ std::optional<ProbeOptions> parse_probe_options(int argc, char** argv, std::stri
             return std::nullopt;
         }
         auto value = positive_integer(argv[++i]);
-        if (flag == "--mib" && value) {
+        if (flag == "--mib" && value && *value < kMaxMib) {
             options.mib = *value;
-        } else if (flag == "--repeats" && value) {
+        } else if (flag == "--repeats" && value && *value <= INT_MAX) {
             options.repeats = static_cast<int>(*value);
         } else if (flag == "--mib") {
-            error = "--mib must be a positive whole number of MiB";
+            error = "--mib must be a whole number of MiB from 1 to " + std::to_string(kMaxMib - 1);
             return std::nullopt;
         } else if (flag == "--repeats") {
-            error = "--repeats must be a positive whole number";
+            error = "--repeats must be a whole number from 1 to " + std::to_string(INT_MAX);
             return std::nullopt;
         } else {
             error = "unknown option " + flag;
@@ -99,6 +103,12 @@ double run_pass(id<MTLCommandQueue> queue, id<MTLComputePipelineState> state, NS
     return commands.GPUEndTime - commands.GPUStartTime;
 }
 
+double median(std::vector<double> values) {
+    std::sort(values.begin(), values.end());
+    size_t mid = values.size() / 2;
+    return values.size() % 2 ? values[mid] : (values[mid - 1] + values[mid]) / 2;
+}
+
 std::optional<ProbeResult> probe_bandwidth(const ProbeOptions& options, std::string& error) {
     id<MTLDevice> device = MTLCreateSystemDefaultDevice();
     if (!device) {
@@ -106,10 +116,6 @@ std::optional<ProbeResult> probe_bandwidth(const ProbeOptions& options, std::str
         return std::nullopt;
     }
     uint64_t bytes = options.mib * 1024ull * 1024ull;
-    if (bytes / 16 > UINT32_MAX) {
-        error = "--mib is too large for one probe buffer";
-        return std::nullopt;
-    }
     uint32_t count4 = static_cast<uint32_t>(bytes / 16);
     NSError* compile_error = nil;
     NSString* source = [[NSString alloc] initWithBytes:probe_metal length:probe_metal_len encoding:NSUTF8StringEncoding];
@@ -127,7 +133,9 @@ std::optional<ProbeResult> probe_bandwidth(const ProbeOptions& options, std::str
     }
     run_pass(queue, pipeline(device, library, @"fill_pattern"), @[ data ], count4);
     id<MTLComputePipelineState> sum = pipeline(device, library, @"sum_stream");
-    ProbeResult result{device.name.UTF8String, bytes, options.repeats, 0, 0};
+    ProbeResult result{device.name.UTF8String, bytes, options.repeats, 0, 0, 0};
+    std::vector<double> passes;
+    passes.reserve(options.repeats);
     for (int pass = 0; pass < options.repeats; ++pass) {
         *static_cast<uint32_t*>(total.contents) = 0;
         double seconds = run_pass(queue, sum, @[ data, total ], count4);
@@ -137,17 +145,18 @@ std::optional<ProbeResult> probe_bandwidth(const ProbeOptions& options, std::str
             return std::nullopt;
         }
         result.checksum = checksum;
-        if (pass == 0 || seconds < result.seconds_best) {
-            result.seconds_best = seconds;
-        }
+        passes.push_back(seconds);
     }
+    result.seconds_best = *std::min_element(passes.begin(), passes.end());
+    result.seconds_median = median(passes);
     return result;
 }
 
 void print_probe(const ProbeResult& result) {
-    std::printf("{\"device\": \"%s\", \"bytes\": %llu, \"repeats\": %d, \"seconds_best\": %.9f, \"gb_per_s_best\": %.6f, \"checksum\": \"0x%08x\"}\n",
+    std::printf("{\"device\": \"%s\", \"bytes\": %llu, \"repeats\": %d, \"seconds_best\": %.9f, \"gb_per_s_best\": %.6f, \"seconds_median\": %.9f, \"gb_per_s_median\": %.6f, \"checksum\": \"0x%08x\"}\n",
                 result.device.c_str(), static_cast<unsigned long long>(result.bytes), result.repeats,
-                result.seconds_best, result.bytes / result.seconds_best / 1e9, result.checksum);
+                result.seconds_best, result.bytes / result.seconds_best / 1e9, result.seconds_median,
+                result.bytes / result.seconds_median / 1e9, result.checksum);
 }
 
 int probe_command(int argc, char** argv) {
