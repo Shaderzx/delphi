@@ -1,0 +1,11 @@
+{
+  "name": "delphi-e2e",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "e2e run"
+  },
+  "devDependencies": {
+    "e2e": "0.24.0"
+  }
+}
