@@ -89,10 +89,12 @@ PATCHES = [
 
 def apply(name, path, old, new):
     text = path.read_text()
+    if new and new in text:
+        return "already applied"
     if old in text:
         path.write_text(text.replace(old, new, 1))
         return "applied"
-    if new in text:
+    if not new:
         return "already applied"
     raise SystemExit(f"patch_upstream: {name}: anchor not found in {path}")
 
