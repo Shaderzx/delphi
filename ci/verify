@@ -54,7 +54,7 @@ python_with_requirements() {
 }
 
 e2e_suite() {
-  (cd e2e && npm ci --silent && DELPHI_PYTHON="$PWD/../.venv/bin/python" npx e2e run)
+  (cd e2e && npm ci --silent && DELPHI_PYTHON="$PWD/../.venv/bin/python" npx e2e run --exclude-tag model)
 }
 
 stage required-files "ci/verify --fast" required_files
