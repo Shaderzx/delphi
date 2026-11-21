@@ -617,6 +617,12 @@ public:
         return seconds;
     }
 
+    void reset_state() {
+        for (auto& [key, b] : conv) {
+            std::memset(b.contents, 0, b.length);
+        }
+    }
+
     uint32_t chosen() const { return static_cast<const uint32_t*>(token.contents)[1]; }
 
     std::vector<std::pair<float, uint32_t>> top5() const {
@@ -715,5 +721,73 @@ int generate_command(int argc, char** argv) {
     std::printf("], \"prompt_tokens\": %zu, \"prefill_tokens_per_s\": %.3f, \"decode_tokens_per_s\": %.3f, \"decode_gpu_tokens_per_s\": %.3f%s%s%s}\n",
                 ids.size(), ids.size() / prefill_wall, *steps > 1 ? (*steps - 1) / decode_wall : 0.0, *steps > 1 ? (*steps - 1) / decode_gpu : 0.0,
                 logprobs ? ", \"steps\": [" : "", steps_json.c_str(), logprobs ? "]" : "");
+    return 0;
+}
+
+int bench_command(int argc, char** argv) {
+    std::string error;
+    auto flags = parse_flags(argc, argv, {"--model", "--input-ids", "--steps", "--repeats", "--warmup"}, {}, error);
+    if (!flags) return refuse(error);
+    auto steps = whole_flag(*flags, "--steps", 64, 2, 4000, error);
+    auto repeats = steps ? whole_flag(*flags, "--repeats", 6, 1, 100, error) : std::nullopt;
+    auto warmup = repeats ? whole_flag(*flags, "--warmup", 1, 0, 10, error) : std::nullopt;
+    if (!warmup) return refuse(error);
+    if (!flags->values.count("--model") || !flags->values.count("--input-ids")) return refuse("bench needs --model DIR and --input-ids JSON");
+    auto ids_opt = parse_ids(flags->values["--input-ids"], error);
+    if (!ids_opt) return refuse(error);
+    auto& ids = *ids_opt;
+    if (ids.empty()) return refuse("--input-ids must hold at least one token id");
+    Engine engine;
+    if (!engine.load(flags->values["--model"], error)) {
+        std::fprintf(stderr, "delphi: %s\n", error.c_str());
+        return 3;
+    }
+    if (ids.size() > engine.max_context || (*steps - 1) > engine.max_context - ids.size()) {
+        return refuse("prompt plus generated steps exceeds 4096-token context");
+    }
+    uint64_t embed_rows = engine.T("embed.weight").shape[0];
+    for (uint32_t id : ids) {
+        if (id >= embed_rows) return refuse("input token id out of embedding range");
+    }
+    std::vector<double> wall_tps, gpu_tps, prefill_tps, gpu_ms_tok;
+    std::vector<uint32_t> ref_out;
+    for (uint64_t r = 0; r < *warmup + *repeats; ++r) {
+        engine.reset_state();
+        uint32_t pos = 0;
+        auto w0 = std::chrono::steady_clock::now();
+        for (uint32_t t : ids) engine.step(t, pos++);
+        auto w1 = std::chrono::steady_clock::now();
+        std::vector<uint32_t> out;
+        out.reserve(*steps);
+        double dgpu = 0;
+        for (uint64_t i = 0; i < *steps; ++i) {
+            uint32_t next = engine.chosen();
+            out.push_back(next);
+            if (i + 1 < *steps) dgpu += engine.step(next, pos++);
+        }
+        auto w2 = std::chrono::steady_clock::now();
+        if (ref_out.empty()) {
+            ref_out = out;
+        } else if (out != ref_out) {
+            std::fprintf(stderr, "delphi: bench output changed between passes\n");
+            return 3;
+        }
+        if (r >= *warmup) {
+            double pw = std::chrono::duration<double>(w1 - w0).count();
+            double dw = std::chrono::duration<double>(w2 - w1).count();
+            prefill_tps.push_back(ids.size() / pw);
+            wall_tps.push_back((*steps - 1) / dw);
+            gpu_tps.push_back((*steps - 1) / dgpu);
+            gpu_ms_tok.push_back(dgpu * 1000.0 / (*steps - 1));
+        }
+    }
+    std::string hash = hex64(fnv1a(ref_out.data(), ref_out.size() * sizeof(uint32_t)));
+    std::printf("{\"prompt_tokens\": %zu, \"steps\": %llu, \"repeats\": %llu, \"output_hash\": \"%s\", \"prefill_tokens_per_s_median\": %.3f, \"decode_tokens_per_s_median\": %.3f, \"decode_gpu_tokens_per_s_median\": %.3f, \"gpu_ms_per_token_median\": %.3f, \"decode_gpu_runs\": [",
+                ids.size(), static_cast<unsigned long long>(*steps), static_cast<unsigned long long>(*repeats), hash.c_str(),
+                median(prefill_tps), median(wall_tps), median(gpu_tps), median(gpu_ms_tok));
+    for (size_t i = 0; i < gpu_tps.size(); ++i) std::printf(i ? ", %.3f" : "%.3f", gpu_tps[i]);
+    std::printf("], \"output_ids\": [");
+    for (size_t i = 0; i < ref_out.size(); ++i) std::printf(i ? ", %u" : "%u", ref_out[i]);
+    std::printf("]}\n");
     return 0;
 }

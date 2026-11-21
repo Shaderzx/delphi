@@ -79,6 +79,20 @@ test('delphi generate rejects non-integer or negative input ids and truncated ch
   });
 });
 
+test('delphi bench refuses missing model or invalid repeat counts', { timeout: 300_000 }, () => {
+  const deadline = Date.now() + 300_000;
+  withBuiltDelphi(deadline, (bin) => {
+    const missing = spawnSync(bin, ['bench', '--steps', '8'], { encoding: 'utf8', timeout: remainingMs(deadline) });
+    if (missing.error) throw missing.error;
+    expect(missing.status).toBe(2);
+    expect(missing.stderr).toContain('--model');
+    const badRepeats = spawnSync(bin, ['bench', '--model', '/nonexistent', '--input-ids', '[1]', '--repeats', '0'], { encoding: 'utf8', timeout: remainingMs(deadline) });
+    if (badRepeats.error) throw badRepeats.error;
+    expect(badRepeats.status).toBe(2);
+    expect(badRepeats.stderr).toContain('--repeats');
+  });
+});
+
 test('delphi generate continues the fibonacci prompt with the same 32 greedy tokens as the SGLang server on a G4', { tags: ['model'], timeout: 900_000 }, () => {
   const deadline = Date.now() + 900_000;
   const result = generate(fibonacci.input_ids, fibonacci.output_ids.length, deadline);
