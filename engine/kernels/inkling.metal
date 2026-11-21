@@ -1143,3 +1143,122 @@ kernel void cert_head_argmax(device const float* in_val [[buffer(0)]],
         token[0] = idx;
     }
 }
+
+kernel void bf12_hist(device const uint4* w [[buffer(0)]],
+                      device atomic_uint* hist [[buffer(1)]],
+                      constant uint& count8 [[buffer(2)]],
+                      uint gid [[thread_position_in_grid]],
+                      uint gsize [[threads_per_grid]],
+                      uint tid [[thread_position_in_threadgroup]]) {
+    threadgroup atomic_uint local[256];
+    if (tid < 256u) atomic_store_explicit(&local[tid], 0u, memory_order_relaxed);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint i = gid; i < count8; i += gsize) {
+        uint4 pk = w[i];
+        uint ws[4] = {pk.x, pk.y, pk.z, pk.w};
+        for (uint j = 0; j < 4u; ++j) {
+            uint lo = ws[j] & 0xffffu;
+            uint hi = ws[j] >> 16;
+            if ((lo & 0x7fffu) != 0u) atomic_fetch_add_explicit(&local[(lo >> 7) & 0xffu], 1u, memory_order_relaxed);
+            if ((hi & 0x7fffu) != 0u) atomic_fetch_add_explicit(&local[(hi >> 7) & 0xffu], 1u, memory_order_relaxed);
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid < 256u) {
+        uint v = atomic_load_explicit(&local[tid], memory_order_relaxed);
+        if (v) atomic_fetch_add_explicit(&hist[tid], v, memory_order_relaxed);
+    }
+}
+
+struct Bf12Pack { uint src_rows; uint cols; uint row_base; uint out_cap; };
+
+kernel void bf12_pack(device const uint4* w [[buffer(0)]],
+                      device const uchar* exp_map [[buffer(1)]],
+                      device uint4* sm_out [[buffer(2)]],
+                      device uint2* ex_out [[buffer(3)]],
+                      device atomic_uint* out_cnt [[buffer(4)]],
+                      device uint2* out_raw [[buffer(5)]],
+                      constant Bf12Pack& p [[buffer(6)]],
+                      uint group [[threadgroup_position_in_grid]],
+                      uint simd [[simdgroup_index_in_threadgroup]],
+                      uint simds [[simdgroups_per_threadgroup]],
+                      uint lane [[thread_index_in_simdgroup]]) {
+    uint r = group * simds + simd;
+    if (r >= p.src_rows) return;
+    uint chunks16 = p.cols / 16u;
+    device const uint4* wr = w + ulong(r) * (chunks16 * 2u);
+    uint dst_row = p.row_base + r;
+    for (uint c = lane; c < chunks16; c += 32u) {
+        uint4 a = wr[c * 2u];
+        uint4 b = wr[c * 2u + 1u];
+        uint words[8] = {a.x, a.y, a.z, a.w, b.x, b.y, b.z, b.w};
+        uint smw[4] = {0u, 0u, 0u, 0u};
+        uint exw[2] = {0u, 0u};
+        for (uint j = 0; j < 16u; ++j) {
+            uint raw = (j & 1u) ? (words[j >> 1] >> 16) : (words[j >> 1] & 0xffffu);
+            uint smb = 0u;
+            uint idx = 15u;
+            if ((raw & 0x7fffu) != 0u) {
+                idx = uint(exp_map[(raw >> 7) & 0xffu]);
+                if (idx == 15u) {
+                    uint pos = atomic_fetch_add_explicit(out_cnt, 1u, memory_order_relaxed);
+                    if (pos < p.out_cap) out_raw[pos] = uint2(dst_row, ((c * 16u + j) << 16) | raw);
+                } else {
+                    smb = ((raw >> 8) & 0x80u) | (raw & 0x7fu);
+                }
+            }
+            smw[j >> 2] |= smb << ((j & 3u) * 8u);
+            exw[j >> 3] |= idx << ((j & 7u) * 4u);
+        }
+        sm_out[ulong(dst_row) * chunks16 + c] = uint4(smw[0], smw[1], smw[2], smw[3]);
+        ex_out[ulong(dst_row) * chunks16 + c] = uint2(exw[0], exw[1]);
+    }
+}
+
+struct Gemv12 { uint rows; uint cols; uint round_out; uint has_outliers; uint elut[16]; };
+
+inline float bf12_dot4(uint smw, uint ex16, float4 xv, constant uint* elut) {
+    float w0 = as_type<float>(((smw << 24) & 0x80000000u) | ((smw << 16) & 0x007f0000u) | elut[ex16 & 15u]);
+    float w1 = as_type<float>(((smw << 16) & 0x80000000u) | ((smw << 8) & 0x007f0000u) | elut[(ex16 >> 4) & 15u]);
+    float w2 = as_type<float>(((smw << 8) & 0x80000000u) | (smw & 0x007f0000u) | elut[(ex16 >> 8) & 15u]);
+    float w3 = as_type<float>((smw & 0x80000000u) | ((smw >> 8) & 0x007f0000u) | elut[(ex16 >> 12) & 15u]);
+    return w0 * xv.x + w1 * xv.y + w2 * xv.z + w3 * xv.w;
+}
+
+kernel void gemv_bf12(device const uint4* sm_buf [[buffer(0)]],
+                      device const uint2* ex_buf [[buffer(1)]],
+                      device const uint* ro_buf [[buffer(2)]],
+                      device const uint* op_buf [[buffer(3)]],
+                      device const float4* x4 [[buffer(4)]],
+                      device float* y [[buffer(5)]],
+                      constant Gemv12& g [[buffer(6)]],
+                      uint group [[threadgroup_position_in_grid]],
+                      uint simd [[simdgroup_index_in_threadgroup]],
+                      uint simds [[simdgroups_per_threadgroup]],
+                      uint lane [[thread_index_in_simdgroup]]) {
+    uint row = group * simds + simd;
+    if (row >= g.rows) return;
+    uint chunks16 = g.cols / 16u;
+    device const uint4* smr = sm_buf + ulong(row) * chunks16;
+    device const uint2* exr = ex_buf + ulong(row) * chunks16;
+    float acc = 0.0f;
+    for (uint c = lane; c < chunks16; c += 32u) {
+        uint4 sm = smr[c];
+        uint2 ex = exr[c];
+        acc += bf12_dot4(sm.x, ex.x & 0xffffu, x4[c * 4u], g.elut)
+             + bf12_dot4(sm.y, ex.x >> 16, x4[c * 4u + 1u], g.elut)
+             + bf12_dot4(sm.z, ex.y & 0xffffu, x4[c * 4u + 2u], g.elut)
+             + bf12_dot4(sm.w, ex.y >> 16, x4[c * 4u + 3u], g.elut);
+    }
+    if (g.has_outliers) {
+        uint s = ro_buf[row];
+        uint e = ro_buf[row + 1u];
+        device const float* xf = (device const float*)x4;
+        for (uint j = s + lane; j < e; j += 32u) {
+            uint pk = op_buf[j];
+            acc += bfv(ushort(pk & 0xffffu)) * xf[pk >> 16];
+        }
+    }
+    float total = simd_sum(acc);
+    if (lane == 0) y[row] = g.round_out ? rbf(total) : total;
+}

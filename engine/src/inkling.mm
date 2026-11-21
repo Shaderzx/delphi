@@ -37,8 +37,20 @@ struct Mat {
     uint32_t cols = 0;
 };
 
+struct Mat12 {
+    uint64_t sm_off = 0;
+    uint64_t ex_off = 0;
+    uint64_t ro_off = 0;
+    uint64_t op_off = 0;
+    uint32_t rows = 0;
+    uint32_t cols = 0;
+    uint32_t has_outliers = 0;
+    uint32_t elut[16] = {};
+};
+
 struct CtlWeights {
     Mat down, gain, forget;
+    Mat12 down12, gf12;
 };
 
 struct LayerWeights {
@@ -46,6 +58,7 @@ struct LayerWeights {
     bool nvfp4 = false;
     uint64_t attn_norm = 0, q_norm = 0, k_norm = 0, v_norm = 0, mlp_norm = 0;
     Mat wq, wr, gate_attn, sink, wk, wv, wo, dynk, dynv, router;
+    Mat12 q12, k12, v12, wo12, router12;
     uint64_t k_sconv = 0, v_sconv = 0, attn_sconv = 0, mlp_sconv = 0;
     uint64_t q_clip = 0, r_clip = 0, rel_proj = 0, router_bias = 0;
     uint64_t w13_w = 0, w13_s = 0, w13_amax = 0, w13_denom = 0, w13_eb = 0, w13_sb = 0;
@@ -83,13 +96,17 @@ public:
     id<MTLComputePipelineState> p_qnv4, p_qmxf8, p_env4, p_emxf8, p_swiglu, p_swiglu_qnv4, p_combine;
     id<MTLComputePipelineState> p_ctl_norm, p_ctl_mix_norm, p_embed, p_softcap, p_argmax, p_round;
     id<MTLComputePipelineState> p_ch_build, p_ch_xnorm, p_ch_scan, p_ch_tau, p_ch_filter, p_ch_setup, p_ch_rescore, p_ch_argmax;
+    id<MTLComputePipelineState> p_bf12_hist, p_bf12_pack, p_gemv12;
     id<MTLBuffer> arena, queries, logits, token, scratch;
     id<MTLBuffer> head_q4 = nil, head_sc = nil, head_err = nil;
     id<MTLBuffer> ch_ub = nil, ch_tg_val = nil, ch_tg_row = nil, ch_state = nil, ch_count = nil, ch_cands = nil, ch_indirect = nil;
+    id<MTLBuffer> bf12_sm = nil, bf12_ex = nil, bf12_ro = nil, bf12_op = nil;
     bool cert_head_ready = false;
+    bool bf12_ready = false;
+    uint64_t s_qbundle, s_kbundle, s_vbundle;
     uint64_t s_q, s_qc, s_r, s_rc, s_gate, s_sinks, s_kraw, s_vraw, s_k, s_v, s_dynk, s_dynv, s_rel, s_gated;
     uint64_t s_router, s_ids, s_gammas, s_xq, s_outer, s_gu, s_h, s_hq, s_houter, s_rows;
-    uint64_t s_normed[3], s_ctlh[3], s_gain[3], s_forget[3];
+    uint64_t s_normed[3], s_ctlh[3], s_gf[3], s_gain[3], s_forget[3];
     std::vector<id<MTLBuffer>> kcache, vcache;
     std::vector<std::array<id<MTLBuffer>, 4>> conv;
     uint32_t max_context = 4096;
@@ -107,7 +124,7 @@ public:
         return {t.offset, uint32_t(t.shape[0]), uint32_t(t.bytes / 2 / t.shape[0])};
     }
 
-    bool load(const std::string& dir, bool use_cert_head, std::string& error) {
+    bool load(const std::string& dir, bool use_cert_head, bool use_bf12, std::string& error) {
         auto opened = open_gpu(error);
         if (!opened) return false;
         gpu = *opened;
@@ -200,6 +217,9 @@ public:
         p_ch_setup = pipeline(gpu, @"cert_head_setup");
         p_ch_rescore = pipeline(gpu, @"cert_head_rescore");
         p_ch_argmax = pipeline(gpu, @"cert_head_argmax");
+        p_bf12_hist = pipeline(gpu, @"bf12_hist");
+        p_bf12_pack = pipeline(gpu, @"bf12_pack");
+        p_gemv12 = pipeline(gpu, @"gemv_bf12");
         arena = [gpu.device newBufferWithLength:uint64_t(slots) * c.hidden * 4 options:MTLResourceStorageModePrivate];
         if (!arena) { error = "arena allocation failed"; return false; }
         build_queries();
@@ -215,18 +235,21 @@ public:
             at += (count * 4 + 255) / 256 * 256;
             return off;
         };
-        s_q = slot_alloc(c.heads * c.head_dim);
+        s_qbundle = slot_alloc(c.heads * c.head_dim * 2 + c.heads * c.d_rel + c.heads);
+        s_q = s_qbundle;
+        s_r = s_q + uint64_t(c.heads * c.head_dim) * 4;
+        s_gate = s_r + uint64_t(c.heads * c.d_rel) * 4;
+        s_sinks = s_gate + uint64_t(c.heads * c.head_dim) * 4;
         s_qc = slot_alloc(c.heads * c.head_dim);
-        s_r = slot_alloc(c.heads * c.d_rel);
         s_rc = slot_alloc(c.heads * c.d_rel);
-        s_gate = slot_alloc(c.heads * c.head_dim);
-        s_sinks = slot_alloc(c.heads);
-        s_kraw = slot_alloc(c.kv_heads * c.head_dim);
-        s_vraw = slot_alloc(c.kv_heads * c.head_dim);
+        s_kbundle = slot_alloc(c.kv_heads * c.head_dim + c.kv_heads * 4);
+        s_kraw = s_kbundle;
+        s_dynk = s_kraw + uint64_t(c.kv_heads * c.head_dim) * 4;
+        s_vbundle = slot_alloc(c.kv_heads * c.head_dim + c.kv_heads * 4);
+        s_vraw = s_vbundle;
+        s_dynv = s_vraw + uint64_t(c.kv_heads * c.head_dim) * 4;
         s_k = slot_alloc(c.kv_heads * c.head_dim);
         s_v = slot_alloc(c.kv_heads * c.head_dim);
-        s_dynk = slot_alloc(c.kv_heads * 4);
-        s_dynv = slot_alloc(c.kv_heads * 4);
         s_rel = slot_alloc(c.heads * c.rel_extent);
         s_gated = slot_alloc(c.heads * c.head_dim);
         s_router = slot_alloc(c.experts);
@@ -242,8 +265,9 @@ public:
         for (int k = 0; k < 3; ++k) {
             s_normed[k] = slot_alloc(2 * H);
             s_ctlh[k] = slot_alloc(64);
-            s_gain[k] = slot_alloc(H);
-            s_forget[k] = slot_alloc(H);
+            s_gf[k] = slot_alloc(2 * H);
+            s_gain[k] = s_gf[k];
+            s_forget[k] = s_gf[k] + uint64_t(H) * 4;
         }
         scratch = [gpu.device newBufferWithLength:at options:MTLResourceStorageModePrivate];
         if (!scratch) { error = "scratch allocation failed"; return false; }
@@ -265,6 +289,177 @@ public:
         if (use_cert_head && (c.hidden % 32 == 0) && c.vocab >= 64) {
             if (!build_cert_head(error)) return false;
         }
+        if (use_bf12 && (c.hidden % 16 == 0) && ((c.heads * c.head_dim) % 16 == 0) && ((c.heads * c.d_rel) % 4 == 0)) {
+            if (!build_bf12(error)) return false;
+        }
+        return true;
+    }
+
+    struct Bf12PackP { uint32_t src_rows, cols, row_base, out_cap; };
+    struct Gemv12P { uint32_t rows, cols, round_out, has_outliers; uint32_t elut[16]; };
+
+    bool build_bf12(std::string& error) {
+        struct Job {
+            Mat12* dst;
+            std::vector<Mat> srcs;
+            uint32_t total_rows = 0;
+            uint32_t cols = 0;
+            uint64_t out_base = 0;
+            uint32_t out_cap = 0;
+        };
+        std::vector<Job> jobs;
+        auto add_job = [&](Mat12* dst, std::initializer_list<Mat> mats) {
+            Job j;
+            j.dst = dst;
+            for (const Mat& m : mats) {
+                j.srcs.push_back(m);
+                j.total_rows += m.rows;
+                j.cols = m.cols;
+            }
+            jobs.push_back(std::move(j));
+        };
+        for (uint32_t i = 0; i < c.layers; ++i) {
+            LayerWeights& w = lw[i];
+            add_job(&w.q12, {w.wq, w.wr, w.gate_attn, w.sink});
+            if (w.local) {
+                add_job(&w.k12, {w.wk});
+                add_job(&w.v12, {w.wv});
+            } else {
+                add_job(&w.k12, {w.wk, w.dynk});
+                add_job(&w.v12, {w.wv, w.dynv});
+            }
+            add_job(&w.wo12, {w.wo});
+            add_job(&w.router12, {w.router});
+            if (w.has_ctl) {
+                for (int k = 0; k < 4; ++k) {
+                    add_job(&w.ctl[k].down12, {w.ctl[k].down});
+                    add_job(&w.ctl[k].gf12, {w.ctl[k].gain, w.ctl[k].forget});
+                }
+            }
+        }
+        size_t nj = jobs.size();
+        id<MTLBuffer> hbuf = [gpu.device newBufferWithLength:nj * 256 * 4 options:MTLResourceStorageModeShared];
+        if (!hbuf) { error = "bf12 hist buffer allocation failed"; return false; }
+        std::memset(hbuf.contents, 0, hbuf.length);
+        {
+            id<MTLCommandBuffer> cb = [gpu.queue commandBuffer];
+            id<MTLComputeCommandEncoder> e = [cb computeCommandEncoderWithDispatchType:MTLDispatchTypeConcurrent];
+            [e setComputePipelineState:p_bf12_hist];
+            for (size_t ji = 0; ji < nj; ++ji) {
+                for (const Mat& m : jobs[ji].srcs) {
+                    uint32_t count8 = uint32_t((uint64_t(m.rows) * m.cols) / 8);
+                    uint32_t groups = std::min<uint32_t>((count8 + 255) / 256, 1024u);
+                    [e setBuffer:file offset:m.offset atIndex:0];
+                    [e setBuffer:hbuf offset:ji * 256 * 4 atIndex:1];
+                    [e setBytes:&count8 length:4 atIndex:2];
+                    [e dispatchThreadgroups:MTLSizeMake(groups, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+                }
+            }
+            [e endEncoding];
+            gpu_seconds(cb);
+        }
+        id<MTLBuffer> mbuf = [gpu.device newBufferWithLength:nj * 256 options:MTLResourceStorageModeShared];
+        if (!mbuf) { error = "bf12 map buffer allocation failed"; return false; }
+        const uint32_t* hptr = static_cast<const uint32_t*>(hbuf.contents);
+        uint8_t* mptr = static_cast<uint8_t*>(mbuf.contents);
+        auto align256 = [](uint64_t v) { return (v + 255) / 256 * 256; };
+        uint64_t sm_total = 0, ex_total = 0, ro_total = 0, out_total = 0;
+        for (size_t ji = 0; ji < nj; ++ji) {
+            Job& j = jobs[ji];
+            const uint32_t* hc = hptr + ji * 256;
+            std::array<uint32_t, 256> ord;
+            for (uint32_t e = 0; e < 256; ++e) ord[e] = e;
+            std::stable_sort(ord.begin(), ord.end(), [&](uint32_t a, uint32_t b) { return hc[a] > hc[b]; });
+            uint8_t* emap = mptr + ji * 256;
+            std::memset(emap, 15, 256);
+            j.dst->elut[15] = 0;
+            uint64_t top_sum = 0, all_sum = 0;
+            for (uint32_t e = 0; e < 256; ++e) all_sum += hc[e];
+            for (uint32_t k = 0; k < 15; ++k) {
+                uint32_t e = ord[k];
+                if (hc[e] > 0) {
+                    emap[e] = uint8_t(k);
+                    j.dst->elut[k] = e << 23;
+                    top_sum += hc[e];
+                } else {
+                    j.dst->elut[k] = 0;
+                }
+            }
+            j.out_cap = uint32_t(all_sum - top_sum);
+            j.out_base = out_total;
+            out_total += j.out_cap;
+            j.dst->rows = j.total_rows;
+            j.dst->cols = j.cols;
+            j.dst->sm_off = sm_total;
+            j.dst->ex_off = ex_total;
+            j.dst->ro_off = ro_total;
+            j.dst->has_outliers = j.out_cap > 0 ? 1u : 0u;
+            sm_total += align256(uint64_t(j.total_rows) * j.cols);
+            ex_total += align256(uint64_t(j.total_rows) * (j.cols / 2));
+            ro_total += align256(uint64_t(j.total_rows + 1) * 4);
+        }
+        bf12_sm = [gpu.device newBufferWithLength:sm_total options:MTLResourceStorageModePrivate];
+        bf12_ex = [gpu.device newBufferWithLength:ex_total options:MTLResourceStorageModePrivate];
+        bf12_ro = [gpu.device newBufferWithLength:ro_total options:MTLResourceStorageModeShared];
+        id<MTLBuffer> cbuf = [gpu.device newBufferWithLength:nj * 4 options:MTLResourceStorageModeShared];
+        id<MTLBuffer> rbuf = [gpu.device newBufferWithLength:std::max<uint64_t>(out_total, 1) * 8 options:MTLResourceStorageModeShared];
+        if (!bf12_sm || !bf12_ex || !bf12_ro || !cbuf || !rbuf) {
+            error = "bf12 packed buffer allocation failed";
+            return false;
+        }
+        std::memset(cbuf.contents, 0, cbuf.length);
+        {
+            id<MTLCommandBuffer> cb = [gpu.queue commandBuffer];
+            id<MTLComputeCommandEncoder> e = [cb computeCommandEncoderWithDispatchType:MTLDispatchTypeConcurrent];
+            [e setComputePipelineState:p_bf12_pack];
+            for (size_t ji = 0; ji < nj; ++ji) {
+                Job& j = jobs[ji];
+                uint32_t rbase = 0;
+                for (const Mat& m : j.srcs) {
+                    Bf12PackP pp{m.rows, m.cols, rbase, j.out_cap};
+                    [e setBuffer:file offset:m.offset atIndex:0];
+                    [e setBuffer:mbuf offset:ji * 256 atIndex:1];
+                    [e setBuffer:bf12_sm offset:j.dst->sm_off atIndex:2];
+                    [e setBuffer:bf12_ex offset:j.dst->ex_off atIndex:3];
+                    [e setBuffer:cbuf offset:ji * 4 atIndex:4];
+                    [e setBuffer:rbuf offset:j.out_base * 8 atIndex:5];
+                    [e setBytes:&pp length:sizeof(pp) atIndex:6];
+                    [e dispatchThreadgroups:MTLSizeMake((m.rows + 7) / 8, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+                    rbase += m.rows;
+                }
+            }
+            [e endEncoding];
+            gpu_seconds(cb);
+        }
+        uint64_t op_total = 0;
+        for (size_t ji = 0; ji < nj; ++ji) {
+            jobs[ji].dst->op_off = op_total;
+            op_total += align256(uint64_t(std::max<uint32_t>(jobs[ji].out_cap, 1)) * 4);
+        }
+        bf12_op = [gpu.device newBufferWithLength:std::max<uint64_t>(op_total, 256) options:MTLResourceStorageModeShared];
+        if (!bf12_op) { error = "bf12 outlier buffer allocation failed"; return false; }
+        const uint32_t* cnts = static_cast<const uint32_t*>(cbuf.contents);
+        const uint32_t* raws = static_cast<const uint32_t*>(rbuf.contents);
+        for (size_t ji = 0; ji < nj; ++ji) {
+            Job& j = jobs[ji];
+            uint32_t* ro = reinterpret_cast<uint32_t*>(static_cast<char*>(bf12_ro.contents) + j.dst->ro_off);
+            uint32_t* op = reinterpret_cast<uint32_t*>(static_cast<char*>(bf12_op.contents) + j.dst->op_off);
+            uint32_t n = cnts[ji];
+            std::memset(ro, 0, uint64_t(j.total_rows + 1) * 4);
+            if (n == 0) continue;
+            const uint32_t* src = raws + j.out_base * 2;
+            for (uint32_t k = 0; k < n; ++k) ro[src[k * 2] + 1]++;
+            for (uint32_t r = 0; r < j.total_rows; ++r) ro[r + 1] += ro[r];
+            std::vector<uint32_t> cur(ro, ro + j.total_rows);
+            for (uint32_t k = 0; k < n; ++k) {
+                uint32_t row = src[k * 2];
+                op[cur[row]++] = src[k * 2 + 1];
+            }
+            for (uint32_t r = 0; r < j.total_rows; ++r) {
+                if (ro[r + 1] - ro[r] > 1) std::sort(op + ro[r], op + ro[r + 1]);
+            }
+        }
+        bf12_ready = true;
         return true;
     }
 
@@ -366,7 +561,7 @@ public:
                 w.has_ctl = true;
                 for (int k = 0; k < 4; ++k) {
                     std::string cb = L + "controllers." + cnames[k] + ".";
-                    w.ctl[k] = {make_mat(cb + "down_weight"), make_mat(cb + "gain_weight"), make_mat(cb + "forget_weight")};
+                    w.ctl[k] = {make_mat(cb + "down_weight"), make_mat(cb + "gain_weight"), make_mat(cb + "forget_weight"), {}, {}};
                 }
             }
         }
@@ -431,6 +626,24 @@ public:
         grid((g.rows + 7) / 8, 256);
     }
 
+    void gemv12_ab(const Mat12& m, id<MTLBuffer> in_buf, uint64_t in_off, id<MTLBuffer> out_buf, uint64_t out_off, bool round_out = true) {
+        Gemv12P g{};
+        g.rows = m.rows;
+        g.cols = m.cols;
+        g.round_out = round_out ? 1u : 0u;
+        g.has_outliers = m.has_outliers;
+        std::memcpy(g.elut, m.elut, sizeof(g.elut));
+        [enc setComputePipelineState:p_gemv12];
+        [enc setBuffer:bf12_sm offset:m.sm_off atIndex:0];
+        [enc setBuffer:bf12_ex offset:m.ex_off atIndex:1];
+        [enc setBuffer:bf12_ro offset:m.ro_off atIndex:2];
+        [enc setBuffer:bf12_op offset:m.op_off atIndex:3];
+        [enc setBuffer:in_buf offset:in_off atIndex:4];
+        [enc setBuffer:out_buf offset:out_off atIndex:5];
+        [enc setBytes:&g length:sizeof(g) atIndex:6];
+        grid((g.rows + 7) / 8, 256);
+    }
+
     struct NormP { uint32_t n, has_weight; float eps; };
     uint32_t norm(uint32_t in, uint64_t weight_off) {
         uint32_t out = alloc();
@@ -485,14 +698,19 @@ public:
         [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
         together = true;
         for (int k = 0; k < 3; ++k) {
-            gemv_ab(w.ctl[k].down, scratch, s_normed[k], scratch, s_ctlh[k]);
+            if (bf12_ready) gemv12_ab(w.ctl[k].down12, scratch, s_normed[k], scratch, s_ctlh[k]);
+            else gemv_ab(w.ctl[k].down, scratch, s_normed[k], scratch, s_ctlh[k]);
         }
         together = false;
         [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
         together = true;
         for (int k = 0; k < 3; ++k) {
-            gemv_ab(w.ctl[k].gain, scratch, s_ctlh[k], scratch, s_gain[k], false);
-            gemv_ab(w.ctl[k].forget, scratch, s_ctlh[k], scratch, s_forget[k], false);
+            if (bf12_ready) {
+                gemv12_ab(w.ctl[k].gf12, scratch, s_ctlh[k], scratch, s_gf[k], false);
+            } else {
+                gemv_ab(w.ctl[k].gain, scratch, s_ctlh[k], scratch, s_gain[k], false);
+                gemv_ab(w.ctl[k].forget, scratch, s_ctlh[k], scratch, s_forget[k], false);
+            }
         }
         together = false;
         [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
@@ -522,12 +740,17 @@ public:
         [enc setBuffer:scratch offset:s_normed[0] atIndex:2];
         [enc setBytes:&n length:4 atIndex:3];
         grid(1, 576);
-        gemv_ab(w.ctl[3].down, scratch, s_normed[0], scratch, s_ctlh[0]);
-        [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
-        together = true;
-        gemv_ab(w.ctl[3].gain, scratch, s_ctlh[0], scratch, s_gain[0], false);
-        gemv_ab(w.ctl[3].forget, scratch, s_ctlh[0], scratch, s_forget[0], false);
-        together = false;
+        if (bf12_ready) {
+            gemv12_ab(w.ctl[3].down12, scratch, s_normed[0], scratch, s_ctlh[0]);
+            gemv12_ab(w.ctl[3].gf12, scratch, s_ctlh[0], scratch, s_gf[0], false);
+        } else {
+            gemv_ab(w.ctl[3].down, scratch, s_normed[0], scratch, s_ctlh[0]);
+            [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+            together = true;
+            gemv_ab(w.ctl[3].gain, scratch, s_ctlh[0], scratch, s_gain[0], false);
+            gemv_ab(w.ctl[3].forget, scratch, s_ctlh[0], scratch, s_forget[0], false);
+            together = false;
+        }
         uint32_t out = alloc();
         [enc setComputePipelineState:p_ctl_mix_norm];
         [enc setBuffer:arena offset:so(dest) atIndex:0];
@@ -580,15 +803,21 @@ public:
         uint32_t kvw = c.kv_heads * c.head_dim;
         [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
         together = true;
-        gemv_ab(w.wq, arena, so(sq), scratch, s_q);
-        gemv_ab(w.wr, arena, so(sq), scratch, s_r);
-        gemv_ab(w.gate_attn, arena, so(sq), scratch, s_gate);
-        gemv_ab(w.sink, arena, so(sq), scratch, s_sinks);
-        gemv_ab(w.wk, arena, so(sk), scratch, s_kraw);
-        gemv_ab(w.wv, arena, so(sv), scratch, s_vraw);
-        if (!w.local) {
-            gemv_ab(w.dynk, arena, so(sk), scratch, s_dynk);
-            gemv_ab(w.dynv, arena, so(sv), scratch, s_dynv);
+        if (bf12_ready) {
+            gemv12_ab(w.q12, arena, so(sq), scratch, s_qbundle);
+            gemv12_ab(w.k12, arena, so(sk), scratch, s_kbundle);
+            gemv12_ab(w.v12, arena, so(sv), scratch, s_vbundle);
+        } else {
+            gemv_ab(w.wq, arena, so(sq), scratch, s_q);
+            gemv_ab(w.wr, arena, so(sq), scratch, s_r);
+            gemv_ab(w.gate_attn, arena, so(sq), scratch, s_gate);
+            gemv_ab(w.sink, arena, so(sq), scratch, s_sinks);
+            gemv_ab(w.wk, arena, so(sk), scratch, s_kraw);
+            gemv_ab(w.wv, arena, so(sv), scratch, s_vraw);
+            if (!w.local) {
+                gemv_ab(w.dynk, arena, so(sk), scratch, s_dynk);
+                gemv_ab(w.dynv, arena, so(sv), scratch, s_dynv);
+            }
         }
         together = false;
         [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
@@ -624,7 +853,8 @@ public:
         [enc setBytes:&a length:sizeof(a) atIndex:7];
         grid(c.heads, 128);
         uint32_t out = alloc();
-        gemv_ab(w.wo, scratch, s_gated, arena, so(out));
+        if (bf12_ready) gemv12_ab(w.wo12, scratch, s_gated, arena, so(out));
+        else gemv_ab(w.wo, scratch, s_gated, arena, so(out));
         return out;
     }
 
@@ -636,7 +866,8 @@ public:
         uint32_t H = c.hidden, I = c.inter;
         [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
         together = true;
-        gemv_ab(w.router, arena, so(x), scratch, s_router, false);
+        if (bf12_ready) gemv12_ab(w.router12, arena, so(x), scratch, s_router, false);
+        else gemv_ab(w.router, arena, so(x), scratch, s_router, false);
         if (w.nvfp4) {
             [enc setComputePipelineState:p_qnv4];
             [enc setBuffer:arena offset:so(x) atIndex:0];
@@ -955,12 +1186,14 @@ std::optional<std::vector<uint32_t>> parse_ids(const std::string& text, std::str
 
 int generate_command(int argc, char** argv) {
     std::string error;
-    auto flags = parse_flags(argc, argv, {"--model", "--input-ids", "--steps", "--head"}, {"--logprobs"}, error);
+    auto flags = parse_flags(argc, argv, {"--model", "--input-ids", "--steps", "--head", "--pack"}, {"--logprobs"}, error);
     if (!flags) return refuse(error);
     auto steps = whole_flag(*flags, "--steps", 8, 1, 4000, error);
     if (!steps) return refuse(error);
     std::string head = flags->values.count("--head") ? flags->values["--head"] : "exact";
     if (head != "exact" && head != "full") return refuse("--head must be exact or full");
+    std::string pack = flags->values.count("--pack") ? flags->values["--pack"] : "bf12";
+    if (pack != "bf12" && pack != "off") return refuse("--pack must be bf12 or off");
     if (!flags->values.count("--model") || !flags->values.count("--input-ids")) return refuse("generate needs --model DIR and --input-ids JSON");
     auto ids_opt = parse_ids(flags->values["--input-ids"], error);
     if (!ids_opt) return refuse(error);
@@ -969,7 +1202,7 @@ int generate_command(int argc, char** argv) {
     bool logprobs = flags->switches.count("--logprobs") > 0;
     bool use_cert = head == "exact" && !logprobs;
     Engine engine;
-    if (!engine.load(flags->values["--model"], use_cert, error)) {
+    if (!engine.load(flags->values["--model"], use_cert, pack == "bf12", error)) {
         std::fprintf(stderr, "delphi: %s\n", error.c_str());
         return 3;
     }
@@ -1013,7 +1246,7 @@ int generate_command(int argc, char** argv) {
 
 int bench_command(int argc, char** argv) {
     std::string error;
-    auto flags = parse_flags(argc, argv, {"--model", "--input-ids", "--steps", "--repeats", "--warmup", "--head"}, {}, error);
+    auto flags = parse_flags(argc, argv, {"--model", "--input-ids", "--steps", "--repeats", "--warmup", "--head", "--pack"}, {}, error);
     if (!flags) return refuse(error);
     auto steps = whole_flag(*flags, "--steps", 64, 2, 4000, error);
     auto repeats = steps ? whole_flag(*flags, "--repeats", 6, 1, 100, error) : std::nullopt;
@@ -1021,13 +1254,15 @@ int bench_command(int argc, char** argv) {
     if (!warmup) return refuse(error);
     std::string head = flags->values.count("--head") ? flags->values["--head"] : "exact";
     if (head != "exact" && head != "full") return refuse("--head must be exact or full");
+    std::string pack = flags->values.count("--pack") ? flags->values["--pack"] : "bf12";
+    if (pack != "bf12" && pack != "off") return refuse("--pack must be bf12 or off");
     if (!flags->values.count("--model") || !flags->values.count("--input-ids")) return refuse("bench needs --model DIR and --input-ids JSON");
     auto ids_opt = parse_ids(flags->values["--input-ids"], error);
     if (!ids_opt) return refuse(error);
     auto& ids = *ids_opt;
     if (ids.empty()) return refuse("--input-ids must hold at least one token id");
     Engine engine;
-    if (!engine.load(flags->values["--model"], head == "exact", error)) {
+    if (!engine.load(flags->values["--model"], head == "exact", pack == "bf12", error)) {
         std::fprintf(stderr, "delphi: %s\n", error.c_str());
         return 3;
     }

@@ -97,6 +97,26 @@ test('delphi bench refuses missing model or invalid repeat counts', { timeout: 3
     const okHead = spawnSync(bin, ['generate', '--model', '/nonexistent', '--input-ids', '[1]', '--head', 'exact'], { encoding: 'utf8', timeout: remainingMs(deadline) });
     if (okHead.error) throw okHead.error;
     expect(okHead.status).toBe(3);
+    const badPack = spawnSync(bin, ['generate', '--model', '/nonexistent', '--input-ids', '[1]', '--pack', 'bogus'], { encoding: 'utf8', timeout: remainingMs(deadline) });
+    if (badPack.error) throw badPack.error;
+    expect(badPack.status).toBe(2);
+    expect(badPack.stderr).toContain('--pack');
+    const okPack = spawnSync(bin, ['generate', '--model', '/nonexistent', '--input-ids', '[1]', '--pack', 'bf12'], { encoding: 'utf8', timeout: remainingMs(deadline) });
+    if (okPack.error) throw okPack.error;
+    expect(okPack.status).toBe(3);
+  });
+});
+
+test('delphi generate 12-bit exact BF16 packing matches unpacked BF16 token-for-token', { tags: ['model'], timeout: 900_000 }, () => {
+  const deadline = Date.now() + 900_000;
+  withBuiltDelphi(deadline, (bin) => {
+    for (const c of [fibonacci, truth.cases[2]]) {
+      const offRun = spawnSync(bin, ['generate', '--model', model, '--input-ids', JSON.stringify(c.input_ids), '--steps', '32', '--pack', 'off'], { encoding: 'utf8', timeout: remainingMs(deadline) });
+      checkRun('delphi generate --pack off', offRun);
+      const packRun = spawnSync(bin, ['generate', '--model', model, '--input-ids', JSON.stringify(c.input_ids), '--steps', '32', '--pack', 'bf12'], { encoding: 'utf8', timeout: remainingMs(deadline) });
+      checkRun('delphi generate --pack bf12', packRun);
+      expect((JSON.parse(packRun.stdout) as Generated).output_ids).toEqual((JSON.parse(offRun.stdout) as Generated).output_ids);
+    }
   });
 });
 
