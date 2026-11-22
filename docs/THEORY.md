@@ -73,18 +73,22 @@ These are byte-model ceilings at 266 GB/s (Apple M5 Pro, context `20-84` tokens)
 
 ## 6. Measured results vs theoretical ceilings (Apple M5 Pro, 266 GB/s sustained)
 
-Waves 1-5 are uncontended medians of 6 warm runs (64 decode steps, context `5-116` tokens) via `delphi bench` on AC power, logged in [bench/ledger.jsonl](../bench/ledger.jsonl); the Wave 0 baseline (`32.1` GPU / `30.7` wall) comes from the initial two-run `delphi generate` baseline (`20-84` tokens) and its 6-repeat `delphi bench` controls logged in Wave 1.
+Waves 1-8 are medians of 6 warm runs (64 decode steps, context `5-224` tokens; 512-token prompt for `Prefill 512`) via `delphi bench` on AC power with interleaved controls, logged in [bench/ledger.jsonl](../bench/ledger.jsonl); the Wave 0 baseline (`32.1` GPU / `30.7` wall) comes from the initial two-run `delphi generate` baseline (`20-84` tokens) and its 6-repeat `delphi bench` controls logged in Wave 1.
 
-| Stage | Shipped variant | Bytes / step (`M=1`) | Ceiling (`M=1`, 266 GB/s) | Measured `M=1` GPU tok/s (% ceiling) | Measured spec GPU tok/s (`story` / `fib` / `copy_code`) |
-|---|---|---:|---:|---:|---:|
-| Wave 0 | Shipped BF16 + FP32 KV | 5.51 GB | 48.3 | 32.1 (66.5%) | 32.1 / 32.1 / 32.1 |
-| Wave 1 | Fused kernels + BF16 KV | 5.51 GB | 48.3 | 38.5 (79.8%) | 38.5 / 38.5 / 38.5 |
-| Wave 2 | + Certified INT4-g32 exact head | 4.85 GB | 54.9 | 42.3 (77.1%) | 42.3 / 42.1 / 42.1 |
-| Wave 3 | + 12-bit exact lossless BF16 pack | 4.17 GB | 63.8 | 46.1 (72.2%) | 46.0 / 46.1 / 45.4 |
-| Wave 4B/4C | + Bundled 49K INT4-g32 MTP + lookup + 32K ring-KV | 4.17 GB | 63.8 | 46.1 (72.2%) | **49.7 / 74.0 / 90.1** (exact) |
-| Wave 5 `--mode lean` | Shipped opt-in INT4-g32 dense projections + BF16 KV (lossy) | 2.81 GB | 94.7 | 58.6 (61.9%) | 54.7 (58.6 off) / 78.8 / 91.1 |
-| Wave 5 `--mode turbo` | Shipped opt-in `lean` + top-4 expert routing (lossy) | 1.89 GB | 140.7 | 76.0 (54.0%) | 71.7 (75.9 off) / **101.4 / 129.7** |
+| Stage | Shipped variant | Bytes / step (`M=1`) | Ceiling (`M=1`, 266 GB/s) | Measured `M=1` GPU tok/s (% ceiling) | Measured spec GPU tok/s (`story` / `fib` / `copy_code` / `p160`) | Prefill 512 |
+|---|---|---:|---:|---:|---:|---:|
+| Wave 0 | Shipped BF16 + FP32 KV | 5.51 GB | 48.3 | 32.1 (66.5%) | 32.1 / 32.1 / 32.1 / 32.1 | - |
+| Wave 1 | Fused kernels + BF16 KV | 5.51 GB | 48.3 | 38.5 (79.8%) | 38.5 / 38.5 / 38.5 / - | - |
+| Wave 2 | + Certified INT4-g32 exact head | 4.85 GB | 54.9 | 42.3 (77.1%) | 42.3 / 42.1 / 42.1 / - | - |
+| Wave 3 | + 12-bit exact lossless BF16 pack | 4.17 GB | 63.8 | 46.1 (72.2%) | 46.0 / 46.1 / 45.4 / - | - |
+| Wave 4B/4C | + Bundled 49K INT4-g32 MTP + lookup + 32K ring-KV | 4.17 GB | 63.8 | 46.1 (72.2%) | 49.7 / 74.0 / 90.1 / 106.5 (exact) | 109.1 |
+| Wave 6 | + Metal 4 `matmul2d` prefill + tail-free 16/8/4-lane kernels + 8-lane cert head | 4.17 GB | 63.8 | **47.2 (74.0%)** | 52.1 / 82.2 / 117.5 / 148.3 (exact) | **462.0** |
+| Wave 7 | + 8-lane MTP drafter (~0.70 ms) + 3-beam exact tree verify + `M=64` Metal 4 lookup | 4.17 GB | 63.8 | 47.1 (73.8%) | **57.2 / 85.3 / 132.7 / 345.2** (exact) | **462.0** |
+| Wave 8 `--mode lean` | Opt-in tail-free `half4` INT4-g32 dense + Metal 4 `bfloat` Q4 prefill + BF16 KV (lossy) | 2.81 GB | 94.7 | 55.2 (58.3%) | 58.4 / 93.7 / 143.8 / 384.7 | **489.2** |
+| Wave 8 `--mode turbo` | Opt-in `lean` + spec-exact top-3 expert routing (lossy) | 1.66 GB | 160.2 | 77.6 (48.4%) | 77.4 / **140.1 / 192.5 / 575.6** | **755.6** |
 
-Measured exact verify step latency curve (`delphi bench`, Apple M5 Pro, Wave 4A/4B, context `5-94` tokens, real expert union `U(1..8) = {8.0, 13.5, 17.0, 20.3, 23.1, 26.5, 29.6, 31.3}`):
-- `M = 1..8`: `{21.6, 30.1, 35.8, 40.3, 47.9, 57.6, 63.4, 71.8} ms` (+ ~1.9 ms bundled MTP draft time for 7 proposals over the 49,152-token `markov_w1`-norm shortlist).
-- Remaining gap to the 63.8 tok/s `M=1` ceiling (21.6 ms measured vs 15.7 ms streaming floor = 5.9 ms): grouped NVFP4/MXFP8 ALU dequant overhead (~2.8 ms) plus 48-visit dispatch/norm/sconv fixed overhead (~3.1 ms). Closing the exact speculation gap past 74 tok/s code / 50 tok/s prose depends primarily on higher drafter acceptance (e.g., completing the 12-token DSpine drafter) and higher expert-batch bandwidth at `M = 4..8`.
+Measured verify step latency (`delphi bench`, Apple M5 Pro, Waves 7-8, context `5-224` tokens, real expert union):
+- **Exact (`Wave 7`):** `M = {1, 2, 3, 4, 5, 6, 7, 8, 12, 16, 24, 32, 64}` -> `{22.2, 26.4, 31.8, 34.8, 40.4, 47.1, 51.0, 55.8, 82.7, 102.9, 111.0, 121.1, 171.7} ms` (+ ~0.70 ms 8-lane 3-beam MTP draft time over the 49,152-token `markov_w1`-norm shortlist). At `M = 64` (Metal 4 `matmul2d`), verifying 64 exact tokens takes `171.7 ms` (`2.68 ms/tok` amortized, `345.2 tok/s` measured on `p160`).
+- **Lean (`Wave 8`, top-8 experts):** `M = 1` plain `18.1 ms` (`55.2 tok/s` GPU), `M = 64` `p160` `163.8 ms` (`384.7 tok/s` GPU, `63.0` accepted/step).
+- **Turbo (`Wave 8`, top-3 experts):** `M = 1` plain `12.9 ms` (`77.6 tok/s` GPU), `M = 64` `p160` `109.5 ms` (`575.6 tok/s` GPU, `63.0` accepted/step).
+- Remaining gap to the 63.8 tok/s exact `M=1` ceiling (21.2 ms measured vs 15.7 ms streaming floor = 5.5 ms): grouped NVFP4/MXFP8 ALU dequant overhead (~2.5 ms) plus 48-visit dispatch/norm/sconv fixed overhead (~3.0 ms). Pushing exact decode further past 85 tok/s code / 57 tok/s prose now depends primarily on higher drafter acceptance (completing the 12-token DSpine drafter).

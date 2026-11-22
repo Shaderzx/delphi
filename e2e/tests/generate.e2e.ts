@@ -123,27 +123,46 @@ test('delphi bench refuses missing model or invalid repeat counts', { timeout: 3
   });
 });
 
-test('delphi generate opt-in --mode lean and --mode turbo report mode and preserve Paris answer', { tags: ['model'], timeout: 900_000 }, () => {
+test('delphi generate opt-in --mode lean and --mode turbo report mode, stay spec-exact, and preserve Paris answer', { tags: ['model'], timeout: 900_000 }, () => {
   const deadline = Date.now() + 900_000;
   withBuiltDelphi(deadline, (bin) => {
     for (const m of ['lean', 'turbo']) {
+      const offRun = spawnSync(bin, ['generate', '--model', model, '--input-ids', JSON.stringify(paris.input_ids), '--steps', '16', '--mode', m, '--spec', 'off'], { encoding: 'utf8', timeout: remainingMs(deadline) });
+      checkRun(`delphi generate --mode ${m} --spec off`, offRun);
       const run = spawnSync(bin, ['generate', '--model', model, '--input-ids', JSON.stringify(paris.input_ids), '--steps', '16', '--mode', m], { encoding: 'utf8', timeout: remainingMs(deadline) });
       checkRun(`delphi generate --mode ${m}`, run);
       const out = JSON.parse(run.stdout) as Generated;
       expect(out.mode).toBe(m);
       expect(out.lossy).toBe(true);
       expect(out.output_ids[0]).toBe(paris.output_ids[0]);
+      expect(out.output_ids).toEqual((JSON.parse(offRun.stdout) as Generated).output_ids);
     }
+  });
+});
+
+test('delphi generate --mode lean retrieves a needle past 4096 tokens', { tags: ['model'], timeout: 900_000 }, () => {
+  const deadline = Date.now() + 900_000;
+  withBuiltDelphi(deadline, (bin) => {
+    const code = [19, 22, 17, 24, 16];
+    const needle = [371, 153536, 150406, 149884, 220, ...code, 13, 198];
+    const filler = [...truth.cases[2].input_ids, 198];
+    const prompt: number[] = [...needle];
+    while (prompt.length < 4600) prompt.push(...filler);
+    prompt.push(371, 153536, 150406, 149884, 220);
+    const leanNeedle = spawnSync(bin, ['generate', '--model', model, '--input-ids', JSON.stringify(prompt), '--steps', '6', '--mode', 'lean', '--spec', 'auto'], { encoding: 'utf8', timeout: remainingMs(deadline) });
+    checkRun('delphi generate lean 4.6k needle', leanNeedle);
+    expect((JSON.parse(leanNeedle.stdout) as Generated).output_ids.slice(0, code.length)).toEqual(code);
   });
 });
 
 test('delphi generate batched prefill and speculative verify match --spec off token-for-token', { tags: ['model'], timeout: 900_000 }, () => {
   const deadline = Date.now() + 900_000;
   withBuiltDelphi(deadline, (bin) => {
-    for (const c of [fibonacci, truth.cases[2]]) {
-      const offRun = spawnSync(bin, ['generate', '--model', model, '--input-ids', JSON.stringify(c.input_ids), '--steps', '64', '--spec', 'off'], { encoding: 'utf8', timeout: remainingMs(deadline) });
+    const widePrompt = Array.from({ length: 8 }, () => fibonacci.input_ids).flat();
+    for (const ids of [fibonacci.input_ids, truth.cases[2].input_ids, widePrompt]) {
+      const offRun = spawnSync(bin, ['generate', '--model', model, '--input-ids', JSON.stringify(ids), '--steps', '64', '--spec', 'off'], { encoding: 'utf8', timeout: remainingMs(deadline) });
       checkRun('delphi generate --spec off', offRun);
-      const specRun = spawnSync(bin, ['generate', '--model', model, '--input-ids', JSON.stringify(c.input_ids), '--steps', '64', '--spec', 'auto'], { encoding: 'utf8', timeout: remainingMs(deadline) });
+      const specRun = spawnSync(bin, ['generate', '--model', model, '--input-ids', JSON.stringify(ids), '--steps', '64', '--spec', 'auto'], { encoding: 'utf8', timeout: remainingMs(deadline) });
       checkRun('delphi generate --spec auto', specRun);
       expect((JSON.parse(specRun.stdout) as Generated).output_ids).toEqual((JSON.parse(offRun.stdout) as Generated).output_ids);
     }
@@ -166,7 +185,7 @@ test('delphi generate retrieves a needle past 4096 tokens using 32K ring-KV', { 
   });
 });
 
-test('delphi generate --spec mtp matches --spec off token-for-token with multi-token acceptance', { tags: ['model'], timeout: 900_000 }, () => {
+test('delphi generate --spec mtp matches --spec off token-for-token with multi-token tree acceptance', { tags: ['model'], timeout: 900_000 }, () => {
   const deadline = Date.now() + 900_000;
   withBuiltDelphi(deadline, (bin) => {
     for (const c of [fibonacci, truth.cases[2]]) {
@@ -176,7 +195,7 @@ test('delphi generate --spec mtp matches --spec off token-for-token with multi-t
       checkRun('delphi generate --spec mtp', mtpRun);
       const mtpOut = JSON.parse(mtpRun.stdout) as Generated;
       expect(mtpOut.output_ids).toEqual((JSON.parse(offRun.stdout) as Generated).output_ids);
-      expect(mtpOut.accepted_per_step ?? 0).toBeGreaterThan(1.3);
+      expect(mtpOut.accepted_per_step ?? 0).toBeGreaterThan(1.55);
     }
   });
 });

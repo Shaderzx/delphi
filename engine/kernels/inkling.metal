@@ -31,8 +31,8 @@ inline float e4m3_rne(float x) {
 inline float e4m3_decode(uchar b) {
     uint e = (b >> 3) & 15u;
     uint m = b & 7u;
-    float v = e == 0u ? float(m) * 0.001953125f : as_type<float>(((e + 120u) << 23) | (m << 20));
-    return (b & 0x80u) ? -v : v;
+    float v = select(as_type<float>(((e + 120u) << 23) | (m << 20)), float(m) * 0.001953125f, e == 0u);
+    return select(v, -v, (b & 0x80u) != 0u);
 }
 
 inline float fp4_rne_val(float v) {
@@ -458,27 +458,42 @@ kernel void route(device const float* logits [[buffer(0)]],
     }
 }
 
-inline void quant_block16(const thread float* blk, float enc, float dec, float out_scale, device half* dst) {
-    float bmax = 0;
-    for (uint j = 0; j < 16; ++j) bmax = max(bmax, fabs(blk[j]));
-    float best_err[2];
-    float vals[2][16];
-    float ims[2] = {1.0f / 6.0f, 0.25f};
-    for (uint c = 0; c < 2; ++c) {
-        float sc = e4m3_rne(min(bmax * (enc * ims[c]), 448.0f));
-        float inv = min(1.0f / (sc * dec), FLT_MAX);
-        float err[16];
-        for (uint j = 0; j < 16; ++j) {
-            float r = fp4_rne_val(blk[j] * inv);
-            float qv = r * sc;
-            vals[c][j] = qv;
-            err[j] = fabs(qv * out_scale - blk[j]);
-        }
-        for (uint w = 16; w > 1; w /= 2) for (uint j = 0; j < w / 2; ++j) err[j] = err[2 * j] + err[2 * j + 1];
-        best_err[c] = err[0];
+inline float4 fp4_rne_val4(float4 v) {
+    float4 av = fabs(v);
+    uint4 code = uint4(av > 0.25f) + uint4(av >= 0.75f) + uint4(av > 1.25f) + uint4(av >= 1.75f)
+               + uint4(av > 2.5f) + uint4(av >= 3.5f) + uint4(av > 5.0f);
+    float4 m = float4(FP4_VALUES[code.x], FP4_VALUES[code.y], FP4_VALUES[code.z], FP4_VALUES[code.w]);
+    return copysign(m, v);
+}
+
+inline void quant_block16_v4(float4 b0, float4 b1, float4 b2, float4 b3, float enc, float dec, float out_scale, device half4* dst) {
+    float4 am = max(max(fabs(b0), fabs(b1)), max(fabs(b2), fabs(b3)));
+    float bmax = max(max(am.x, am.y), max(am.z, am.w));
+    float sc0 = e4m3_rne(min(bmax * (enc * (1.0f / 6.0f)), 448.0f));
+    float inv0 = min(1.0f / (sc0 * dec), FLT_MAX);
+    float4 q00 = fp4_rne_val4(b0 * inv0) * sc0;
+    float4 q01 = fp4_rne_val4(b1 * inv0) * sc0;
+    float4 q02 = fp4_rne_val4(b2 * inv0) * sc0;
+    float4 q03 = fp4_rne_val4(b3 * inv0) * sc0;
+    float4 e00 = fabs(q00 * out_scale - b0), e01 = fabs(q01 * out_scale - b1);
+    float4 e02 = fabs(q02 * out_scale - b2), e03 = fabs(q03 * out_scale - b3);
+    float err0 = (((e00.x + e00.y) + (e00.z + e00.w)) + ((e01.x + e01.y) + (e01.z + e01.w)))
+               + (((e02.x + e02.y) + (e02.z + e02.w)) + ((e03.x + e03.y) + (e03.z + e03.w)));
+    float sc1 = e4m3_rne(min(bmax * (enc * 0.25f), 448.0f));
+    float inv1 = min(1.0f / (sc1 * dec), FLT_MAX);
+    float4 q10 = fp4_rne_val4(b0 * inv1) * sc1;
+    float4 q11 = fp4_rne_val4(b1 * inv1) * sc1;
+    float4 q12 = fp4_rne_val4(b2 * inv1) * sc1;
+    float4 q13 = fp4_rne_val4(b3 * inv1) * sc1;
+    float4 e10 = fabs(q10 * out_scale - b0), e11 = fabs(q11 * out_scale - b1);
+    float4 e12 = fabs(q12 * out_scale - b2), e13 = fabs(q13 * out_scale - b3);
+    float err1 = (((e10.x + e10.y) + (e10.z + e10.w)) + ((e11.x + e11.y) + (e11.z + e11.w)))
+               + (((e12.x + e12.y) + (e12.z + e12.w)) + ((e13.x + e13.y) + (e13.z + e13.w)));
+    if (err1 < err0) {
+        dst[0] = half4(q10); dst[1] = half4(q11); dst[2] = half4(q12); dst[3] = half4(q13);
+    } else {
+        dst[0] = half4(q00); dst[1] = half4(q01); dst[2] = half4(q02); dst[3] = half4(q03);
     }
-    uint pick = best_err[1] < best_err[0] ? 1u : 0u;
-    for (uint j = 0; j < 16; ++j) dst[j] = half(vals[pick][j]);
 }
 
 kernel void quant_nvfp4(device const float* x [[buffer(0)]],
@@ -491,18 +506,22 @@ kernel void quant_nvfp4(device const float* x [[buffer(0)]],
                         uint lane [[thread_index_in_simdgroup]],
                         uint simd [[simdgroup_index_in_threadgroup]]) {
     threadgroup float part[8];
-    device const float* xr = x + row * n;
-    device half* opr = operand + row * n;
-    float a = 0;
-    for (uint i = tid; i < n; i += threads) a = max(a, fabs(xr[i]));
+    device const float4* xr4 = (device const float4*)(x + row * n);
+    device half4* opr4 = (device half4*)(operand + row * n);
+    uint n4 = n / 4u;
+    float a = 0.0f;
+    for (uint i = tid; i < n4; i += threads) {
+        float4 v = fabs(xr4[i]);
+        a = max(a, max(max(v.x, v.y), max(v.z, v.w)));
+    }
     a = simd_max(a);
     if (lane == 0) part[simd] = a;
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    float amax = 0;
+    float amax = 0.0f;
     for (uint i = 0; i < (threads + 31u) / 32u; ++i) amax = max(amax, part[i]);
     if (amax == 0.0f) {
-        for (uint i = tid; i < n; i += threads) opr[i] = half(0);
-        if (tid == 0) outer[row] = 0;
+        for (uint i = tid; i < n4; i += threads) opr4[i] = half4(0);
+        if (tid == 0) outer[row] = 0.0f;
         return;
     }
     float enc = min(1536.0f / amax, FLT_MAX);
@@ -510,9 +529,8 @@ kernel void quant_nvfp4(device const float* x [[buffer(0)]],
     float out_scale = amax * (1.0f / 1536.0f);
     if (tid == 0) outer[row] = out_scale;
     for (uint b = tid; b < n / 16u; b += threads) {
-        float blk[16];
-        for (uint j = 0; j < 16; ++j) blk[j] = xr[b * 16u + j];
-        quant_block16(blk, enc, dec, out_scale, opr + b * 16u);
+        uint b4 = b * 4u;
+        quant_block16_v4(xr4[b4], xr4[b4 + 1u], xr4[b4 + 2u], xr4[b4 + 3u], enc, dec, out_scale, opr4 + b4);
     }
 }
 
@@ -531,14 +549,17 @@ kernel void swiglu_quant_nvfp4(device const float* gu [[buffer(0)]],
     threadgroup float hs[2048];
     threadgroup float part[8];
     float gamma = gammas[k];
+    float inv_gc = 1.0f / p.gate_cap;
+    float inv_uc = 1.0f / p.up_cap;
     float a = 0.0f;
-    device const float* row_gu = gu + k * 2u * p.inter;
+    device const float2* row_gu = (device const float2*)(gu + k * 2u * p.inter);
     for (uint j = tid; j < p.inter; j += threads) {
-        float g = row_gu[2u * j];
-        float u = row_gu[2u * j + 1u];
+        float2 guv = row_gu[j];
+        float g = guv.x;
+        float u = guv.y;
         float sg = sigm(g);
-        float gc = p.gate_cap * precise::tanh(g / p.gate_cap);
-        float uc = p.up_cap * precise::tanh(u / p.up_cap);
+        float gc = p.gate_cap * precise::tanh(g * inv_gc);
+        float uc = p.up_cap * precise::tanh(u * inv_uc);
         float v = rbf(gc * sg * uc * gamma);
         hs[j] = v;
         a = max(a, fabs(v));
@@ -546,22 +567,55 @@ kernel void swiglu_quant_nvfp4(device const float* gu [[buffer(0)]],
     a = simd_max(a);
     if (lane == 0) part[simd] = a;
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    float amax = 0;
+    float amax = 0.0f;
     for (uint i = 0; i < (threads + 31u) / 32u; ++i) amax = max(amax, part[i]);
-    device half* opr = hq + k * p.inter;
+    device half4* opr4 = (device half4*)(hq + k * p.inter);
     if (amax == 0.0f) {
-        for (uint i = tid; i < p.inter; i += threads) opr[i] = half(0);
-        if (tid == 0) houter[k] = 0;
+        for (uint i = tid; i < p.inter / 4u; i += threads) opr4[i] = half4(0);
+        if (tid == 0) houter[k] = 0.0f;
         return;
     }
     float enc = min(1536.0f / amax, FLT_MAX);
     float dec = 1.0f / enc;
     float out_scale = amax * (1.0f / 1536.0f);
     if (tid == 0) houter[k] = out_scale;
+    threadgroup const float4* hs4 = (threadgroup const float4*)hs;
     for (uint b = tid; b < p.inter / 16u; b += threads) {
-        float blk[16];
-        for (uint j = 0; j < 16; ++j) blk[j] = hs[b * 16u + j];
-        quant_block16(blk, enc, dec, out_scale, opr + b * 16u);
+        uint b4 = b * 4u;
+        quant_block16_v4(hs4[b4], hs4[b4 + 1u], hs4[b4 + 2u], hs4[b4 + 3u], enc, dec, out_scale, opr4 + b4);
+    }
+}
+
+kernel void swiglu_quant_mxfp8(device const float* gu [[buffer(0)]],
+                               device const float* gammas [[buffer(1)]],
+                               device float* operand [[buffer(2)]],
+                               constant Swiglu& p [[buffer(3)]],
+                               uint2 gid [[thread_position_in_grid]]) {
+    uint b = gid.x, k = gid.y;
+    if (b >= p.inter / 32u) return;
+    float gamma = gammas[k];
+    float inv_gc = 1.0f / p.gate_cap;
+    float inv_uc = 1.0f / p.up_cap;
+    device const float2* row_gu = (device const float2*)(gu + k * 2u * p.inter) + b * 32u;
+    float vals[32];
+    float bmax = 0.0f;
+    for (uint j = 0; j < 32u; ++j) {
+        float2 guv = row_gu[j];
+        float g = rbf(guv.x);
+        float u = rbf(guv.y);
+        float sg = sigm(g);
+        float gc = p.gate_cap * precise::tanh(g * inv_gc);
+        float uc = p.up_cap * precise::tanh(u * inv_uc);
+        float v = gc * sg * uc * gamma;
+        vals[j] = v;
+        bmax = max(bmax, fabs(v));
+    }
+    float scale = bmax > 0.0f ? exp2(clamp(floor(log2(bmax)) - 8.0f, -127.0f, 127.0f)) : exp2(-127.0f);
+    float inv_s = 1.0f / scale;
+    device float* dst = operand + k * p.inter + b * 32u;
+    for (uint j = 0; j < 32u; ++j) {
+        float v = vals[j] * inv_s;
+        dst[j] = (v < 0.0f ? -1.0f : 1.0f) * e4m3_rne(fabs(v)) * scale;
     }
 }
 
@@ -581,6 +635,37 @@ kernel void quant_mxfp8(device const float* x [[buffer(0)]],
     }
 }
 
+inline half fp4_h(uint code) {
+    uint mag = code & 7u;
+    half v = mag < 2u ? half(mag) * half(0.5h) : as_type<half>(ushort((mag << 9) + 0x3800u));
+    return (code & 8u) ? -v : v;
+}
+
+inline half4 fp4x4_h(uint bits) {
+    return half4(fp4_h(bits & 15u), fp4_h((bits >> 4) & 15u), fp4_h((bits >> 8) & 15u), fp4_h((bits >> 12) & 15u));
+}
+
+inline float simd16_sum(float v) {
+    v += simd_shuffle_xor(v, 8u);
+    v += simd_shuffle_xor(v, 4u);
+    v += simd_shuffle_xor(v, 2u);
+    v += simd_shuffle_xor(v, 1u);
+    return v;
+}
+
+inline float simd8_sum(float v) {
+    v += simd_shuffle_xor(v, 4u);
+    v += simd_shuffle_xor(v, 2u);
+    v += simd_shuffle_xor(v, 1u);
+    return v;
+}
+
+inline float simd4_sum(float v) {
+    v += simd_shuffle_xor(v, 2u);
+    v += simd_shuffle_xor(v, 1u);
+    return v;
+}
+
 inline float fp4(uint code) {
     uint mag = code & 7u;
     float v = mag < 2u ? float(mag) * 0.5f : float(as_type<half>(ushort((mag << 9) + 0x3800u)));
@@ -592,6 +677,92 @@ inline float4 fp4x4(uint bits) {
 }
 
 struct Expert { uint rows; uint cols; uint in_stride; uint out_stride; uint per_row_input; ulong expert_bytes; ulong scale_bytes; };
+
+kernel void expert_nvfp4_16(device const uchar* w [[buffer(0)]],
+                            device const uchar* sc [[buffer(1)]],
+                            device const float* amax [[buffer(2)]],
+                            device const float* denom [[buffer(3)]],
+                            device const half* x [[buffer(4)]],
+                            device const float* outer [[buffer(5)]],
+                            device const uint* ids [[buffer(6)]],
+                            device float* y [[buffer(7)]],
+                            constant Expert& p [[buffer(8)]],
+                            uint2 group [[threadgroup_position_in_grid]],
+                            uint simd [[simdgroup_index_in_threadgroup]],
+                            uint simds [[simdgroups_per_threadgroup]],
+                            uint lane [[thread_index_in_simdgroup]]) {
+    uint sub = lane >> 4;
+    uint sl = lane & 15u;
+    uint row = (group.x * simds + simd) * 2u + sub;
+    uint k = group.y;
+    if (row >= p.rows) return;
+    uint e = ids[k];
+    device const uint2* wr = (device const uint2*)(w + ulong(e) * p.expert_bytes + ulong(row) * (p.cols / 2u));
+    device const uchar* sr = sc + ulong(e) * p.scale_bytes + ulong(row) * (p.cols / 16u);
+    device const half4* x4 = (device const half4*)(x + (p.per_row_input ? k * p.in_stride : 0u));
+    float acc = 0.0f;
+    uint blocks = p.cols / 16u;
+    for (uint b = sl; b < blocks; b += 16u) {
+        uint2 pk = wr[b];
+        float s = e4m3_decode(sr[b]);
+        uint b4 = b * 4u;
+        float d = 0.0f;
+        { float4 q = float4(fp4x4_h(pk.x) * x4[b4]);            d += (q.x + q.y) + (q.z + q.w); }
+        { float4 q = float4(fp4x4_h(pk.x >> 16) * x4[b4 + 1u]); d += (q.x + q.y) + (q.z + q.w); }
+        { float4 q = float4(fp4x4_h(pk.y) * x4[b4 + 2u]);       d += (q.x + q.y) + (q.z + q.w); }
+        { float4 q = float4(fp4x4_h(pk.y >> 16) * x4[b4 + 3u]); d += (q.x + q.y) + (q.z + q.w); }
+        acc += d * s;
+    }
+    float total = simd16_sum(acc);
+    if (sl == 0u) {
+        float o = outer[p.per_row_input ? k : 0u];
+        float r = total * o * (amax[e] / denom[0]);
+        y[k * p.out_stride + row] = p.per_row_input ? rbf(r) : r;
+    }
+}
+
+kernel void expert_nvfp4_8(device const uchar* w [[buffer(0)]],
+                           device const uchar* sc [[buffer(1)]],
+                           device const float* amax [[buffer(2)]],
+                           device const float* denom [[buffer(3)]],
+                           device const half* x [[buffer(4)]],
+                           device const float* outer [[buffer(5)]],
+                           device const uint* ids [[buffer(6)]],
+                           device float* y [[buffer(7)]],
+                           constant Expert& p [[buffer(8)]],
+                           uint2 group [[threadgroup_position_in_grid]],
+                           uint simd [[simdgroup_index_in_threadgroup]],
+                           uint simds [[simdgroups_per_threadgroup]],
+                           uint lane [[thread_index_in_simdgroup]]) {
+    uint sub = lane >> 3;
+    uint sl = lane & 7u;
+    uint row = (group.x * simds + simd) * 4u + sub;
+    uint k = group.y;
+    if (row >= p.rows) return;
+    uint e = ids[k];
+    device const uint2* wr = (device const uint2*)(w + ulong(e) * p.expert_bytes + ulong(row) * (p.cols / 2u));
+    device const uchar* sr = sc + ulong(e) * p.scale_bytes + ulong(row) * (p.cols / 16u);
+    device const half4* x4 = (device const half4*)(x + (p.per_row_input ? k * p.in_stride : 0u));
+    float acc = 0.0f;
+    uint blocks = p.cols / 16u;
+    for (uint b = sl; b < blocks; b += 8u) {
+        uint2 pk = wr[b];
+        float s = e4m3_decode(sr[b]);
+        uint b4 = b * 4u;
+        float d = 0.0f;
+        { float4 q = float4(fp4x4_h(pk.x) * x4[b4]);            d += (q.x + q.y) + (q.z + q.w); }
+        { float4 q = float4(fp4x4_h(pk.x >> 16) * x4[b4 + 1u]); d += (q.x + q.y) + (q.z + q.w); }
+        { float4 q = float4(fp4x4_h(pk.y) * x4[b4 + 2u]);       d += (q.x + q.y) + (q.z + q.w); }
+        { float4 q = float4(fp4x4_h(pk.y >> 16) * x4[b4 + 3u]); d += (q.x + q.y) + (q.z + q.w); }
+        acc += d * s;
+    }
+    float total = simd8_sum(acc);
+    if (sl == 0u) {
+        float o = outer[p.per_row_input ? k : 0u];
+        float r = total * o * (amax[e] / denom[0]);
+        y[k * p.out_stride + row] = p.per_row_input ? rbf(r) : r;
+    }
+}
 
 kernel void expert_nvfp4(device const uchar* w [[buffer(0)]],
                          device const uchar* sc [[buffer(1)]],
@@ -633,6 +804,76 @@ kernel void expert_nvfp4(device const uchar* w [[buffer(0)]],
 
 inline float4 e4m3x4(uint word) {
     return float4(e4m3_decode(uchar(word)), e4m3_decode(uchar(word >> 8)), e4m3_decode(uchar(word >> 16)), e4m3_decode(uchar(word >> 24)));
+}
+
+kernel void expert_mxfp8_8(device const uchar* w [[buffer(0)]],
+                           device const uchar* sc [[buffer(1)]],
+                           device const float* x [[buffer(4)]],
+                           device const uint* ids [[buffer(6)]],
+                           device float* y [[buffer(7)]],
+                           constant Expert& p [[buffer(8)]],
+                           uint2 group [[threadgroup_position_in_grid]],
+                           uint simd [[simdgroup_index_in_threadgroup]],
+                           uint simds [[simdgroups_per_threadgroup]],
+                           uint lane [[thread_index_in_simdgroup]]) {
+    uint sub = lane >> 3;
+    uint sl = lane & 7u;
+    uint row = (group.x * simds + simd) * 4u + sub;
+    uint k = group.y;
+    if (row >= p.rows) return;
+    uint e = ids[k];
+    device const uint4* wr4 = (device const uint4*)(w + ulong(e) * p.expert_bytes + ulong(row) * p.cols);
+    device const uchar* sr = sc + ulong(e) * p.scale_bytes + ulong(row) * (p.cols / 32u);
+    device const float4* x4 = (device const float4*)(x + (p.per_row_input ? k * p.in_stride : 0u));
+    float acc = 0.0f;
+    uint blocks = p.cols / 32u;
+    for (uint b = sl; b < blocks; b += 8u) {
+        uint4 w0 = wr4[b * 2u];
+        uint4 w1 = wr4[b * 2u + 1u];
+        uint b8 = b * 8u;
+        float d = dot(e4m3x4(w0.x), x4[b8]) + dot(e4m3x4(w0.y), x4[b8 + 1u])
+                + dot(e4m3x4(w0.z), x4[b8 + 2u]) + dot(e4m3x4(w0.w), x4[b8 + 3u])
+                + dot(e4m3x4(w1.x), x4[b8 + 4u]) + dot(e4m3x4(w1.y), x4[b8 + 5u])
+                + dot(e4m3x4(w1.z), x4[b8 + 6u]) + dot(e4m3x4(w1.w), x4[b8 + 7u]);
+        acc += d * as_type<float>(uint(sr[b]) << 23);
+    }
+    float total = simd8_sum(acc);
+    if (sl == 0u) y[k * p.out_stride + row] = rbf(total);
+}
+
+kernel void expert_mxfp8_4(device const uchar* w [[buffer(0)]],
+                           device const uchar* sc [[buffer(1)]],
+                           device const float* x [[buffer(4)]],
+                           device const uint* ids [[buffer(6)]],
+                           device float* y [[buffer(7)]],
+                           constant Expert& p [[buffer(8)]],
+                           uint2 group [[threadgroup_position_in_grid]],
+                           uint simd [[simdgroup_index_in_threadgroup]],
+                           uint simds [[simdgroups_per_threadgroup]],
+                           uint lane [[thread_index_in_simdgroup]]) {
+    uint sub = lane >> 2;
+    uint sl = lane & 3u;
+    uint row = (group.x * simds + simd) * 8u + sub;
+    uint k = group.y;
+    if (row >= p.rows) return;
+    uint e = ids[k];
+    device const uint4* wr4 = (device const uint4*)(w + ulong(e) * p.expert_bytes + ulong(row) * p.cols);
+    device const uchar* sr = sc + ulong(e) * p.scale_bytes + ulong(row) * (p.cols / 32u);
+    device const float4* x4 = (device const float4*)(x + (p.per_row_input ? k * p.in_stride : 0u));
+    float acc = 0.0f;
+    uint blocks = p.cols / 32u;
+    for (uint b = sl; b < blocks; b += 4u) {
+        uint4 w0 = wr4[b * 2u];
+        uint4 w1 = wr4[b * 2u + 1u];
+        uint b8 = b * 8u;
+        float d = dot(e4m3x4(w0.x), x4[b8]) + dot(e4m3x4(w0.y), x4[b8 + 1u])
+                + dot(e4m3x4(w0.z), x4[b8 + 2u]) + dot(e4m3x4(w0.w), x4[b8 + 3u])
+                + dot(e4m3x4(w1.x), x4[b8 + 4u]) + dot(e4m3x4(w1.y), x4[b8 + 5u])
+                + dot(e4m3x4(w1.z), x4[b8 + 6u]) + dot(e4m3x4(w1.w), x4[b8 + 7u]);
+        acc += d * as_type<float>(uint(sr[b]) << 23);
+    }
+    float total = simd4_sum(acc);
+    if (sl == 0u) y[k * p.out_stride + row] = rbf(total);
 }
 
 kernel void expert_mxfp8(device const uchar* w [[buffer(0)]],
@@ -857,10 +1098,20 @@ inline float4 u4_hi(uint w) {
     return float4(float((w >> 16) & 15u), float((w >> 20) & 15u), float((w >> 24) & 15u), float((w >> 28) & 15u)) - 8.0f;
 }
 
+inline half4 u4_lo_h_fast(uint w) {
+    ushort4 u = ushort4(w & 15u, (w >> 4) & 15u, (w >> 8) & 15u, (w >> 12) & 15u) | ushort4(0x6400u);
+    return as_type<half4>(u) - half4(1032.0h);
+}
+
+inline half4 u4_hi_h_fast(uint w) {
+    ushort4 u = ushort4((w >> 16) & 15u, (w >> 20) & 15u, (w >> 24) & 15u, (w >> 28) & 15u) | ushort4(0x6400u);
+    return as_type<half4>(u) - half4(1032.0h);
+}
+
 kernel void build_cert_head(device const uint4* w [[buffer(0)]],
                             device uint4* q4 [[buffer(1)]],
                             device half* sc [[buffer(2)]],
-                            device float* err [[buffer(3)]],
+                            device float2* err [[buffer(3)]],
                             constant CertHead& p [[buffer(4)]],
                             uint group [[threadgroup_position_in_grid]],
                             uint simd [[simdgroup_index_in_threadgroup]],
@@ -871,6 +1122,7 @@ kernel void build_cert_head(device const uint4* w [[buffer(0)]],
     uint chunks = p.cols / 8u;
     device const uint4* wr = w + ulong(row) * chunks;
     float err2 = 0.0f;
+    float w2 = 0.0f;
     for (uint g = lane; g < p.ng; g += 32u) {
         float vals[32];
         float amax = 0.0f;
@@ -896,8 +1148,10 @@ kernel void build_cert_head(device const uint4* w [[buffer(0)]],
             for (uint j = 0; j < 8u; ++j) {
                 float v = vals[u * 8u + j];
                 int q = s > 0.0f ? clamp(int(rint(v * inv)), -7, 7) : 0;
-                float diff = v - float(q) * s;
+                float qv = float(q) * s;
+                float diff = v - qv;
                 err2 += diff * diff;
+                w2 += qv * qv;
                 word |= uint(q + 8) << (j * 4u);
             }
             packed[u] = word;
@@ -906,7 +1160,8 @@ kernel void build_cert_head(device const uint4* w [[buffer(0)]],
         sc[ulong(row) * p.ng + g] = sh;
     }
     float total = simd_sum(err2);
-    if (lane == 0) err[row] = precise::sqrt(total) * 1.001f + 1e-6f;
+    float total_w2 = simd_sum(w2);
+    if (lane == 0) err[row] = float2(precise::sqrt(total) * 1.002f, precise::sqrt(total_w2) * 1.002f);
 }
 
 kernel void cert_head_xnorm(device const float4* x [[buffer(0)]],
@@ -934,7 +1189,7 @@ kernel void cert_head_xnorm(device const float4* x [[buffer(0)]],
 
 kernel void cert_head_scan(device const uint4* q4 [[buffer(0)]],
                            device const half* sc [[buffer(1)]],
-                           device const float* err [[buffer(2)]],
+                           device const float2* err [[buffer(2)]],
                            device const float4* x4 [[buffer(3)]],
                            device const float* state [[buffer(4)]],
                            device float* ub_out [[buffer(5)]],
@@ -964,7 +1219,7 @@ kernel void cert_head_scan(device const uint4* q4 [[buffer(0)]],
         }
         float shat = simd_sum(acc);
         if (lane == 0) {
-            ub_out[row] = shat + state[2] * err[row];
+            ub_out[row] = shat + state[2] * err[row].x + 1e-4f;
             svals[simd] = shat;
             srows[simd] = row;
         }
