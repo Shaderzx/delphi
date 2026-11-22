@@ -16,7 +16,21 @@ std::optional<Gpu> open_gpu(std::string& error) {
     options.mathMode = MTLMathModeSafe;
     NSError* compile_error = nil;
     NSString* source = [[NSString alloc] initWithBytes:kernels_metal length:kernels_metal_len encoding:NSUTF8StringEncoding];
-    id<MTLLibrary> library = [device newLibraryWithSource:source options:options error:&compile_error];
+    id<MTLLibrary> library = nil;
+#if defined(__MAC_26_0)
+    if (@available(macOS 26.0, *)) {
+        options.languageVersion = MTLLanguageVersion4_0;
+        library = [device newLibraryWithSource:source options:options error:&compile_error];
+        if (!library) {
+            options = [MTLCompileOptions new];
+            options.mathMode = MTLMathModeSafe;
+            compile_error = nil;
+        }
+    }
+#endif
+    if (!library) {
+        library = [device newLibraryWithSource:source options:options error:&compile_error];
+    }
     if (!library) {
         error = std::string("shader compile: ") + compile_error.localizedDescription.UTF8String;
         return std::nullopt;

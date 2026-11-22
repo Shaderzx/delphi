@@ -94,7 +94,9 @@ float f(NSDictionary* d, NSString* k) { return [d[k] floatValue]; }
 
 class Engine {
 public:
-    static constexpr uint32_t MAX_BATCH = 16;
+    static constexpr uint32_t MAX_BATCH = 128;
+    static constexpr uint32_t MAX_LOGITS_BATCH = 32;
+    static constexpr uint32_t PERSIST_SLOTS = 64;
     enum LogitsMode { LOGITS_NONE = 0, LOGITS_LAST = 1, LOGITS_ALL = 2 };
 
     Gpu gpu;
@@ -105,31 +107,34 @@ public:
     Mat unembed_mat{};
     id<MTLBuffer> file = nil;
     id<MTLComputePipelineState> p_gemv, p_norm, p_res, p_sconv, p_clip, p_clip_kv, p_rel, p_attend, p_route;
-    id<MTLComputePipelineState> p_qnv4, p_qmxf8, p_env4, p_emxf8, p_swiglu, p_swiglu_qnv4, p_combine;
+    id<MTLComputePipelineState> p_qnv4, p_qmxf8, p_env4, p_env4_16, p_env4_8, p_emxf8, p_emxf8_8, p_emxf8_4, p_swiglu, p_swiglu_qnv4, p_swiglu_qmxf8, p_combine;
     id<MTLComputePipelineState> p_ctl_norm, p_ctl_mix_norm, p_embed, p_softcap, p_argmax, p_round;
     id<MTLComputePipelineState> p_ch_build, p_ch_xnorm, p_ch_scan, p_ch_tau, p_ch_filter, p_ch_setup, p_ch_rescore, p_ch_argmax;
     id<MTLComputePipelineState> p_bf12_hist, p_bf12_pack, p_gemv12;
     id<MTLComputePipelineState> p_embed_b, p_norm_b, p_res_b, p_ctl_norm_b, p_ctl_mix_b, p_sconv_b, p_conv_commit;
-    id<MTLComputePipelineState> p_clip_b, p_clip_kv_b, p_rel_b, p_attend_b, p_route_b, p_union, p_env4_g, p_emxf8_g, p_combine_b;
+    id<MTLComputePipelineState> p_clip_b, p_clip_kv_b, p_rel_b, p_attend_b, p_route_b, p_union, p_env4_g, p_emxf8_g, p_emxf8_g8, p_emxf8_g4, p_combine_b;
+    id<MTLComputePipelineState> p_env4_g1_16, p_env4_g1_8, p_env4_g24_16, p_env4_g24_8, p_env4_g5p_16, p_env4_g5p_8;
+    id<MTLComputePipelineState> p_f32_to_bf16 = nil, p_m4_bf12_mm32 = nil, p_bf12_outlier_patch = nil, p_m4_nvfp4_g5p = nil, p_m4_mxfp8_g5p = nil;
     id<MTLComputePipelineState> p_ch_xnorm_b, p_ch_tau_b, p_ch_filter_b, p_ch_setup_b, p_copy_tap;
-    std::array<id<MTLComputePipelineState>, 9> p_gemv12_rows, p_gemv16_rows, p_ch_scan_rows, p_gemv_q4_rows;
+    std::array<id<MTLComputePipelineState>, 9> p_gemv12_rows, p_gemv12_16_rows, p_gemv12_4_rows, p_gemv16_rows, p_ch_scan_rows, p_gemv_q4_rows;
     id<MTLComputePipelineState> p_mtp_w1_norms, p_mtp_pack_head, p_mtp_q4, p_mtp_fold, p_mtp_fold_b, p_mtp_mix, p_mtp_norm_h, p_mtp_ctx_kv, p_mtp_embed;
     id<MTLComputePipelineState> p_mtp_qk_rope, p_mtp_attn, p_mtp_add_norm, p_mtp_add, p_mtp_silu;
     id<MTLComputePipelineState> p_mtp_base7, p_mtp_rnn_in, p_mtp_rnn_gates, p_mtp_mscan, p_mtp_mred;
     std::array<id<MTLComputePipelineState>, 9> p_mtp_q4_rows;
     id<MTLBuffer> arena, queries, logits, token, scratch;
     id<MTLBuffer> head_q4 = nil, head_sc = nil, head_err = nil;
-    id<MTLBuffer> ch_ub = nil, ch_tg_val = nil, ch_tg_row = nil, ch_state = nil, ch_count = nil, ch_cands = nil, ch_indirect = nil;
+    id<MTLBuffer> ch_ub = nil, ch_tg_val = nil, ch_tg_row = nil, ch_state = nil, ch_count = nil, ch_cands = nil, ch_indirect = nil, ch_xh = nil;
     id<MTLBuffer> bf12_sm = nil, bf12_ex = nil, bf12_ro = nil, bf12_op = nil;
     id<MTLBuffer> lean_q4 = nil, lean_sc = nil;
     id<MTLBuffer> conv_buf = nil, conv_meta = nil;
-    id<MTLBuffer> u_exp = nil, u_cnt = nil, u_pairs = nil, u_ind_w13 = nil, u_ind_w2 = nil;
+    id<MTLBuffer> u_exp = nil, u_cnt = nil, u_off = nil, u_pairs = nil, u_bidx = nil, u_ind_w13 = nil, u_ind_w2 = nil, u_ind_b = nil;
     id<MTLBuffer> tap_buf = nil;
     bool cert_head_ready = false;
     bool cert_head_active = false;
     bool bf12_ready = false;
     bool lean_q4_ready = false;
     bool mtp_ready = false;
+    bool has_m4_mpp = false;
     uint32_t eff_top = 8;
     std::array<double, 9> cost_ms = {0.0, 21.6, 30.1, 35.8, 40.3, 47.9, 57.6, 63.4, 71.8};
     struct MtpQ4Mat { uint64_t q4_off = 0, sc_off = 0; uint32_t rows = 0, cols = 0; };
@@ -158,7 +163,7 @@ public:
     uint64_t s_qbundle, s_kbundle, s_vbundle;
     uint64_t s_q, s_qc, s_r, s_rc, s_gate, s_sinks, s_kraw, s_vraw, s_k, s_v, s_dynk, s_dynv, s_rel, s_gated;
     uint64_t s_router, s_ids, s_gammas, s_xq, s_outer, s_gu, s_h, s_hq, s_houter, s_rows;
-    uint64_t s_normed[3], s_ctlh[3], s_gf[3], s_gain[3], s_forget[3];
+    uint64_t s_normed[3], s_ctlh[3], s_gf[3], s_gain[3], s_forget[3], s_xbf16;
     std::vector<id<MTLBuffer>> kcache, vcache;
     std::vector<uint32_t> kv_cap, m_kv_cap;
     std::vector<std::array<uint64_t, 4>> conv_off;
@@ -166,7 +171,9 @@ public:
     uint32_t pending_conv_commit = 0;
     uint32_t max_context = 32768;
     uint32_t next_slot = 0;
-    uint32_t slots = 1024;
+    uint32_t tmp_slot = PERSIST_SLOTS;
+    uint32_t cur_batch = 1;
+    uint32_t slots = 96;
     std::vector<uint64_t> q_attn_off, q_mlp_off, q_loop_attn_off, q_loop_mlp_off;
     uint64_t q_output_off = 0;
     id<MTLComputeCommandEncoder> enc = nil;
@@ -255,9 +262,14 @@ public:
         p_qnv4 = pipeline(gpu, @"quant_nvfp4");
         p_qmxf8 = pipeline(gpu, @"quant_mxfp8");
         p_env4 = pipeline(gpu, @"expert_nvfp4");
+        p_env4_16 = pipeline(gpu, @"expert_nvfp4_16");
+        p_env4_8 = pipeline(gpu, @"expert_nvfp4_8");
         p_emxf8 = pipeline(gpu, @"expert_mxfp8");
+        p_emxf8_8 = pipeline(gpu, @"expert_mxfp8_8");
+        p_emxf8_4 = pipeline(gpu, @"expert_mxfp8_4");
         p_swiglu = pipeline(gpu, @"swiglu");
         p_swiglu_qnv4 = pipeline(gpu, @"swiglu_quant_nvfp4");
+        p_swiglu_qmxf8 = pipeline(gpu, @"swiglu_quant_mxfp8");
         p_combine = pipeline(gpu, @"combine");
         p_ctl_norm = pipeline(gpu, @"ctl_normed");
         p_ctl_mix_norm = pipeline(gpu, @"ctl_mix_norm");
@@ -290,8 +302,24 @@ public:
         p_route_b = pipeline(gpu, @"route_batch");
         p_union = pipeline(gpu, @"build_expert_union");
         p_env4_g = pipeline(gpu, @"expert_nvfp4_grouped");
+        p_env4_g1_16 = pipeline(gpu, @"expert_nvfp4_g1_16");
+        p_env4_g1_8 = pipeline(gpu, @"expert_nvfp4_g1_8");
+        p_env4_g24_16 = pipeline(gpu, @"expert_nvfp4_g24_16");
+        p_env4_g24_8 = pipeline(gpu, @"expert_nvfp4_g24_8");
+        p_env4_g5p_16 = pipeline(gpu, @"expert_nvfp4_g5p_16");
+        p_env4_g5p_8 = pipeline(gpu, @"expert_nvfp4_g5p_8");
         p_emxf8_g = pipeline(gpu, @"expert_mxfp8_grouped");
+        p_emxf8_g8 = pipeline(gpu, @"expert_mxfp8_grouped_8");
+        p_emxf8_g4 = pipeline(gpu, @"expert_mxfp8_grouped_4");
         p_combine_b = pipeline(gpu, @"combine_batch");
+        if ([gpu.library newFunctionWithName:@"m4_bf12_mm32"] != nil && !std::getenv("DELPHI_NO_M4")) {
+            p_f32_to_bf16 = pipeline(gpu, @"f32_to_bf16_rows");
+            p_m4_bf12_mm32 = pipeline(gpu, @"m4_bf12_mm32");
+            p_bf12_outlier_patch = pipeline(gpu, @"bf12_outlier_patch_rows");
+            p_m4_nvfp4_g5p = pipeline(gpu, @"m4_nvfp4_g5p");
+            p_m4_mxfp8_g5p = pipeline(gpu, @"m4_mxfp8_g5p");
+            has_m4_mpp = true;
+        }
         p_ch_xnorm_b = pipeline(gpu, @"cert_head_xnorm_batch");
         p_ch_tau_b = pipeline(gpu, @"cert_head_tau_batch");
         p_ch_filter_b = pipeline(gpu, @"cert_head_filter_batch");
@@ -318,6 +346,8 @@ public:
         p_mtp_mred = pipeline(gpu, @"mtp_markov_reduce");
         for (uint32_t r = 1; r <= 8; ++r) {
             p_gemv12_rows[r] = pipeline_for_rows(gpu, @"gemv_bf12_rows", r);
+            p_gemv12_16_rows[r] = pipeline_for_rows(gpu, @"gemv_bf12_16_rows", r);
+            p_gemv12_4_rows[r] = pipeline_for_rows(gpu, @"gemv_bf12_4_rows", r);
             p_gemv16_rows[r] = pipeline_for_rows(gpu, @"gemv_bf16_rows", r);
             p_ch_scan_rows[r] = pipeline_for_rows(gpu, @"cert_head_scan_rows", r);
             p_gemv_q4_rows[r] = pipeline_for_rows(gpu, @"gemv_q4_f32_rows", r);
@@ -329,14 +359,17 @@ public:
         if (!queries) { error = "queries allocation failed"; return false; }
         resolve_weights();
         logits = [gpu.device newBufferWithLength:uint64_t(c.padded_vocab) * 4 options:MTLResourceStorageModeShared];
-        token = [gpu.device newBufferWithLength:256 options:MTLResourceStorageModeShared];
+        token = [gpu.device newBufferWithLength:2048 options:MTLResourceStorageModeShared];
         u_exp = [gpu.device newBufferWithLength:128 * 4 options:MTLResourceStorageModePrivate];
         u_cnt = [gpu.device newBufferWithLength:128 * 4 options:MTLResourceStorageModePrivate];
-        u_pairs = [gpu.device newBufferWithLength:128 * MAX_BATCH * 4 options:MTLResourceStorageModePrivate];
+        u_off = [gpu.device newBufferWithLength:128 * 4 options:MTLResourceStorageModePrivate];
+        u_pairs = [gpu.device newBufferWithLength:uint64_t(MAX_BATCH) * c.top * 4 options:MTLResourceStorageModePrivate];
+        u_bidx = [gpu.device newBufferWithLength:384 * 4 options:MTLResourceStorageModePrivate];
         u_ind_w13 = [gpu.device newBufferWithLength:16 options:MTLResourceStorageModePrivate];
         u_ind_w2 = [gpu.device newBufferWithLength:16 options:MTLResourceStorageModePrivate];
+        u_ind_b = [gpu.device newBufferWithLength:24 * 4 options:MTLResourceStorageModePrivate];
         tap_buf = [gpu.device newBufferWithLength:uint64_t(MAX_BATCH) * 4 * c.hidden * 4 options:MTLResourceStorageModePrivate];
-        if (!logits || !token || !u_exp || !u_cnt || !u_pairs || !u_ind_w13 || !u_ind_w2 || !tap_buf) { error = "workspace allocation failed"; return false; }
+        if (!logits || !token || !u_exp || !u_cnt || !u_off || !u_pairs || !u_bidx || !u_ind_w13 || !u_ind_w2 || !u_ind_b || !tap_buf) { error = "workspace allocation failed"; return false; }
         uint32_t H = c.hidden, I = c.inter, K = c.top;
         uint64_t at = 0;
         auto slot_alloc = [&](uint64_t count) {
@@ -381,6 +414,7 @@ public:
             s_gain[k] = s_gf[k];
             s_forget[k] = s_gf[k] + uint64_t(H) * 4;
         }
+        s_xbf16 = slot_alloc(uint64_t(MAX_BATCH) * std::max<uint32_t>(2 * H, c.heads * c.head_dim));
         scratch = [gpu.device newBufferWithLength:at options:MTLResourceStorageModePrivate];
         if (!scratch) { error = "scratch allocation failed"; return false; }
         uint32_t visits = c.layers + (c.passes - 1) * (c.core_end - c.core_start);
@@ -943,14 +977,15 @@ public:
         head_q4 = [gpu.device newBufferWithLength:uint64_t(V) * ng * 16 options:MTLResourceStorageModePrivate];
         head_sc = [gpu.device newBufferWithLength:uint64_t(V) * ng * 2 options:MTLResourceStorageModePrivate];
         head_err = [gpu.device newBufferWithLength:uint64_t(V) * 4 options:MTLResourceStorageModePrivate];
-        ch_ub = [gpu.device newBufferWithLength:uint64_t(MAX_BATCH) * V * 4 options:MTLResourceStorageModePrivate];
-        ch_tg_val = [gpu.device newBufferWithLength:uint64_t(MAX_BATCH) * ntg * 4 options:MTLResourceStorageModePrivate];
-        ch_tg_row = [gpu.device newBufferWithLength:uint64_t(MAX_BATCH) * ntg * 4 options:MTLResourceStorageModePrivate];
-        ch_state = [gpu.device newBufferWithLength:uint64_t(MAX_BATCH) * 16 options:MTLResourceStorageModePrivate];
-        ch_count = [gpu.device newBufferWithLength:uint64_t(MAX_BATCH) * 4 options:MTLResourceStorageModeShared];
-        ch_cands = [gpu.device newBufferWithLength:uint64_t(MAX_BATCH) * V * 4 options:MTLResourceStorageModePrivate];
-        ch_indirect = [gpu.device newBufferWithLength:uint64_t(MAX_BATCH) * 16 options:MTLResourceStorageModePrivate];
-        if (!head_q4 || !head_sc || !head_err || !ch_ub || !ch_tg_val || !ch_tg_row || !ch_state || !ch_count || !ch_cands || !ch_indirect) {
+        ch_ub = [gpu.device newBufferWithLength:uint64_t(MAX_LOGITS_BATCH) * V * 4 options:MTLResourceStorageModePrivate];
+        ch_tg_val = [gpu.device newBufferWithLength:uint64_t(MAX_LOGITS_BATCH) * ntg * 4 options:MTLResourceStorageModePrivate];
+        ch_tg_row = [gpu.device newBufferWithLength:uint64_t(MAX_LOGITS_BATCH) * ntg * 4 options:MTLResourceStorageModePrivate];
+        ch_state = [gpu.device newBufferWithLength:uint64_t(MAX_LOGITS_BATCH) * 16 options:MTLResourceStorageModePrivate];
+        ch_count = [gpu.device newBufferWithLength:uint64_t(MAX_LOGITS_BATCH) * 4 options:MTLResourceStorageModeShared];
+        ch_cands = [gpu.device newBufferWithLength:uint64_t(MAX_LOGITS_BATCH) * V * 4 options:MTLResourceStorageModePrivate];
+        ch_indirect = [gpu.device newBufferWithLength:uint64_t(MAX_LOGITS_BATCH) * 16 options:MTLResourceStorageModePrivate];
+        ch_xh = [gpu.device newBufferWithLength:uint64_t(MAX_LOGITS_BATCH) * c.hidden * 2 options:MTLResourceStorageModePrivate];
+        if (!head_q4 || !head_sc || !head_err || !ch_ub || !ch_tg_val || !ch_tg_row || !ch_state || !ch_count || !ch_cands || !ch_indirect || !ch_xh) {
             error = "certified head allocation failed";
             return false;
         }
@@ -1078,8 +1113,9 @@ public:
         queries = [gpu.device newBufferWithBytes:all.data() length:all.size() * 4 options:MTLResourceStorageModeShared];
     }
 
-    uint64_t so(uint32_t slot) const { return uint64_t(slot) * MAX_BATCH * c.hidden * 4; }
+    uint64_t so(uint32_t slot) const { return uint64_t(slot) * cur_batch * c.hidden * 4; }
     uint32_t alloc() { return next_slot++; }
+    uint32_t alloc_tmp() { return tmp_slot++; }
 
     void barrier() { if (!together) [enc memoryBarrierWithScope:MTLBarrierScopeBuffers]; }
     void grid(NSUInteger groups, NSUInteger threads) { barrier(); [enc dispatchThreadgroups:MTLSizeMake(groups, 1, 1) threadsPerThreadgroup:MTLSizeMake(threads, 1, 1)]; }
@@ -1135,8 +1171,53 @@ public:
         grid((g.rows + 7) / 8, 256);
     }
 
+    struct CastBf16PP { uint32_t M, M_pad, K, x_stride; };
+    struct M4Bf12PP { uint32_t M, M_pad, N, K, round_out, has_outliers; uint32_t elut[16]; };
+    struct OutlierPatchPP { uint32_t M, N, x_stride, y_stride, round_out; };
+
     void gemv12_m(const Mat12& m, id<MTLBuffer> in_buf, uint64_t in_off, uint32_t x_stride, id<MTLBuffer> out_buf, uint64_t out_off, uint32_t y_stride, uint32_t M, bool round_out = true) {
-        if (M == 1) {
+        if (M >= 32 && has_m4_mpp && y_stride == m.rows && (m.cols % 32u) == 0u) {
+            uint32_t m_pad = (M + 31u) / 32u * 32u;
+            CastBf16PP cp{M, m_pad, m.cols, x_stride};
+            [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+            [enc setComputePipelineState:p_f32_to_bf16];
+            [enc setBuffer:in_buf offset:in_off atIndex:0];
+            [enc setBuffer:scratch offset:s_xbf16 atIndex:1];
+            [enc setBytes:&cp length:sizeof(cp) atIndex:2];
+            [enc dispatchThreadgroups:MTLSizeMake((m.cols + 255) / 256, m_pad, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+            [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+            M4Bf12PP mp{};
+            mp.M = M;
+            mp.M_pad = m_pad;
+            mp.N = m.rows;
+            mp.K = m.cols;
+            mp.round_out = round_out ? 1u : 0u;
+            mp.has_outliers = m.has_outliers;
+            std::memcpy(mp.elut, m.elut, sizeof(mp.elut));
+            [enc setComputePipelineState:p_m4_bf12_mm32];
+            [enc setBuffer:bf12_sm offset:m.sm_off atIndex:0];
+            [enc setBuffer:bf12_ex offset:m.ex_off atIndex:1];
+            [enc setBuffer:scratch offset:s_xbf16 atIndex:2];
+            [enc setBuffer:out_buf offset:out_off atIndex:3];
+            [enc setBytes:&mp length:sizeof(mp) atIndex:4];
+            [enc dispatchThreadgroups:MTLSizeMake((m.rows + 63) / 64, m_pad / 32u, 1) threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+            if (m.has_outliers) {
+                [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+                OutlierPatchPP op{M, m.rows, x_stride, y_stride, round_out ? 1u : 0u};
+                [enc setComputePipelineState:p_bf12_outlier_patch];
+                [enc setBuffer:bf12_ro offset:m.ro_off atIndex:0];
+                [enc setBuffer:bf12_op offset:m.op_off atIndex:1];
+                [enc setBuffer:in_buf offset:in_off atIndex:2];
+                [enc setBuffer:out_buf offset:out_off atIndex:3];
+                [enc setBytes:&op length:sizeof(op) atIndex:4];
+                [enc dispatchThreadgroups:MTLSizeMake((m.rows + 255) / 256, M, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+            }
+            return;
+        }
+        uint32_t chunks16 = m.cols / 16u;
+        bool use_4 = (chunks16 == 4u);
+        bool use_16 = (!use_4) && ((chunks16 % 16u) == 0u);
+        if (M == 1 && !use_4 && !use_16) {
             gemv12_ab(m, in_buf, in_off, out_buf, out_off, round_out);
             return;
         }
@@ -1150,7 +1231,8 @@ public:
             g.x_stride = x_stride;
             g.y_stride = y_stride;
             std::memcpy(g.elut, m.elut, sizeof(g.elut));
-            [enc setComputePipelineState:p_gemv12_rows[mb]];
+            id<MTLComputePipelineState> ps = use_4 ? p_gemv12_4_rows[mb] : (use_16 ? p_gemv12_16_rows[mb] : p_gemv12_rows[mb]);
+            [enc setComputePipelineState:ps];
             [enc setBuffer:bf12_sm offset:m.sm_off atIndex:0];
             [enc setBuffer:bf12_ex offset:m.ex_off atIndex:1];
             [enc setBuffer:bf12_ro offset:m.ro_off atIndex:2];
@@ -1158,7 +1240,15 @@ public:
             [enc setBuffer:in_buf offset:in_off + uint64_t(m0) * x_stride * 4 atIndex:4];
             [enc setBuffer:out_buf offset:out_off + uint64_t(m0) * y_stride * 4 atIndex:5];
             [enc setBytes:&g length:sizeof(g) atIndex:6];
-            grid((g.rows + 7) / 8, 256);
+            if (use_4) {
+                grid((g.rows + 31) / 32, 128);
+            } else if (use_16) {
+                uint32_t tpg = g.rows <= 128 ? 64u : 256u;
+                uint32_t rptg = tpg / 16u;
+                grid((g.rows + rptg - 1) / rptg, tpg);
+            } else {
+                grid((g.rows + 7) / 8, 256);
+            }
         }
     }
 
@@ -1179,8 +1269,8 @@ public:
     }
 
     struct NormP { uint32_t n, has_weight; float eps; };
-    uint32_t norm(uint32_t in, uint64_t weight_off, uint32_t M) {
-        uint32_t out = alloc();
+    uint32_t norm(uint32_t in, uint64_t weight_off, uint32_t M, bool persist = false) {
+        uint32_t out = persist ? alloc() : alloc_tmp();
         NormP p{c.hidden, 1, 1e-6f};
         [enc setComputePipelineState:M == 1 ? p_norm : p_norm_b];
         [enc setBuffer:arena offset:so(in) atIndex:0];
@@ -1196,15 +1286,15 @@ public:
         ResP p{};
         p.n = c.hidden;
         p.sources = uint32_t(sources.size());
-        p.addend = addend >= 0 ? int32_t(addend * MAX_BATCH * c.hidden) : -1;
+        p.addend = addend >= 0 ? int32_t(addend * cur_batch * c.hidden) : -1;
         p.queries = nq;
         p.normalize = 1;
         p.has_norm = norm_offs ? 1u : 0u;
-        for (size_t i = 0; i < sources.size(); ++i) p.offs[i] = sources[i] * MAX_BATCH * c.hidden;
+        for (size_t i = 0; i < sources.size(); ++i) p.offs[i] = sources[i] * cur_batch * c.hidden;
         std::vector<uint32_t> outs;
         for (uint32_t k = 0; k < nq; ++k) {
-            outs.push_back(alloc());
-            p.outs[k] = outs.back() * MAX_BATCH * c.hidden;
+            outs.push_back(alloc_tmp());
+            p.outs[k] = outs.back() * cur_batch * c.hidden;
             if (norm_offs) p.norm_offs[k] = norm_offs[k];
         }
         [enc setComputePipelineState:M == 1 ? p_res : p_res_b];
@@ -1258,7 +1348,7 @@ public:
         std::array<uint32_t, 3> outs;
         CtlMixBP cmp{n, gfs};
         for (int k = 0; k < 3; ++k) {
-            outs[k] = alloc();
+            outs[k] = alloc_tmp();
             [enc setComputePipelineState:M == 1 ? p_ctl_mix_norm : p_ctl_mix_b];
             [enc setBuffer:arena offset:so(dests[k]) atIndex:0];
             [enc setBuffer:arena offset:so(msgs[k]) atIndex:1];
@@ -1297,7 +1387,7 @@ public:
             gemv16_m(w.ctl[3].forget, scratch, s_ctlh[0], 64, scratch, s_forget[0], gfs, M, false);
             together = false;
         }
-        uint32_t out = alloc();
+        uint32_t out = alloc_tmp();
         CtlMixBP cmp{n, gfs};
         [enc setComputePipelineState:M == 1 ? p_ctl_mix_norm : p_ctl_mix_b];
         [enc setBuffer:arena offset:so(dest) atIndex:0];
@@ -1322,7 +1412,8 @@ public:
         [enc setBuffer:scratch offset:dynoff atIndex:3];
         [enc setBuffer:yb offset:yoff atIndex:4];
         [enc setBytes:&p length:sizeof(p) atIndex:5];
-        grid((channels + 255) / 256, 256);
+        uint32_t tpg = channels <= 512 ? 64u : 128u;
+        grid((channels + tpg - 1) / tpg, tpg);
     }
 
     void conv_commit_encode(uint32_t commit) {
@@ -1432,7 +1523,7 @@ public:
             [enc setBytes:&a length:sizeof(a) atIndex:6];
             grid2(c.heads, (M + 3) / 4, 128);
         }
-        uint32_t out = alloc();
+        uint32_t out = alloc_tmp();
         if (lean_q4_ready) gemv_q4_m(w.wo4, scratch, s_gated, qdim, arena, so(out), H, M);
         else if (bf12_ready) gemv12_m(w.wo12, scratch, s_gated, qdim, arena, so(out), H, M);
         else gemv16_m(w.wo, scratch, s_gated, qdim, arena, so(out), H, M);
@@ -1440,9 +1531,9 @@ public:
     }
 
     struct RouteP { uint32_t experts, top; float scale; };
-    struct UnionPP { uint32_t rows, top, experts, w13_groups, w2_groups; };
+    struct UnionPP { uint32_t rows, top, experts, w13_groups, w2_groups, w13_g5p, w2_g5p; };
     struct ExpertP { uint32_t rows, cols, in_stride, out_stride, per_row_input; uint32_t pad; uint64_t expert_bytes, scale_bytes; };
-    struct ExpertGP { uint32_t rows, cols, in_stride, out_stride, per_row_input, top; uint64_t expert_bytes, scale_bytes; };
+    struct ExpertGP { uint32_t rows, cols, in_stride, out_stride, per_row_input, top, skip_5p, pad; uint64_t expert_bytes, scale_bytes; };
     struct SwigluP { uint32_t inter, top; float gate_cap, up_cap; uint32_t round_out; };
 
     void experts(const LayerWeights& w, uint32_t x, uint32_t M) {
@@ -1474,22 +1565,37 @@ public:
         [enc setBuffer:scratch offset:s_gammas atIndex:3];
         [enc setBytes:&rp length:sizeof(rp) atIndex:4];
         grid(M, 32);
+        bool fast_w13 = w.nvfp4 ? (((H / 16u) % 16u) == 0u) : (((H / 32u) % 8u) == 0u);
+        bool fast_w2 = w.nvfp4 ? (((I / 16u) % 8u) == 0u) : (((I / 32u) % 4u) == 0u);
         if (M > 1) {
-            UnionPP up{M, eff_top, c.experts, (2 * I + 7) / 8, (H + 7) / 8};
+            uint32_t w13_g = fast_w13 ? (2 * I + 15) / 16 : (2 * I + 7) / 8;
+            uint32_t w2_g = fast_w2 ? (H + 15) / 16 : (H + 7) / 8;
+            uint32_t w13_g5p = (M >= 32 && has_m4_mpp) ? (2 * I + 63) / 64 : w13_g;
+            uint32_t w2_g5p = (M >= 32 && has_m4_mpp) ? (H + 63) / 64 : w2_g;
+            UnionPP up{M, eff_top, c.experts, w13_g, w2_g, w13_g5p, w2_g5p};
             [enc setComputePipelineState:p_union];
             [enc setBuffer:scratch offset:s_ids atIndex:0];
             [enc setBuffer:u_exp offset:0 atIndex:1];
             [enc setBuffer:u_cnt offset:0 atIndex:2];
-            [enc setBuffer:u_pairs offset:0 atIndex:3];
-            [enc setBuffer:u_ind_w13 offset:0 atIndex:4];
-            [enc setBuffer:u_ind_w2 offset:0 atIndex:5];
-            [enc setBytes:&up length:sizeof(up) atIndex:6];
+            [enc setBuffer:u_off offset:0 atIndex:3];
+            [enc setBuffer:u_pairs offset:0 atIndex:4];
+            [enc setBuffer:u_bidx offset:0 atIndex:5];
+            [enc setBuffer:u_ind_w13 offset:0 atIndex:6];
+            [enc setBuffer:u_ind_w2 offset:0 atIndex:7];
+            [enc setBuffer:u_ind_b offset:0 atIndex:8];
+            [enc setBytes:&up length:sizeof(up) atIndex:9];
             grid(1, 128);
         }
         auto run_expert = [&](bool is_w2, uint32_t rows, uint32_t cols, uint64_t in_off, uint64_t outer_off, uint64_t out_off, bool per_row) {
+            bool fast = is_w2 ? fast_w2 : fast_w13;
+            uint32_t tpg = 256u;
+            if (fast) tpg = w.nvfp4 ? (is_w2 ? 128u : 256u) : (is_w2 ? 64u : 128u);
             if (M == 1) {
                 ExpertP p{rows, cols, per_row ? I : 0u, per_row ? H : 2 * I, per_row ? 1u : 0u, 0, is_w2 ? w.w2_eb : w.w13_eb, is_w2 ? w.w2_sb : w.w13_sb};
-                [enc setComputePipelineState:w.nvfp4 ? p_env4 : p_emxf8];
+                id<MTLComputePipelineState> ps = w.nvfp4
+                    ? (fast ? (is_w2 ? p_env4_8 : p_env4_16) : p_env4)
+                    : (fast ? (is_w2 ? p_emxf8_4 : p_emxf8_8) : p_emxf8);
+                [enc setComputePipelineState:ps];
                 [enc setBuffer:file offset:is_w2 ? w.w2_w : w.w13_w atIndex:0];
                 [enc setBuffer:file offset:is_w2 ? w.w2_s : w.w13_s atIndex:1];
                 if (w.nvfp4) {
@@ -1501,10 +1607,94 @@ public:
                 [enc setBuffer:scratch offset:s_ids atIndex:6];
                 [enc setBuffer:scratch offset:out_off atIndex:7];
                 [enc setBytes:&p length:sizeof(p) atIndex:8];
-                grid2((rows + 7) / 8, eff_top, 256);
+                uint32_t rptg = fast ? 16u : 8u;
+                grid2((rows + rptg - 1) / rptg, eff_top, tpg);
+            } else if (w.nvfp4 && fast) {
+                ExpertGP p{rows, cols, per_row ? I : H, per_row ? H : 2 * I, per_row ? 1u : 0u, eff_top, 0u, 0u, is_w2 ? w.w2_eb : w.w13_eb, is_w2 ? w.w2_sb : w.w13_sb};
+                uint64_t ibase = is_w2 ? 48 : 0;
+                barrier();
+                [enc setComputePipelineState:is_w2 ? p_env4_g1_8 : p_env4_g1_16];
+                [enc setBuffer:file offset:is_w2 ? w.w2_w : w.w13_w atIndex:0];
+                [enc setBuffer:file offset:is_w2 ? w.w2_s : w.w13_s atIndex:1];
+                [enc setBuffer:file offset:is_w2 ? w.w2_amax : w.w13_amax atIndex:2];
+                [enc setBuffer:file offset:is_w2 ? w.w2_denom : w.w13_denom atIndex:3];
+                [enc setBuffer:scratch offset:in_off atIndex:4];
+                [enc setBuffer:scratch offset:outer_off atIndex:5];
+                [enc setBuffer:u_exp offset:0 atIndex:6];
+                [enc setBuffer:u_off offset:0 atIndex:7];
+                [enc setBuffer:u_pairs offset:0 atIndex:8];
+                [enc setBuffer:u_bidx offset:0 atIndex:9];
+                [enc setBuffer:u_ind_b offset:ibase atIndex:10];
+                [enc setBuffer:scratch offset:out_off atIndex:11];
+                [enc setBytes:&p length:sizeof(p) atIndex:12];
+                [enc dispatchThreadgroupsWithIndirectBuffer:u_ind_b indirectBufferOffset:ibase threadsPerThreadgroup:MTLSizeMake(tpg, 1, 1)];
+                [enc setComputePipelineState:is_w2 ? p_env4_g24_8 : p_env4_g24_16];
+                [enc setBuffer:file offset:is_w2 ? w.w2_w : w.w13_w atIndex:0];
+                [enc setBuffer:file offset:is_w2 ? w.w2_s : w.w13_s atIndex:1];
+                [enc setBuffer:file offset:is_w2 ? w.w2_amax : w.w13_amax atIndex:2];
+                [enc setBuffer:file offset:is_w2 ? w.w2_denom : w.w13_denom atIndex:3];
+                [enc setBuffer:scratch offset:in_off atIndex:4];
+                [enc setBuffer:scratch offset:outer_off atIndex:5];
+                [enc setBuffer:u_exp offset:0 atIndex:6];
+                [enc setBuffer:u_cnt offset:0 atIndex:7];
+                [enc setBuffer:u_off offset:0 atIndex:8];
+                [enc setBuffer:u_pairs offset:0 atIndex:9];
+                [enc setBuffer:u_bidx offset:128 * 4 atIndex:10];
+                [enc setBuffer:u_ind_b offset:ibase + 16 atIndex:11];
+                [enc setBuffer:scratch offset:out_off atIndex:12];
+                [enc setBytes:&p length:sizeof(p) atIndex:13];
+                [enc dispatchThreadgroupsWithIndirectBuffer:u_ind_b indirectBufferOffset:ibase + 16 threadsPerThreadgroup:MTLSizeMake(tpg, 1, 1)];
+                bool use_m4_g5p = (M >= 32 && has_m4_mpp);
+                [enc setComputePipelineState:use_m4_g5p ? p_m4_nvfp4_g5p : (is_w2 ? p_env4_g5p_8 : p_env4_g5p_16)];
+                [enc setBuffer:file offset:is_w2 ? w.w2_w : w.w13_w atIndex:0];
+                [enc setBuffer:file offset:is_w2 ? w.w2_s : w.w13_s atIndex:1];
+                [enc setBuffer:file offset:is_w2 ? w.w2_amax : w.w13_amax atIndex:2];
+                [enc setBuffer:file offset:is_w2 ? w.w2_denom : w.w13_denom atIndex:3];
+                [enc setBuffer:scratch offset:in_off atIndex:4];
+                [enc setBuffer:scratch offset:outer_off atIndex:5];
+                [enc setBuffer:u_exp offset:0 atIndex:6];
+                [enc setBuffer:u_cnt offset:0 atIndex:7];
+                [enc setBuffer:u_off offset:0 atIndex:8];
+                [enc setBuffer:u_pairs offset:0 atIndex:9];
+                [enc setBuffer:u_bidx offset:256 * 4 atIndex:10];
+                [enc setBuffer:u_ind_b offset:ibase + 32 atIndex:11];
+                [enc setBuffer:scratch offset:out_off atIndex:12];
+                [enc setBytes:&p length:sizeof(p) atIndex:13];
+                [enc dispatchThreadgroupsWithIndirectBuffer:u_ind_b indirectBufferOffset:ibase + 32 threadsPerThreadgroup:MTLSizeMake(use_m4_g5p ? 128 : tpg, 1, 1)];
+            } else if (!w.nvfp4 && fast && M >= 32 && has_m4_mpp) {
+                ExpertGP p{rows, cols, per_row ? I : H, per_row ? H : 2 * I, per_row ? 1u : 0u, eff_top, 1u, 0u, is_w2 ? w.w2_eb : w.w13_eb, is_w2 ? w.w2_sb : w.w13_sb};
+                uint64_t ibase = is_w2 ? 48 : 0;
+                barrier();
+                [enc setComputePipelineState:is_w2 ? p_emxf8_g4 : p_emxf8_g8];
+                [enc setBuffer:file offset:is_w2 ? w.w2_w : w.w13_w atIndex:0];
+                [enc setBuffer:file offset:is_w2 ? w.w2_s : w.w13_s atIndex:1];
+                [enc setBuffer:scratch offset:in_off atIndex:4];
+                [enc setBuffer:u_exp offset:0 atIndex:6];
+                [enc setBuffer:u_cnt offset:0 atIndex:7];
+                [enc setBuffer:u_off offset:0 atIndex:11];
+                [enc setBuffer:u_pairs offset:0 atIndex:8];
+                [enc setBuffer:scratch offset:out_off atIndex:9];
+                [enc setBytes:&p length:sizeof(p) atIndex:10];
+                [enc dispatchThreadgroupsWithIndirectBuffer:(is_w2 ? u_ind_w2 : u_ind_w13) indirectBufferOffset:0 threadsPerThreadgroup:MTLSizeMake(tpg, 1, 1)];
+                [enc setComputePipelineState:p_m4_mxfp8_g5p];
+                [enc setBuffer:file offset:is_w2 ? w.w2_w : w.w13_w atIndex:0];
+                [enc setBuffer:file offset:is_w2 ? w.w2_s : w.w13_s atIndex:1];
+                [enc setBuffer:scratch offset:in_off atIndex:4];
+                [enc setBuffer:u_exp offset:0 atIndex:6];
+                [enc setBuffer:u_cnt offset:0 atIndex:7];
+                [enc setBuffer:u_off offset:0 atIndex:8];
+                [enc setBuffer:u_pairs offset:0 atIndex:9];
+                [enc setBuffer:u_bidx offset:256 * 4 atIndex:10];
+                [enc setBuffer:u_ind_b offset:ibase + 32 atIndex:11];
+                [enc setBuffer:scratch offset:out_off atIndex:12];
+                [enc setBytes:&p length:sizeof(p) atIndex:13];
+                [enc dispatchThreadgroupsWithIndirectBuffer:u_ind_b indirectBufferOffset:ibase + 32 threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
             } else {
-                ExpertGP p{rows, cols, per_row ? I : H, per_row ? H : 2 * I, per_row ? 1u : 0u, eff_top, is_w2 ? w.w2_eb : w.w13_eb, is_w2 ? w.w2_sb : w.w13_sb};
-                [enc setComputePipelineState:w.nvfp4 ? p_env4_g : p_emxf8_g];
+                ExpertGP p{rows, cols, per_row ? I : H, per_row ? H : 2 * I, per_row ? 1u : 0u, eff_top, 0u, 0u, is_w2 ? w.w2_eb : w.w13_eb, is_w2 ? w.w2_sb : w.w13_sb};
+                id<MTLComputePipelineState> ps = w.nvfp4
+                    ? p_env4_g
+                    : (fast ? (is_w2 ? p_emxf8_g4 : p_emxf8_g8) : p_emxf8_g);
+                [enc setComputePipelineState:ps];
                 [enc setBuffer:file offset:is_w2 ? w.w2_w : w.w13_w atIndex:0];
                 [enc setBuffer:file offset:is_w2 ? w.w2_s : w.w13_s atIndex:1];
                 if (w.nvfp4) {
@@ -1515,11 +1705,12 @@ public:
                 [enc setBuffer:scratch offset:in_off atIndex:4];
                 [enc setBuffer:u_exp offset:0 atIndex:6];
                 [enc setBuffer:u_cnt offset:0 atIndex:7];
+                [enc setBuffer:u_off offset:0 atIndex:11];
                 [enc setBuffer:u_pairs offset:0 atIndex:8];
                 [enc setBuffer:scratch offset:out_off atIndex:9];
                 [enc setBytes:&p length:sizeof(p) atIndex:10];
                 barrier();
-                [enc dispatchThreadgroupsWithIndirectBuffer:(is_w2 ? u_ind_w2 : u_ind_w13) indirectBufferOffset:0 threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+                [enc dispatchThreadgroupsWithIndirectBuffer:(is_w2 ? u_ind_w2 : u_ind_w13) indirectBufferOffset:0 threadsPerThreadgroup:MTLSizeMake(tpg, 1, 1)];
             }
         };
         run_expert(false, 2 * I, H, s_xq, s_outer, s_gu, false);
@@ -1534,22 +1725,12 @@ public:
             [enc setBytes:&sp length:sizeof(sp) atIndex:4];
             grid(total_k, 128);
         } else {
-            uint32_t n = total_k * 2 * I;
-            [enc setComputePipelineState:p_round];
-            [enc setBuffer:scratch offset:s_gu atIndex:0];
-            [enc setBytes:&n length:4 atIndex:1];
-            grid((n + 255) / 256, 256);
             SwigluP sp{I, total_k, c.gate_cap, c.up_cap, 0u};
-            [enc setComputePipelineState:p_swiglu];
+            [enc setComputePipelineState:p_swiglu_qmxf8];
             [enc setBuffer:scratch offset:s_gu atIndex:0];
             [enc setBuffer:scratch offset:s_gammas atIndex:1];
-            [enc setBuffer:scratch offset:s_h atIndex:2];
+            [enc setBuffer:scratch offset:s_hq atIndex:2];
             [enc setBytes:&sp length:sizeof(sp) atIndex:3];
-            grid2((I + 255) / 256, total_k, 256);
-            [enc setComputePipelineState:p_qmxf8];
-            [enc setBuffer:scratch offset:s_h atIndex:0];
-            [enc setBuffer:scratch offset:s_hq atIndex:1];
-            [enc setBytes:&I length:4 atIndex:2];
             grid2((I / 32 + 63) / 64, total_k, 64);
         }
         run_expert(true, H, I, s_hq, s_houter, s_rows, true);
@@ -1568,6 +1749,7 @@ public:
     }
 
     std::pair<std::vector<uint32_t>, uint32_t> layer(std::vector<uint32_t> blocks, uint32_t partial, uint32_t layer_idx, uint32_t pass, const std::vector<uint32_t>& bank, uint32_t pos0, uint32_t M, bool capture_taps) {
+        tmp_slot = PERSIST_SLOTS;
         if (capture_taps) {
             if (pass == 0 && layer_idx == 5) copy_tap(partial, 0, M);
             else if (pass == 1 && layer_idx == 11) copy_tap(partial, 1, M);
@@ -1614,7 +1796,7 @@ public:
             }
         }
         uint32_t att = attention(w, visit, sq, sk, sv, pos0, M);
-        uint32_t attc = alloc();
+        uint32_t attc = alloc_tmp();
         sconv_run(arena, so(att), conv_off[visit][2], w.attn_sconv, s_dynk, arena, so(attc), c.hidden, false, M, c.hidden, 0, c.hidden);
         bool boundary = layer_idx % c.block == 0;
         std::vector<uint32_t> src = blocks;
@@ -1645,7 +1827,7 @@ public:
         [enc setBuffer:file offset:w.mlp_sconv atIndex:5];
         [enc setBuffer:arena offset:so(out) atIndex:6];
         [enc setBytes:&cp length:sizeof(cp) atIndex:7];
-        grid((c.hidden + 255) / 256, 256);
+        grid((c.hidden + 127) / 128, 128);
         if (boundary) blocks.push_back(partial);
         return {blocks, out};
     }
@@ -1658,25 +1840,26 @@ public:
         if (cert_head_active && !full_logits) {
             uint32_t V = c.vocab;
             uint32_t ng = c.hidden / 32;
-            uint32_t ntg = (V + 7) / 8;
-            CertHeadP chp{V, c.hidden, ng, c.softcap};
+            uint32_t ntg = (V + 31) / 32;
+            CertHeadBP chb{V, c.hidden, ng, ntg, 0, c.softcap};
             CertTauP ctp{ntg, c.hidden, c.softcap};
-            [enc setComputePipelineState:p_ch_xnorm];
+            [enc setComputePipelineState:p_ch_xnorm_b];
             [enc setBuffer:arena offset:hidden_off atIndex:0];
             [enc setBuffer:ch_state offset:0 atIndex:1];
             [enc setBuffer:ch_count offset:0 atIndex:2];
-            [enc setBytes:&H length:4 atIndex:3];
+            [enc setBuffer:ch_xh offset:0 atIndex:3];
+            [enc setBytes:&H length:4 atIndex:4];
             grid(1, 576);
-            [enc setComputePipelineState:p_ch_scan];
+            [enc setComputePipelineState:p_ch_scan_rows[1]];
             [enc setBuffer:head_q4 offset:0 atIndex:0];
             [enc setBuffer:head_sc offset:0 atIndex:1];
             [enc setBuffer:head_err offset:0 atIndex:2];
-            [enc setBuffer:arena offset:hidden_off atIndex:3];
+            [enc setBuffer:ch_xh offset:0 atIndex:3];
             [enc setBuffer:ch_state offset:0 atIndex:4];
             [enc setBuffer:ch_ub offset:0 atIndex:5];
             [enc setBuffer:ch_tg_val offset:0 atIndex:6];
             [enc setBuffer:ch_tg_row offset:0 atIndex:7];
-            [enc setBytes:&chp length:sizeof(chp) atIndex:8];
+            [enc setBytes:&chb length:sizeof(chb) atIndex:8];
             grid(ntg, 256);
             [enc setComputePipelineState:p_ch_tau];
             [enc setBuffer:ch_tg_val offset:0 atIndex:0];
@@ -1732,24 +1915,25 @@ public:
         if (lmode == LOGITS_NONE) return;
         uint32_t H = c.hidden;
         if (lmode == LOGITS_LAST) {
-            run_head_single(so(hidden) + uint64_t(M - 1) * H * 4, 16 * 4, full_logits);
+            run_head_single(so(hidden) + uint64_t(M - 1) * H * 4, 128 * 4, full_logits);
             return;
         }
         if (M == 1 || full_logits || !cert_head_active) {
             for (uint32_t m = 0; m < M; ++m) {
-                run_head_single(so(hidden) + uint64_t(m) * H * 4, (16 + m) * 4, full_logits);
+                run_head_single(so(hidden) + uint64_t(m) * H * 4, (128 + m) * 4, full_logits);
             }
             return;
         }
         uint32_t V = c.vocab;
         uint32_t ng = c.hidden / 32;
-        uint32_t ntg = (V + 7) / 8;
+        uint32_t ntg = (V + 31) / 32;
         CertTauP ctp{ntg, c.hidden, c.softcap};
         [enc setComputePipelineState:p_ch_xnorm_b];
         [enc setBuffer:arena offset:so(hidden) atIndex:0];
         [enc setBuffer:ch_state offset:0 atIndex:1];
         [enc setBuffer:ch_count offset:0 atIndex:2];
-        [enc setBytes:&H length:4 atIndex:3];
+        [enc setBuffer:ch_xh offset:0 atIndex:3];
+        [enc setBytes:&H length:4 atIndex:4];
         grid(M, 576);
         for (uint32_t m0 = 0; m0 < M; m0 += 8) {
             uint32_t mb = std::min<uint32_t>(8, M - m0);
@@ -1758,7 +1942,7 @@ public:
             [enc setBuffer:head_q4 offset:0 atIndex:0];
             [enc setBuffer:head_sc offset:0 atIndex:1];
             [enc setBuffer:head_err offset:0 atIndex:2];
-            [enc setBuffer:arena offset:so(hidden) atIndex:3];
+            [enc setBuffer:ch_xh offset:0 atIndex:3];
             [enc setBuffer:ch_state offset:0 atIndex:4];
             [enc setBuffer:ch_ub offset:0 atIndex:5];
             [enc setBuffer:ch_tg_val offset:0 atIndex:6];
@@ -1806,7 +1990,7 @@ public:
             [enc setBuffer:ch_tg_val offset:uint64_t(m) * ntg * 4 atIndex:0];
             [enc setBuffer:ch_tg_row offset:uint64_t(m) * ntg * 4 atIndex:1];
             [enc setBuffer:ch_indirect offset:uint64_t(m) * 16 atIndex:2];
-            [enc setBuffer:token offset:uint64_t(16 + m) * 4 atIndex:3];
+            [enc setBuffer:token offset:uint64_t(128 + m) * 4 atIndex:3];
             grid(1, 256);
         }
         together = false;
@@ -1814,6 +1998,8 @@ public:
 
     double step_rows(const uint32_t* toks, uint32_t pos0, uint32_t M, LogitsMode lmode, bool auto_commit = true, bool full_logits = false, bool capture_taps = false, uint32_t ingest_pos = 0, uint32_t ingest_commit = 0) {
         next_slot = 0;
+        tmp_slot = PERSIST_SLOTS;
+        cur_batch = M;
         std::memcpy(token.contents, toks, M * 4);
         id<MTLCommandBuffer> cb = [gpu.queue commandBuffer];
         enc = [cb computeCommandEncoderWithDispatchType:MTLDispatchTypeConcurrent];
@@ -1842,7 +2028,7 @@ public:
             [enc setBytes:&ep length:sizeof(ep) atIndex:3];
             grid2((H + 255) / 256, M, 256);
         }
-        uint32_t x = norm(emb, embed_norm_off, M);
+        uint32_t x = norm(emb, embed_norm_off, M, true);
         std::vector<uint32_t> blocks;
         uint32_t partial = x;
         for (uint32_t l = 0; l < c.core_start; ++l) std::tie(blocks, partial) = layer(blocks, partial, l, 0, {}, pos0, M, capture_taps);
@@ -1860,6 +2046,7 @@ public:
         }
         for (uint32_t l = c.core_end; l < c.layers; ++l) std::tie(blocks, partial) = layer(blocks, partial, l, 0, {}, pos0, M, capture_taps);
         if (lmode != LOGITS_NONE || capture_taps) {
+            tmp_slot = PERSIST_SLOTS;
             std::vector<uint32_t> src = blocks;
             src.push_back(partial);
             uint64_t final_noffs[3] = {final_norm_off, 0, 0};
@@ -1870,7 +2057,7 @@ public:
         if (auto_commit) conv_commit_encode(M);
         [enc endEncoding];
         double seconds = gpu_seconds(cb);
-        if (next_slot > slots) { std::fprintf(stderr, "delphi: arena overflow %u\n", next_slot); std::exit(3); }
+        if (next_slot > PERSIST_SLOTS || tmp_slot > slots) { std::fprintf(stderr, "delphi: arena overflow %u/%u\n", next_slot, tmp_slot); std::exit(3); }
         return seconds;
     }
 
@@ -2090,7 +2277,7 @@ public:
     const uint32_t* mtp_draft_ids() const { return static_cast<const uint32_t*>(m_out.contents) + 1; }
     const float* mtp_draft_probs() const { return reinterpret_cast<const float*>(static_cast<const char*>(m_out.contents) + 32); }
 
-    uint32_t chosen_at(uint32_t m) const { return static_cast<const uint32_t*>(token.contents)[16 + m]; }
+    uint32_t chosen_at(uint32_t m) const { return static_cast<const uint32_t*>(token.contents)[128 + m]; }
     uint32_t chosen() const { return chosen_at(0); }
 
     std::vector<std::pair<float, uint32_t>> top5() const {
@@ -2179,7 +2366,7 @@ DecodeStats run_decode_pass(Engine& engine, const std::vector<uint32_t>& ids, ui
     auto w0 = std::chrono::steady_clock::now();
     if (use_batch_prefill && (ids.size() > 1 || use_mtp)) {
         for (size_t i = 0; i < ids.size(); ) {
-            uint32_t chunk = uint32_t(std::min<size_t>(8, ids.size() - i));
+            uint32_t chunk = uint32_t(std::min<size_t>(Engine::MAX_BATCH, ids.size() - i));
             bool is_last = (i + chunk == ids.size());
             engine.step_rows(ids.data() + i, pos, chunk, is_last ? Engine::LOGITS_LAST : Engine::LOGITS_NONE, true, logprobs, use_mtp);
             if (use_mtp) engine.mtp_ingest_ctx(pos, chunk, is_last);
@@ -2222,7 +2409,7 @@ DecodeStats run_decode_pass(Engine& engine, const std::vector<uint32_t>& ids, ui
         last_was_mtp = false;
         last_exp_acc = 0.0;
         if (use_spec && rem > 1 && ctx_room > 1) {
-            uint32_t max_k = uint32_t(std::min<uint64_t>({uint64_t(Engine::MAX_BATCH - 1), rem - 1, uint64_t(ctx_room - 1)}));
+            uint32_t max_k = uint32_t(std::min<uint64_t>({15ull, rem - 1, uint64_t(ctx_room - 1)}));
             if (spec == "lookup" || spec == "auto") draft = lookup_draft(history, max_k);
             if (draft.empty() && use_mtp) {
                 if (mtp_cooldown > 0) {

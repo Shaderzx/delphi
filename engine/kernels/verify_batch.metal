@@ -304,6 +304,206 @@ inline float4 bf12_dec4(uint smw, uint ex16, constant uint* elut) {
 
 struct Gemv12B { uint rows; uint cols; uint round_out; uint has_outliers; uint x_stride; uint y_stride; uint elut[16]; };
 
+kernel void gemv_bf12_16_rows(device const uint4* sm_buf [[buffer(0)]],
+                              device const uint2* ex_buf [[buffer(1)]],
+                              device const uint* ro_buf [[buffer(2)]],
+                              device const uint* op_buf [[buffer(3)]],
+                              device const float4* x4 [[buffer(4)]],
+                              device float* y [[buffer(5)]],
+                              constant Gemv12B& g [[buffer(6)]],
+                              uint group [[threadgroup_position_in_grid]],
+                              uint simd [[simdgroup_index_in_threadgroup]],
+                              uint simds [[simdgroups_per_threadgroup]],
+                              uint lane [[thread_index_in_simdgroup]]) {
+    uint sub = lane >> 4;
+    uint sl = lane & 15u;
+    uint row = (group * simds + simd) * 2u + sub;
+    if (row >= g.rows) return;
+    uint chunks16 = g.cols / 16u;
+    uint xs4 = g.x_stride / 4u;
+    device const uint4* smr = sm_buf + ulong(row) * chunks16;
+    device const uint2* exr = ex_buf + ulong(row) * chunks16;
+    float a0 = 0, a1 = 0, a2 = 0, a3 = 0, a4 = 0, a5 = 0, a6 = 0, a7 = 0;
+    for (uint c = sl; c < chunks16; c += 16u) {
+        uint4 sm = smr[c];
+        uint2 ex = exr[c];
+        uint c4 = c * 4u;
+        {
+            float4 w = bf12_dec4(sm.x, ex.x & 0xffffu, g.elut);
+            if (ROWS > 0u) a0 += dot(w, x4[0ul * xs4 + c4]);
+            if (ROWS > 1u) a1 += dot(w, x4[1ul * xs4 + c4]);
+            if (ROWS > 2u) a2 += dot(w, x4[2ul * xs4 + c4]);
+            if (ROWS > 3u) a3 += dot(w, x4[3ul * xs4 + c4]);
+            if (ROWS > 4u) a4 += dot(w, x4[4ul * xs4 + c4]);
+            if (ROWS > 5u) a5 += dot(w, x4[5ul * xs4 + c4]);
+            if (ROWS > 6u) a6 += dot(w, x4[6ul * xs4 + c4]);
+            if (ROWS > 7u) a7 += dot(w, x4[7ul * xs4 + c4]);
+        }
+        {
+            float4 w = bf12_dec4(sm.y, ex.x >> 16, g.elut);
+            uint k = c4 + 1u;
+            if (ROWS > 0u) a0 += dot(w, x4[0ul * xs4 + k]);
+            if (ROWS > 1u) a1 += dot(w, x4[1ul * xs4 + k]);
+            if (ROWS > 2u) a2 += dot(w, x4[2ul * xs4 + k]);
+            if (ROWS > 3u) a3 += dot(w, x4[3ul * xs4 + k]);
+            if (ROWS > 4u) a4 += dot(w, x4[4ul * xs4 + k]);
+            if (ROWS > 5u) a5 += dot(w, x4[5ul * xs4 + k]);
+            if (ROWS > 6u) a6 += dot(w, x4[6ul * xs4 + k]);
+            if (ROWS > 7u) a7 += dot(w, x4[7ul * xs4 + k]);
+        }
+        {
+            float4 w = bf12_dec4(sm.z, ex.y & 0xffffu, g.elut);
+            uint k = c4 + 2u;
+            if (ROWS > 0u) a0 += dot(w, x4[0ul * xs4 + k]);
+            if (ROWS > 1u) a1 += dot(w, x4[1ul * xs4 + k]);
+            if (ROWS > 2u) a2 += dot(w, x4[2ul * xs4 + k]);
+            if (ROWS > 3u) a3 += dot(w, x4[3ul * xs4 + k]);
+            if (ROWS > 4u) a4 += dot(w, x4[4ul * xs4 + k]);
+            if (ROWS > 5u) a5 += dot(w, x4[5ul * xs4 + k]);
+            if (ROWS > 6u) a6 += dot(w, x4[6ul * xs4 + k]);
+            if (ROWS > 7u) a7 += dot(w, x4[7ul * xs4 + k]);
+        }
+        {
+            float4 w = bf12_dec4(sm.w, ex.y >> 16, g.elut);
+            uint k = c4 + 3u;
+            if (ROWS > 0u) a0 += dot(w, x4[0ul * xs4 + k]);
+            if (ROWS > 1u) a1 += dot(w, x4[1ul * xs4 + k]);
+            if (ROWS > 2u) a2 += dot(w, x4[2ul * xs4 + k]);
+            if (ROWS > 3u) a3 += dot(w, x4[3ul * xs4 + k]);
+            if (ROWS > 4u) a4 += dot(w, x4[4ul * xs4 + k]);
+            if (ROWS > 5u) a5 += dot(w, x4[5ul * xs4 + k]);
+            if (ROWS > 6u) a6 += dot(w, x4[6ul * xs4 + k]);
+            if (ROWS > 7u) a7 += dot(w, x4[7ul * xs4 + k]);
+        }
+    }
+    if (g.has_outliers) {
+        uint s = ro_buf[row];
+        uint e = ro_buf[row + 1u];
+        device const float* xf = (device const float*)x4;
+        for (uint j = s + sl; j < e; j += 16u) {
+            uint pk = op_buf[j];
+            float wv = bfv(ushort(pk & 0xffffu));
+            uint col = pk >> 16;
+            if (ROWS > 0u) a0 += wv * xf[0ul * g.x_stride + col];
+            if (ROWS > 1u) a1 += wv * xf[1ul * g.x_stride + col];
+            if (ROWS > 2u) a2 += wv * xf[2ul * g.x_stride + col];
+            if (ROWS > 3u) a3 += wv * xf[3ul * g.x_stride + col];
+            if (ROWS > 4u) a4 += wv * xf[4ul * g.x_stride + col];
+            if (ROWS > 5u) a5 += wv * xf[5ul * g.x_stride + col];
+            if (ROWS > 6u) a6 += wv * xf[6ul * g.x_stride + col];
+            if (ROWS > 7u) a7 += wv * xf[7ul * g.x_stride + col];
+        }
+    }
+    if (ROWS > 0u) { float t = simd16_sum(a0); if (sl == 0u) y[0ul * g.y_stride + row] = g.round_out ? rbf(t) : t; }
+    if (ROWS > 1u) { float t = simd16_sum(a1); if (sl == 0u) y[1ul * g.y_stride + row] = g.round_out ? rbf(t) : t; }
+    if (ROWS > 2u) { float t = simd16_sum(a2); if (sl == 0u) y[2ul * g.y_stride + row] = g.round_out ? rbf(t) : t; }
+    if (ROWS > 3u) { float t = simd16_sum(a3); if (sl == 0u) y[3ul * g.y_stride + row] = g.round_out ? rbf(t) : t; }
+    if (ROWS > 4u) { float t = simd16_sum(a4); if (sl == 0u) y[4ul * g.y_stride + row] = g.round_out ? rbf(t) : t; }
+    if (ROWS > 5u) { float t = simd16_sum(a5); if (sl == 0u) y[5ul * g.y_stride + row] = g.round_out ? rbf(t) : t; }
+    if (ROWS > 6u) { float t = simd16_sum(a6); if (sl == 0u) y[6ul * g.y_stride + row] = g.round_out ? rbf(t) : t; }
+    if (ROWS > 7u) { float t = simd16_sum(a7); if (sl == 0u) y[7ul * g.y_stride + row] = g.round_out ? rbf(t) : t; }
+}
+
+kernel void gemv_bf12_4_rows(device const uint4* sm_buf [[buffer(0)]],
+                             device const uint2* ex_buf [[buffer(1)]],
+                             device const uint* ro_buf [[buffer(2)]],
+                             device const uint* op_buf [[buffer(3)]],
+                             device const float4* x4 [[buffer(4)]],
+                             device float* y [[buffer(5)]],
+                             constant Gemv12B& g [[buffer(6)]],
+                             uint group [[threadgroup_position_in_grid]],
+                             uint simd [[simdgroup_index_in_threadgroup]],
+                             uint simds [[simdgroups_per_threadgroup]],
+                             uint lane [[thread_index_in_simdgroup]]) {
+    uint sub = lane >> 2;
+    uint sl = lane & 3u;
+    uint row = (group * simds + simd) * 8u + sub;
+    if (row >= g.rows) return;
+    uint chunks16 = g.cols / 16u;
+    uint xs4 = g.x_stride / 4u;
+    device const uint4* smr = sm_buf + ulong(row) * chunks16;
+    device const uint2* exr = ex_buf + ulong(row) * chunks16;
+    float a0 = 0, a1 = 0, a2 = 0, a3 = 0, a4 = 0, a5 = 0, a6 = 0, a7 = 0;
+    for (uint c = sl; c < chunks16; c += 4u) {
+        uint4 sm = smr[c];
+        uint2 ex = exr[c];
+        uint c4 = c * 4u;
+        {
+            float4 w = bf12_dec4(sm.x, ex.x & 0xffffu, g.elut);
+            if (ROWS > 0u) a0 += dot(w, x4[0ul * xs4 + c4]);
+            if (ROWS > 1u) a1 += dot(w, x4[1ul * xs4 + c4]);
+            if (ROWS > 2u) a2 += dot(w, x4[2ul * xs4 + c4]);
+            if (ROWS > 3u) a3 += dot(w, x4[3ul * xs4 + c4]);
+            if (ROWS > 4u) a4 += dot(w, x4[4ul * xs4 + c4]);
+            if (ROWS > 5u) a5 += dot(w, x4[5ul * xs4 + c4]);
+            if (ROWS > 6u) a6 += dot(w, x4[6ul * xs4 + c4]);
+            if (ROWS > 7u) a7 += dot(w, x4[7ul * xs4 + c4]);
+        }
+        {
+            float4 w = bf12_dec4(sm.y, ex.x >> 16, g.elut);
+            uint k = c4 + 1u;
+            if (ROWS > 0u) a0 += dot(w, x4[0ul * xs4 + k]);
+            if (ROWS > 1u) a1 += dot(w, x4[1ul * xs4 + k]);
+            if (ROWS > 2u) a2 += dot(w, x4[2ul * xs4 + k]);
+            if (ROWS > 3u) a3 += dot(w, x4[3ul * xs4 + k]);
+            if (ROWS > 4u) a4 += dot(w, x4[4ul * xs4 + k]);
+            if (ROWS > 5u) a5 += dot(w, x4[5ul * xs4 + k]);
+            if (ROWS > 6u) a6 += dot(w, x4[6ul * xs4 + k]);
+            if (ROWS > 7u) a7 += dot(w, x4[7ul * xs4 + k]);
+        }
+        {
+            float4 w = bf12_dec4(sm.z, ex.y & 0xffffu, g.elut);
+            uint k = c4 + 2u;
+            if (ROWS > 0u) a0 += dot(w, x4[0ul * xs4 + k]);
+            if (ROWS > 1u) a1 += dot(w, x4[1ul * xs4 + k]);
+            if (ROWS > 2u) a2 += dot(w, x4[2ul * xs4 + k]);
+            if (ROWS > 3u) a3 += dot(w, x4[3ul * xs4 + k]);
+            if (ROWS > 4u) a4 += dot(w, x4[4ul * xs4 + k]);
+            if (ROWS > 5u) a5 += dot(w, x4[5ul * xs4 + k]);
+            if (ROWS > 6u) a6 += dot(w, x4[6ul * xs4 + k]);
+            if (ROWS > 7u) a7 += dot(w, x4[7ul * xs4 + k]);
+        }
+        {
+            float4 w = bf12_dec4(sm.w, ex.y >> 16, g.elut);
+            uint k = c4 + 3u;
+            if (ROWS > 0u) a0 += dot(w, x4[0ul * xs4 + k]);
+            if (ROWS > 1u) a1 += dot(w, x4[1ul * xs4 + k]);
+            if (ROWS > 2u) a2 += dot(w, x4[2ul * xs4 + k]);
+            if (ROWS > 3u) a3 += dot(w, x4[3ul * xs4 + k]);
+            if (ROWS > 4u) a4 += dot(w, x4[4ul * xs4 + k]);
+            if (ROWS > 5u) a5 += dot(w, x4[5ul * xs4 + k]);
+            if (ROWS > 6u) a6 += dot(w, x4[6ul * xs4 + k]);
+            if (ROWS > 7u) a7 += dot(w, x4[7ul * xs4 + k]);
+        }
+    }
+    if (g.has_outliers) {
+        uint s = ro_buf[row];
+        uint e = ro_buf[row + 1u];
+        device const float* xf = (device const float*)x4;
+        for (uint j = s + sl; j < e; j += 4u) {
+            uint pk = op_buf[j];
+            float wv = bfv(ushort(pk & 0xffffu));
+            uint col = pk >> 16;
+            if (ROWS > 0u) a0 += wv * xf[0ul * g.x_stride + col];
+            if (ROWS > 1u) a1 += wv * xf[1ul * g.x_stride + col];
+            if (ROWS > 2u) a2 += wv * xf[2ul * g.x_stride + col];
+            if (ROWS > 3u) a3 += wv * xf[3ul * g.x_stride + col];
+            if (ROWS > 4u) a4 += wv * xf[4ul * g.x_stride + col];
+            if (ROWS > 5u) a5 += wv * xf[5ul * g.x_stride + col];
+            if (ROWS > 6u) a6 += wv * xf[6ul * g.x_stride + col];
+            if (ROWS > 7u) a7 += wv * xf[7ul * g.x_stride + col];
+        }
+    }
+    if (ROWS > 0u) { float t = simd4_sum(a0); if (sl == 0u) y[0ul * g.y_stride + row] = g.round_out ? rbf(t) : t; }
+    if (ROWS > 1u) { float t = simd4_sum(a1); if (sl == 0u) y[1ul * g.y_stride + row] = g.round_out ? rbf(t) : t; }
+    if (ROWS > 2u) { float t = simd4_sum(a2); if (sl == 0u) y[2ul * g.y_stride + row] = g.round_out ? rbf(t) : t; }
+    if (ROWS > 3u) { float t = simd4_sum(a3); if (sl == 0u) y[3ul * g.y_stride + row] = g.round_out ? rbf(t) : t; }
+    if (ROWS > 4u) { float t = simd4_sum(a4); if (sl == 0u) y[4ul * g.y_stride + row] = g.round_out ? rbf(t) : t; }
+    if (ROWS > 5u) { float t = simd4_sum(a5); if (sl == 0u) y[5ul * g.y_stride + row] = g.round_out ? rbf(t) : t; }
+    if (ROWS > 6u) { float t = simd4_sum(a6); if (sl == 0u) y[6ul * g.y_stride + row] = g.round_out ? rbf(t) : t; }
+    if (ROWS > 7u) { float t = simd4_sum(a7); if (sl == 0u) y[7ul * g.y_stride + row] = g.round_out ? rbf(t) : t; }
+}
+
 kernel void gemv_bf12_rows(device const uint4* sm_buf [[buffer(0)]],
                            device const uint2* ex_buf [[buffer(1)]],
                            device const uint* ro_buf [[buffer(2)]],
@@ -725,199 +925,311 @@ kernel void route_batch(device const float* logits [[buffer(0)]],
     }
 }
 
-struct UnionP { uint rows; uint top; uint experts; uint w13_groups; uint w2_groups; };
+struct UnionP { uint rows; uint top; uint experts; uint w13_groups; uint w2_groups; uint w13_g5p; uint w2_g5p; };
 
 kernel void build_expert_union(device const uint* ids [[buffer(0)]],
                                device uint* u_exp [[buffer(1)]],
                                device uint* u_cnt [[buffer(2)]],
-                               device uint* u_pairs [[buffer(3)]],
-                               device uint* ind_w13 [[buffer(4)]],
-                               device uint* ind_w2 [[buffer(5)]],
-                               constant UnionP& p [[buffer(6)]],
+                               device uint* u_off [[buffer(3)]],
+                               device uint* u_pairs [[buffer(4)]],
+                               device uint* u_bidx [[buffer(5)]],
+                               device uint* ind_w13 [[buffer(6)]],
+                               device uint* ind_w2 [[buffer(7)]],
+                               device uint* ind_b [[buffer(8)]],
+                               constant UnionP& p [[buffer(9)]],
                                uint tid [[thread_position_in_threadgroup]],
                                uint lane [[thread_index_in_simdgroup]],
                                uint simd [[simdgroup_index_in_threadgroup]]) {
-    threadgroup uint all_ids[128];
-    threadgroup uint stot[4];
+    threadgroup uint all_ids[1024];
+    threadgroup uint stot_u[4];
+    threadgroup uint stot_o[4];
+    threadgroup uint stot_b1[4];
+    threadgroup uint stot_b24[4];
+    threadgroup uint stot_b5p[4];
     uint total_mk = p.rows * p.top;
-    if (tid < total_mk) all_ids[tid] = ids[tid];
+    for (uint i = tid; i < total_mk; i += 128u) all_ids[i] = ids[i];
     threadgroup_barrier(mem_flags::mem_threadgroup);
     uint cnt = 0u;
-    uint pairs[16];
     if (tid < p.experts) {
         for (uint mk = 0; mk < total_mk; ++mk) {
-            if (all_ids[mk] == tid) pairs[cnt++] = mk;
+            if (all_ids[mk] == tid) cnt++;
         }
     }
     uint active = cnt > 0u ? 1u : 0u;
-    uint lrank = simd_prefix_exclusive_sum(active);
-    uint ssum = simd_sum(active);
-    if (lane == 0) stot[simd] = ssum;
+    uint is_b1 = cnt == 1u ? 1u : 0u;
+    uint is_b24 = (cnt >= 2u && cnt <= 4u) ? 1u : 0u;
+    uint is_b5p = cnt >= 5u ? 1u : 0u;
+    uint lr_u = simd_prefix_exclusive_sum(active);
+    uint lr_o = simd_prefix_exclusive_sum(cnt);
+    uint lr_b1 = simd_prefix_exclusive_sum(is_b1);
+    uint lr_b24 = simd_prefix_exclusive_sum(is_b24);
+    uint lr_b5p = simd_prefix_exclusive_sum(is_b5p);
+    uint su = simd_sum(active);
+    uint so = simd_sum(cnt);
+    uint sb1 = simd_sum(is_b1);
+    uint sb24 = simd_sum(is_b24);
+    uint sb5p = simd_sum(is_b5p);
+    if (lane == 0u) {
+        stot_u[simd] = su;
+        stot_o[simd] = so;
+        stot_b1[simd] = sb1;
+        stot_b24[simd] = sb24;
+        stot_b5p[simd] = sb5p;
+    }
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    uint base = 0u;
-    for (uint s = 0; s < simd; ++s) base += stot[s];
-    uint u = base + lrank;
+    uint bu = 0u, bo = 0u, bb1 = 0u, bb24 = 0u, bb5p = 0u;
+    for (uint s = 0; s < simd; ++s) {
+        bu += stot_u[s];
+        bo += stot_o[s];
+        bb1 += stot_b1[s];
+        bb24 += stot_b24[s];
+        bb5p += stot_b5p[s];
+    }
+    uint u = bu + lr_u;
+    uint off = bo + lr_o;
     if (active) {
         u_exp[u] = tid;
         u_cnt[u] = cnt;
-        for (uint j = 0; j < cnt; ++j) u_pairs[u * 16u + j] = pairs[j];
+        u_off[u] = off;
+        uint w = off;
+        for (uint mk = 0; mk < total_mk; ++mk) {
+            if (all_ids[mk] == tid) u_pairs[w++] = mk;
+        }
+        if (is_b1) u_bidx[bb1 + lr_b1] = u;
+        else if (is_b24) u_bidx[128u + bb24 + lr_b24] = u;
+        else u_bidx[256u + bb5p + lr_b5p] = u;
     }
-    if (tid == 0) {
-        uint total_u = stot[0] + stot[1] + stot[2] + stot[3];
-        ind_w13[0] = p.w13_groups;
-        ind_w13[1] = max(total_u, 1u);
-        ind_w13[2] = 1u;
-        ind_w2[0] = p.w2_groups;
-        ind_w2[1] = max(total_u, 1u);
-        ind_w2[2] = 1u;
+    if (tid == 0u) {
+        uint total_u = stot_u[0] + stot_u[1] + stot_u[2] + stot_u[3];
+        uint n1 = stot_b1[0] + stot_b1[1] + stot_b1[2] + stot_b1[3];
+        uint n24 = stot_b24[0] + stot_b24[1] + stot_b24[2] + stot_b24[3];
+        uint n5p = stot_b5p[0] + stot_b5p[1] + stot_b5p[2] + stot_b5p[3];
+        ind_w13[0] = p.w13_groups; ind_w13[1] = max(total_u, 1u); ind_w13[2] = 1u; ind_w13[3] = total_u;
+        ind_w2[0] = p.w2_groups;   ind_w2[1] = max(total_u, 1u);  ind_w2[2] = 1u;  ind_w2[3] = total_u;
+        ind_b[0]  = p.w13_groups; ind_b[1]  = max(n1, 1u);  ind_b[2]  = 1u; ind_b[3]  = n1;
+        ind_b[4]  = p.w13_groups; ind_b[5]  = max(n24, 1u); ind_b[6]  = 1u; ind_b[7]  = n24;
+        ind_b[8]  = p.w13_g5p;    ind_b[9]  = max(n5p, 1u); ind_b[10] = 1u; ind_b[11] = n5p;
+        ind_b[12] = p.w2_groups;  ind_b[13] = max(n1, 1u);  ind_b[14] = 1u; ind_b[15] = n1;
+        ind_b[16] = p.w2_groups;  ind_b[17] = max(n24, 1u); ind_b[18] = 1u; ind_b[19] = n24;
+        ind_b[20] = p.w2_g5p;     ind_b[21] = max(n5p, 1u); ind_b[22] = 1u; ind_b[23] = n5p;
     }
 }
 
-struct ExpertG { uint rows; uint cols; uint in_stride; uint out_stride; uint per_row_input; uint top; ulong expert_bytes; ulong scale_bytes; };
+struct ExpertG { uint rows; uint cols; uint in_stride; uint out_stride; uint per_row_input; uint top; uint skip_5p; uint pad; ulong expert_bytes; ulong scale_bytes; };
 
-kernel void expert_nvfp4_grouped(device const uchar* w [[buffer(0)]],
-                                 device const uchar* sc [[buffer(1)]],
-                                 device const float* amax [[buffer(2)]],
-                                 device const float* denom [[buffer(3)]],
-                                 device const half* x [[buffer(4)]],
-                                 device const float* outer [[buffer(5)]],
-                                 device const uint* u_exp [[buffer(6)]],
-                                 device const uint* u_cnt [[buffer(7)]],
-                                 device const uint* u_pairs [[buffer(8)]],
-                                 device float* y [[buffer(9)]],
-                                 constant ExpertG& p [[buffer(10)]],
-                                 uint2 group [[threadgroup_position_in_grid]],
-                                 uint simd [[simdgroup_index_in_threadgroup]],
-                                 uint simds [[simdgroups_per_threadgroup]],
-                                 uint lane [[thread_index_in_simdgroup]]) {
-    uint row = group.x * simds + simd;
-    uint u = group.y;
-    if (row >= p.rows) return;
+inline void nvfp4_g1_body(device const uchar* w, device const uchar* sc, device const float* amax,
+                          device const float* denom, device const half* x, device const float* outer,
+                          device const uint* u_exp, device const uint* u_off, device const uint* u_pairs,
+                          device const uint* u_bidx, device const uint* ind_slot,
+                          device float* y, constant ExpertG& p, uint row, uint bi, uint sl, uint stride_lanes) {
+    if (row >= p.rows || bi >= ind_slot[3]) return;
+    uint u = u_bidx[bi];
+    uint e = u_exp[u];
+    uint mk0 = u_pairs[u_off[u]];
+    uint i0 = p.per_row_input ? mk0 : (mk0 / p.top);
+    device const uint2* wr = (device const uint2*)(w + ulong(e) * p.expert_bytes + ulong(row) * (p.cols / 2u));
+    device const uchar* sr = sc + ulong(e) * p.scale_bytes + ulong(row) * (p.cols / 16u);
+    device const half4* x0 = (device const half4*)x + ulong(i0) * (p.in_stride / 4u);
+    uint blocks = p.cols / 16u;
+    float a0 = 0.0f;
+    for (uint b = sl; b < blocks; b += stride_lanes) {
+        uint2 pk = wr[b];
+        float s = e4m3_decode(sr[b]);
+        uint b4 = b * 4u;
+        float d = 0.0f;
+        { float4 q = float4(fp4x4_h(pk.x) * x0[b4]);            d += (q.x + q.y) + (q.z + q.w); }
+        { float4 q = float4(fp4x4_h(pk.x >> 16) * x0[b4 + 1u]); d += (q.x + q.y) + (q.z + q.w); }
+        { float4 q = float4(fp4x4_h(pk.y) * x0[b4 + 2u]);       d += (q.x + q.y) + (q.z + q.w); }
+        { float4 q = float4(fp4x4_h(pk.y >> 16) * x0[b4 + 3u]); d += (q.x + q.y) + (q.z + q.w); }
+        a0 += d * s;
+    }
+    float t0 = stride_lanes == 16u ? simd16_sum(a0) : simd8_sum(a0);
+    if (sl == 0u) {
+        float r = t0 * outer[i0] * (amax[e] / denom[0]);
+        y[ulong(mk0) * p.out_stride + row] = p.per_row_input ? rbf(r) : r;
+    }
+}
+
+kernel void expert_nvfp4_g1_16(device const uchar* w [[buffer(0)]], device const uchar* sc [[buffer(1)]],
+                               device const float* amax [[buffer(2)]], device const float* denom [[buffer(3)]],
+                               device const half* x [[buffer(4)]], device const float* outer [[buffer(5)]],
+                               device const uint* u_exp [[buffer(6)]], device const uint* u_off [[buffer(7)]],
+                               device const uint* u_pairs [[buffer(8)]], device const uint* u_bidx [[buffer(9)]],
+                               device const uint* ind_slot [[buffer(10)]], device float* y [[buffer(11)]],
+                               constant ExpertG& p [[buffer(12)]],
+                               uint2 group [[threadgroup_position_in_grid]], uint simd [[simdgroup_index_in_threadgroup]],
+                               uint simds [[simdgroups_per_threadgroup]], uint lane [[thread_index_in_simdgroup]]) {
+    uint row = (group.x * simds + simd) * 2u + (lane >> 4);
+    nvfp4_g1_body(w, sc, amax, denom, x, outer, u_exp, u_off, u_pairs, u_bidx, ind_slot, y, p, row, group.y, lane & 15u, 16u);
+}
+
+kernel void expert_nvfp4_g1_8(device const uchar* w [[buffer(0)]], device const uchar* sc [[buffer(1)]],
+                              device const float* amax [[buffer(2)]], device const float* denom [[buffer(3)]],
+                              device const half* x [[buffer(4)]], device const float* outer [[buffer(5)]],
+                              device const uint* u_exp [[buffer(6)]], device const uint* u_off [[buffer(7)]],
+                              device const uint* u_pairs [[buffer(8)]], device const uint* u_bidx [[buffer(9)]],
+                              device const uint* ind_slot [[buffer(10)]], device float* y [[buffer(11)]],
+                              constant ExpertG& p [[buffer(12)]],
+                              uint2 group [[threadgroup_position_in_grid]], uint simd [[simdgroup_index_in_threadgroup]],
+                              uint simds [[simdgroups_per_threadgroup]], uint lane [[thread_index_in_simdgroup]]) {
+    uint row = (group.x * simds + simd) * 4u + (lane >> 3);
+    nvfp4_g1_body(w, sc, amax, denom, x, outer, u_exp, u_off, u_pairs, u_bidx, ind_slot, y, p, row, group.y, lane & 7u, 8u);
+}
+
+inline void nvfp4_g24_body(device const uchar* w, device const uchar* sc, device const float* amax,
+                           device const float* denom, device const half* x, device const float* outer,
+                           device const uint* u_exp, device const uint* u_cnt, device const uint* u_off,
+                           device const uint* u_pairs, device const uint* u_bidx, device const uint* ind_slot,
+                           device float* y, constant ExpertG& p, uint row, uint bi, uint sl, uint stride_lanes) {
+    if (row >= p.rows || bi >= ind_slot[3]) return;
+    uint u = u_bidx[bi];
     uint e = u_exp[u];
     uint cnt = u_cnt[u];
-    device const uchar* wr = w + ulong(e) * p.expert_bytes + ulong(row) * (p.cols / 2u);
+    uint off = u_off[u];
+    device const uint2* wr = (device const uint2*)(w + ulong(e) * p.expert_bytes + ulong(row) * (p.cols / 2u));
     device const uchar* sr = sc + ulong(e) * p.scale_bytes + ulong(row) * (p.cols / 16u);
     device const half4* x4 = (device const half4*)x;
     uint is4 = p.in_stride / 4u;
     uint blocks = p.cols / 16u;
     float alpha = amax[e] / denom[0];
-    if (cnt == 1u) {
-        uint mk0 = u_pairs[u * 16u];
-        uint i0 = p.per_row_input ? mk0 : (mk0 / p.top);
-        device const half4* x0 = x4 + ulong(i0) * is4;
-        float a0 = 0.0f;
-        for (uint b = lane; b < blocks; b += 32u) {
-            uint2 packed = *(device const uint2*)(wr + b * 8u);
-            float s = e4m3_decode(sr[b]);
-            uint b4 = b * 4u;
-            float4 part = fp4x4(packed.x) * float4(x0[b4]) + fp4x4(packed.x >> 16) * float4(x0[b4 + 1u])
-                        + fp4x4(packed.y) * float4(x0[b4 + 2u]) + fp4x4(packed.y >> 16) * float4(x0[b4 + 3u]);
-            a0 += ((part.x + part.y) + (part.z + part.w)) * s;
-        }
-        float t0 = simd_sum(a0);
-        if (lane == 0) { float r = t0 * outer[i0] * alpha; y[ulong(mk0) * p.out_stride + row] = p.per_row_input ? rbf(r) : r; }
-        return;
-    }
+    uint mk0 = u_pairs[off], mk1 = u_pairs[off + 1u];
+    uint i0 = p.per_row_input ? mk0 : (mk0 / p.top);
+    uint i1 = p.per_row_input ? mk1 : (mk1 / p.top);
+    device const half4* x0 = x4 + ulong(i0) * is4;
+    device const half4* x1 = x4 + ulong(i1) * is4;
     if (cnt == 2u) {
-        uint mk0 = u_pairs[u * 16u], mk1 = u_pairs[u * 16u + 1u];
-        uint i0 = p.per_row_input ? mk0 : (mk0 / p.top);
-        uint i1 = p.per_row_input ? mk1 : (mk1 / p.top);
-        device const half4* x0 = x4 + ulong(i0) * is4;
-        device const half4* x1 = x4 + ulong(i1) * is4;
         float a0 = 0.0f, a1 = 0.0f;
-        for (uint b = lane; b < blocks; b += 32u) {
-            uint2 packed = *(device const uint2*)(wr + b * 8u);
+        for (uint b = sl; b < blocks; b += stride_lanes) {
+            uint2 pk = wr[b];
             float s = e4m3_decode(sr[b]);
             uint b4 = b * 4u;
-            float4 p0 = 0.0f, p1 = 0.0f;
-            { float4 f = fp4x4(packed.x);       p0 += f * float4(x0[b4]);      p1 += f * float4(x1[b4]); }
-            { float4 f = fp4x4(packed.x >> 16); p0 += f * float4(x0[b4 + 1u]); p1 += f * float4(x1[b4 + 1u]); }
-            { float4 f = fp4x4(packed.y);       p0 += f * float4(x0[b4 + 2u]); p1 += f * float4(x1[b4 + 2u]); }
-            { float4 f = fp4x4(packed.y >> 16); p0 += f * float4(x0[b4 + 3u]); p1 += f * float4(x1[b4 + 3u]); }
-            a0 += ((p0.x + p0.y) + (p0.z + p0.w)) * s;
-            a1 += ((p1.x + p1.y) + (p1.z + p1.w)) * s;
+            float d0 = 0.0f, d1 = 0.0f;
+            { half4 f = fp4x4_h(pk.x);       float4 q; q = float4(f * x0[b4]);      d0 += (q.x + q.y) + (q.z + q.w); q = float4(f * x1[b4]);      d1 += (q.x + q.y) + (q.z + q.w); }
+            { half4 f = fp4x4_h(pk.x >> 16); uint k = b4 + 1u; float4 q; q = float4(f * x0[k]); d0 += (q.x + q.y) + (q.z + q.w); q = float4(f * x1[k]); d1 += (q.x + q.y) + (q.z + q.w); }
+            { half4 f = fp4x4_h(pk.y);       uint k = b4 + 2u; float4 q; q = float4(f * x0[k]); d0 += (q.x + q.y) + (q.z + q.w); q = float4(f * x1[k]); d1 += (q.x + q.y) + (q.z + q.w); }
+            { half4 f = fp4x4_h(pk.y >> 16); uint k = b4 + 3u; float4 q; q = float4(f * x0[k]); d0 += (q.x + q.y) + (q.z + q.w); q = float4(f * x1[k]); d1 += (q.x + q.y) + (q.z + q.w); }
+            a0 += d0 * s;
+            a1 += d1 * s;
         }
-        float t0 = simd_sum(a0), t1 = simd_sum(a1);
-        if (lane == 0) {
+        float t0 = stride_lanes == 16u ? simd16_sum(a0) : simd8_sum(a0);
+        float t1 = stride_lanes == 16u ? simd16_sum(a1) : simd8_sum(a1);
+        if (sl == 0u) {
             float r0 = t0 * outer[i0] * alpha; y[ulong(mk0) * p.out_stride + row] = p.per_row_input ? rbf(r0) : r0;
             float r1 = t1 * outer[i1] * alpha; y[ulong(mk1) * p.out_stride + row] = p.per_row_input ? rbf(r1) : r1;
         }
         return;
     }
+    uint mk2 = u_pairs[off + 2u];
+    uint i2 = p.per_row_input ? mk2 : (mk2 / p.top);
+    device const half4* x2 = x4 + ulong(i2) * is4;
     if (cnt == 3u) {
-        uint mk0 = u_pairs[u * 16u], mk1 = u_pairs[u * 16u + 1u], mk2 = u_pairs[u * 16u + 2u];
-        uint i0 = p.per_row_input ? mk0 : (mk0 / p.top);
-        uint i1 = p.per_row_input ? mk1 : (mk1 / p.top);
-        uint i2 = p.per_row_input ? mk2 : (mk2 / p.top);
-        device const half4* x0 = x4 + ulong(i0) * is4;
-        device const half4* x1 = x4 + ulong(i1) * is4;
-        device const half4* x2 = x4 + ulong(i2) * is4;
         float a0 = 0.0f, a1 = 0.0f, a2 = 0.0f;
-        for (uint b = lane; b < blocks; b += 32u) {
-            uint2 packed = *(device const uint2*)(wr + b * 8u);
+        for (uint b = sl; b < blocks; b += stride_lanes) {
+            uint2 pk = wr[b];
             float s = e4m3_decode(sr[b]);
             uint b4 = b * 4u;
-            float4 p0 = 0.0f, p1 = 0.0f, p2 = 0.0f;
-            { float4 f = fp4x4(packed.x);       p0 += f * float4(x0[b4]);      p1 += f * float4(x1[b4]);      p2 += f * float4(x2[b4]); }
-            { float4 f = fp4x4(packed.x >> 16); p0 += f * float4(x0[b4 + 1u]); p1 += f * float4(x1[b4 + 1u]); p2 += f * float4(x2[b4 + 1u]); }
-            { float4 f = fp4x4(packed.y);       p0 += f * float4(x0[b4 + 2u]); p1 += f * float4(x1[b4 + 2u]); p2 += f * float4(x2[b4 + 2u]); }
-            { float4 f = fp4x4(packed.y >> 16); p0 += f * float4(x0[b4 + 3u]); p1 += f * float4(x1[b4 + 3u]); p2 += f * float4(x2[b4 + 3u]); }
-            a0 += ((p0.x + p0.y) + (p0.z + p0.w)) * s;
-            a1 += ((p1.x + p1.y) + (p1.z + p1.w)) * s;
-            a2 += ((p2.x + p2.y) + (p2.z + p2.w)) * s;
+            float d0 = 0.0f, d1 = 0.0f, d2 = 0.0f;
+            { half4 f = fp4x4_h(pk.x);       float4 q; q = float4(f * x0[b4]);      d0 += (q.x + q.y) + (q.z + q.w); q = float4(f * x1[b4]);      d1 += (q.x + q.y) + (q.z + q.w); q = float4(f * x2[b4]);      d2 += (q.x + q.y) + (q.z + q.w); }
+            { half4 f = fp4x4_h(pk.x >> 16); uint k = b4 + 1u; float4 q; q = float4(f * x0[k]); d0 += (q.x + q.y) + (q.z + q.w); q = float4(f * x1[k]); d1 += (q.x + q.y) + (q.z + q.w); q = float4(f * x2[k]); d2 += (q.x + q.y) + (q.z + q.w); }
+            { half4 f = fp4x4_h(pk.y);       uint k = b4 + 2u; float4 q; q = float4(f * x0[k]); d0 += (q.x + q.y) + (q.z + q.w); q = float4(f * x1[k]); d1 += (q.x + q.y) + (q.z + q.w); q = float4(f * x2[k]); d2 += (q.x + q.y) + (q.z + q.w); }
+            { half4 f = fp4x4_h(pk.y >> 16); uint k = b4 + 3u; float4 q; q = float4(f * x0[k]); d0 += (q.x + q.y) + (q.z + q.w); q = float4(f * x1[k]); d1 += (q.x + q.y) + (q.z + q.w); q = float4(f * x2[k]); d2 += (q.x + q.y) + (q.z + q.w); }
+            a0 += d0 * s;
+            a1 += d1 * s;
+            a2 += d2 * s;
         }
-        float t0 = simd_sum(a0), t1 = simd_sum(a1), t2 = simd_sum(a2);
-        if (lane == 0) {
+        float t0 = stride_lanes == 16u ? simd16_sum(a0) : simd8_sum(a0);
+        float t1 = stride_lanes == 16u ? simd16_sum(a1) : simd8_sum(a1);
+        float t2 = stride_lanes == 16u ? simd16_sum(a2) : simd8_sum(a2);
+        if (sl == 0u) {
             float r0 = t0 * outer[i0] * alpha; y[ulong(mk0) * p.out_stride + row] = p.per_row_input ? rbf(r0) : r0;
             float r1 = t1 * outer[i1] * alpha; y[ulong(mk1) * p.out_stride + row] = p.per_row_input ? rbf(r1) : r1;
             float r2 = t2 * outer[i2] * alpha; y[ulong(mk2) * p.out_stride + row] = p.per_row_input ? rbf(r2) : r2;
         }
         return;
     }
-    if (cnt == 4u) {
-        uint mk0 = u_pairs[u * 16u], mk1 = u_pairs[u * 16u + 1u], mk2 = u_pairs[u * 16u + 2u], mk3 = u_pairs[u * 16u + 3u];
-        uint i0 = p.per_row_input ? mk0 : (mk0 / p.top);
-        uint i1 = p.per_row_input ? mk1 : (mk1 / p.top);
-        uint i2 = p.per_row_input ? mk2 : (mk2 / p.top);
-        uint i3 = p.per_row_input ? mk3 : (mk3 / p.top);
-        device const half4* x0 = x4 + ulong(i0) * is4;
-        device const half4* x1 = x4 + ulong(i1) * is4;
-        device const half4* x2 = x4 + ulong(i2) * is4;
-        device const half4* x3 = x4 + ulong(i3) * is4;
-        float a0 = 0.0f, a1 = 0.0f, a2 = 0.0f, a3 = 0.0f;
-        for (uint b = lane; b < blocks; b += 32u) {
-            uint2 packed = *(device const uint2*)(wr + b * 8u);
-            float s = e4m3_decode(sr[b]);
-            uint b4 = b * 4u;
-            float4 p0 = 0.0f, p1 = 0.0f, p2 = 0.0f, p3 = 0.0f;
-            { float4 f = fp4x4(packed.x);       p0 += f * float4(x0[b4]);      p1 += f * float4(x1[b4]);      p2 += f * float4(x2[b4]);      p3 += f * float4(x3[b4]); }
-            { float4 f = fp4x4(packed.x >> 16); p0 += f * float4(x0[b4 + 1u]); p1 += f * float4(x1[b4 + 1u]); p2 += f * float4(x2[b4 + 1u]); p3 += f * float4(x3[b4 + 1u]); }
-            { float4 f = fp4x4(packed.y);       p0 += f * float4(x0[b4 + 2u]); p1 += f * float4(x1[b4 + 2u]); p2 += f * float4(x2[b4 + 2u]); p3 += f * float4(x3[b4 + 2u]); }
-            { float4 f = fp4x4(packed.y >> 16); p0 += f * float4(x0[b4 + 3u]); p1 += f * float4(x1[b4 + 3u]); p2 += f * float4(x2[b4 + 3u]); p3 += f * float4(x3[b4 + 3u]); }
-            a0 += ((p0.x + p0.y) + (p0.z + p0.w)) * s;
-            a1 += ((p1.x + p1.y) + (p1.z + p1.w)) * s;
-            a2 += ((p2.x + p2.y) + (p2.z + p2.w)) * s;
-            a3 += ((p3.x + p3.y) + (p3.z + p3.w)) * s;
-        }
-        float t0 = simd_sum(a0), t1 = simd_sum(a1), t2 = simd_sum(a2), t3 = simd_sum(a3);
-        if (lane == 0) {
-            float r0 = t0 * outer[i0] * alpha; y[ulong(mk0) * p.out_stride + row] = p.per_row_input ? rbf(r0) : r0;
-            float r1 = t1 * outer[i1] * alpha; y[ulong(mk1) * p.out_stride + row] = p.per_row_input ? rbf(r1) : r1;
-            float r2 = t2 * outer[i2] * alpha; y[ulong(mk2) * p.out_stride + row] = p.per_row_input ? rbf(r2) : r2;
-            float r3 = t3 * outer[i3] * alpha; y[ulong(mk3) * p.out_stride + row] = p.per_row_input ? rbf(r3) : r3;
-        }
-        return;
+    uint mk3 = u_pairs[off + 3u];
+    uint i3 = p.per_row_input ? mk3 : (mk3 / p.top);
+    device const half4* x3 = x4 + ulong(i3) * is4;
+    float a0 = 0.0f, a1 = 0.0f, a2 = 0.0f, a3 = 0.0f;
+    for (uint b = sl; b < blocks; b += stride_lanes) {
+        uint2 pk = wr[b];
+        float s = e4m3_decode(sr[b]);
+        uint b4 = b * 4u;
+        float d0 = 0.0f, d1 = 0.0f, d2 = 0.0f, d3 = 0.0f;
+        { half4 f = fp4x4_h(pk.x);       float4 q; q = float4(f * x0[b4]);      d0 += (q.x + q.y) + (q.z + q.w); q = float4(f * x1[b4]);      d1 += (q.x + q.y) + (q.z + q.w); q = float4(f * x2[b4]);      d2 += (q.x + q.y) + (q.z + q.w); q = float4(f * x3[b4]);      d3 += (q.x + q.y) + (q.z + q.w); }
+        { half4 f = fp4x4_h(pk.x >> 16); uint k = b4 + 1u; float4 q; q = float4(f * x0[k]); d0 += (q.x + q.y) + (q.z + q.w); q = float4(f * x1[k]); d1 += (q.x + q.y) + (q.z + q.w); q = float4(f * x2[k]); d2 += (q.x + q.y) + (q.z + q.w); q = float4(f * x3[k]); d3 += (q.x + q.y) + (q.z + q.w); }
+        { half4 f = fp4x4_h(pk.y);       uint k = b4 + 2u; float4 q; q = float4(f * x0[k]); d0 += (q.x + q.y) + (q.z + q.w); q = float4(f * x1[k]); d1 += (q.x + q.y) + (q.z + q.w); q = float4(f * x2[k]); d2 += (q.x + q.y) + (q.z + q.w); q = float4(f * x3[k]); d3 += (q.x + q.y) + (q.z + q.w); }
+        { half4 f = fp4x4_h(pk.y >> 16); uint k = b4 + 3u; float4 q; q = float4(f * x0[k]); d0 += (q.x + q.y) + (q.z + q.w); q = float4(f * x1[k]); d1 += (q.x + q.y) + (q.z + q.w); q = float4(f * x2[k]); d2 += (q.x + q.y) + (q.z + q.w); q = float4(f * x3[k]); d3 += (q.x + q.y) + (q.z + q.w); }
+        a0 += d0 * s;
+        a1 += d1 * s;
+        a2 += d2 * s;
+        a3 += d3 * s;
     }
+    float t0 = stride_lanes == 16u ? simd16_sum(a0) : simd8_sum(a0);
+    float t1 = stride_lanes == 16u ? simd16_sum(a1) : simd8_sum(a1);
+    float t2 = stride_lanes == 16u ? simd16_sum(a2) : simd8_sum(a2);
+    float t3 = stride_lanes == 16u ? simd16_sum(a3) : simd8_sum(a3);
+    if (sl == 0u) {
+        float r0 = t0 * outer[i0] * alpha; y[ulong(mk0) * p.out_stride + row] = p.per_row_input ? rbf(r0) : r0;
+        float r1 = t1 * outer[i1] * alpha; y[ulong(mk1) * p.out_stride + row] = p.per_row_input ? rbf(r1) : r1;
+        float r2 = t2 * outer[i2] * alpha; y[ulong(mk2) * p.out_stride + row] = p.per_row_input ? rbf(r2) : r2;
+        float r3 = t3 * outer[i3] * alpha; y[ulong(mk3) * p.out_stride + row] = p.per_row_input ? rbf(r3) : r3;
+    }
+}
+
+kernel void expert_nvfp4_g24_16(device const uchar* w [[buffer(0)]], device const uchar* sc [[buffer(1)]],
+                                device const float* amax [[buffer(2)]], device const float* denom [[buffer(3)]],
+                                device const half* x [[buffer(4)]], device const float* outer [[buffer(5)]],
+                                device const uint* u_exp [[buffer(6)]], device const uint* u_cnt [[buffer(7)]],
+                                device const uint* u_off [[buffer(8)]], device const uint* u_pairs [[buffer(9)]],
+                                device const uint* u_bidx [[buffer(10)]], device const uint* ind_slot [[buffer(11)]],
+                                device float* y [[buffer(12)]], constant ExpertG& p [[buffer(13)]],
+                                uint2 group [[threadgroup_position_in_grid]], uint simd [[simdgroup_index_in_threadgroup]],
+                                uint simds [[simdgroups_per_threadgroup]], uint lane [[thread_index_in_simdgroup]]) {
+    uint row = (group.x * simds + simd) * 2u + (lane >> 4);
+    nvfp4_g24_body(w, sc, amax, denom, x, outer, u_exp, u_cnt, u_off, u_pairs, u_bidx, ind_slot, y, p, row, group.y, lane & 15u, 16u);
+}
+
+kernel void expert_nvfp4_g24_8(device const uchar* w [[buffer(0)]], device const uchar* sc [[buffer(1)]],
+                               device const float* amax [[buffer(2)]], device const float* denom [[buffer(3)]],
+                               device const half* x [[buffer(4)]], device const float* outer [[buffer(5)]],
+                               device const uint* u_exp [[buffer(6)]], device const uint* u_cnt [[buffer(7)]],
+                               device const uint* u_off [[buffer(8)]], device const uint* u_pairs [[buffer(9)]],
+                               device const uint* u_bidx [[buffer(10)]], device const uint* ind_slot [[buffer(11)]],
+                               device float* y [[buffer(12)]], constant ExpertG& p [[buffer(13)]],
+                               uint2 group [[threadgroup_position_in_grid]], uint simd [[simdgroup_index_in_threadgroup]],
+                               uint simds [[simdgroups_per_threadgroup]], uint lane [[thread_index_in_simdgroup]]) {
+    uint row = (group.x * simds + simd) * 4u + (lane >> 3);
+    nvfp4_g24_body(w, sc, amax, denom, x, outer, u_exp, u_cnt, u_off, u_pairs, u_bidx, ind_slot, y, p, row, group.y, lane & 7u, 8u);
+}
+
+inline void nvfp4_g5p_body(device const uchar* w, device const uchar* sc, device const float* amax,
+                           device const float* denom, device const half* x, device const float* outer,
+                           device const uint* u_exp, device const uint* u_cnt, device const uint* u_off,
+                           device const uint* u_pairs, device const uint* u_bidx, device const uint* ind_slot,
+                           device float* y, constant ExpertG& p, uint row, uint bi, uint sl, uint stride_lanes) {
+    if (row >= p.rows || bi >= ind_slot[3]) return;
+    uint u = u_bidx[bi];
+    uint e = u_exp[u];
+    uint cnt = u_cnt[u];
+    uint off = u_off[u];
+    device const uint2* wr = (device const uint2*)(w + ulong(e) * p.expert_bytes + ulong(row) * (p.cols / 2u));
+    device const uchar* sr = sc + ulong(e) * p.scale_bytes + ulong(row) * (p.cols / 16u);
+    device const half4* x4 = (device const half4*)x;
+    uint is4 = p.in_stride / 4u;
+    uint blocks = p.cols / 16u;
+    float alpha = amax[e] / denom[0];
+    auto red = [&](float v) { return stride_lanes == 16u ? simd16_sum(v) : simd8_sum(v); };
     for (uint j0 = 0; j0 < cnt; j0 += 8u) {
         uint rem = min(8u, cnt - j0);
-        uint mk0 = u_pairs[u * 16u + j0];
-        uint mk1 = rem > 1u ? u_pairs[u * 16u + j0 + 1u] : mk0;
-        uint mk2 = rem > 2u ? u_pairs[u * 16u + j0 + 2u] : mk0;
-        uint mk3 = rem > 3u ? u_pairs[u * 16u + j0 + 3u] : mk0;
-        uint mk4 = rem > 4u ? u_pairs[u * 16u + j0 + 4u] : mk0;
-        uint mk5 = rem > 5u ? u_pairs[u * 16u + j0 + 5u] : mk0;
-        uint mk6 = rem > 6u ? u_pairs[u * 16u + j0 + 6u] : mk0;
-        uint mk7 = rem > 7u ? u_pairs[u * 16u + j0 + 7u] : mk0;
+        uint mk0 = u_pairs[off + j0];
+        uint mk1 = rem > 1u ? u_pairs[off + j0 + 1u] : mk0;
+        uint mk2 = rem > 2u ? u_pairs[off + j0 + 2u] : mk0;
+        uint mk3 = rem > 3u ? u_pairs[off + j0 + 3u] : mk0;
+        uint mk4 = rem > 4u ? u_pairs[off + j0 + 4u] : mk0;
+        uint mk5 = rem > 5u ? u_pairs[off + j0 + 5u] : mk0;
+        uint mk6 = rem > 6u ? u_pairs[off + j0 + 6u] : mk0;
+        uint mk7 = rem > 7u ? u_pairs[off + j0 + 7u] : mk0;
         uint i0 = p.per_row_input ? mk0 : (mk0 / p.top);
         uint i1 = p.per_row_input ? mk1 : (mk1 / p.top);
         uint i2 = p.per_row_input ? mk2 : (mk2 / p.top);
@@ -927,40 +1239,173 @@ kernel void expert_nvfp4_grouped(device const uchar* w [[buffer(0)]],
         uint i6 = p.per_row_input ? mk6 : (mk6 / p.top);
         uint i7 = p.per_row_input ? mk7 : (mk7 / p.top);
         float a0 = 0, a1 = 0, a2 = 0, a3 = 0, a4 = 0, a5 = 0, a6 = 0, a7 = 0;
-        for (uint b = lane; b < blocks; b += 32u) {
-            uint2 packed = *(device const uint2*)(wr + b * 8u);
+        for (uint b = sl; b < blocks; b += stride_lanes) {
+            uint2 pk = wr[b];
             float s = e4m3_decode(sr[b]);
             uint b4 = b * 4u;
-            float4 p0 = 0, p1 = 0, p2 = 0, p3 = 0, p4 = 0, p5 = 0, p6 = 0, p7 = 0;
-            { float4 f = fp4x4(packed.x);       p0 += f * float4(x4[ulong(i0)*is4+b4]);      if (rem > 1u) p1 += f * float4(x4[ulong(i1)*is4+b4]);      if (rem > 2u) p2 += f * float4(x4[ulong(i2)*is4+b4]);      if (rem > 3u) p3 += f * float4(x4[ulong(i3)*is4+b4]);      if (rem > 4u) p4 += f * float4(x4[ulong(i4)*is4+b4]);      if (rem > 5u) p5 += f * float4(x4[ulong(i5)*is4+b4]);      if (rem > 6u) p6 += f * float4(x4[ulong(i6)*is4+b4]);      if (rem > 7u) p7 += f * float4(x4[ulong(i7)*is4+b4]); }
-            { float4 f = fp4x4(packed.x >> 16); uint k = b4 + 1u; p0 += f * float4(x4[ulong(i0)*is4+k]); if (rem > 1u) p1 += f * float4(x4[ulong(i1)*is4+k]); if (rem > 2u) p2 += f * float4(x4[ulong(i2)*is4+k]); if (rem > 3u) p3 += f * float4(x4[ulong(i3)*is4+k]); if (rem > 4u) p4 += f * float4(x4[ulong(i4)*is4+k]); if (rem > 5u) p5 += f * float4(x4[ulong(i5)*is4+k]); if (rem > 6u) p6 += f * float4(x4[ulong(i6)*is4+k]); if (rem > 7u) p7 += f * float4(x4[ulong(i7)*is4+k]); }
-            { float4 f = fp4x4(packed.y);       uint k = b4 + 2u; p0 += f * float4(x4[ulong(i0)*is4+k]); if (rem > 1u) p1 += f * float4(x4[ulong(i1)*is4+k]); if (rem > 2u) p2 += f * float4(x4[ulong(i2)*is4+k]); if (rem > 3u) p3 += f * float4(x4[ulong(i3)*is4+k]); if (rem > 4u) p4 += f * float4(x4[ulong(i4)*is4+k]); if (rem > 5u) p5 += f * float4(x4[ulong(i5)*is4+k]); if (rem > 6u) p6 += f * float4(x4[ulong(i6)*is4+k]); if (rem > 7u) p7 += f * float4(x4[ulong(i7)*is4+k]); }
-            { float4 f = fp4x4(packed.y >> 16); uint k = b4 + 3u; p0 += f * float4(x4[ulong(i0)*is4+k]); if (rem > 1u) p1 += f * float4(x4[ulong(i1)*is4+k]); if (rem > 2u) p2 += f * float4(x4[ulong(i2)*is4+k]); if (rem > 3u) p3 += f * float4(x4[ulong(i3)*is4+k]); if (rem > 4u) p4 += f * float4(x4[ulong(i4)*is4+k]); if (rem > 5u) p5 += f * float4(x4[ulong(i5)*is4+k]); if (rem > 6u) p6 += f * float4(x4[ulong(i6)*is4+k]); if (rem > 7u) p7 += f * float4(x4[ulong(i7)*is4+k]); }
-            a0 += ((p0.x + p0.y) + (p0.z + p0.w)) * s;
-            if (rem > 1u) a1 += ((p1.x + p1.y) + (p1.z + p1.w)) * s;
-            if (rem > 2u) a2 += ((p2.x + p2.y) + (p2.z + p2.w)) * s;
-            if (rem > 3u) a3 += ((p3.x + p3.y) + (p3.z + p3.w)) * s;
-            if (rem > 4u) a4 += ((p4.x + p4.y) + (p4.z + p4.w)) * s;
-            if (rem > 5u) a5 += ((p5.x + p5.y) + (p5.z + p5.w)) * s;
-            if (rem > 6u) a6 += ((p6.x + p6.y) + (p6.z + p6.w)) * s;
-            if (rem > 7u) a7 += ((p7.x + p7.y) + (p7.z + p7.w)) * s;
+            float d0 = 0, d1 = 0, d2 = 0, d3 = 0, d4 = 0, d5 = 0, d6 = 0, d7 = 0;
+            half4 fs[4] = {fp4x4_h(pk.x), fp4x4_h(pk.x >> 16), fp4x4_h(pk.y), fp4x4_h(pk.y >> 16)};
+            for (uint t = 0; t < 4u; ++t) {
+                half4 f = fs[t];
+                uint k = b4 + t;
+                float4 q;
+                q = float4(f * x4[ulong(i0) * is4 + k]); d0 += (q.x + q.y) + (q.z + q.w);
+                if (rem > 1u) { q = float4(f * x4[ulong(i1) * is4 + k]); d1 += (q.x + q.y) + (q.z + q.w); }
+                if (rem > 2u) { q = float4(f * x4[ulong(i2) * is4 + k]); d2 += (q.x + q.y) + (q.z + q.w); }
+                if (rem > 3u) { q = float4(f * x4[ulong(i3) * is4 + k]); d3 += (q.x + q.y) + (q.z + q.w); }
+                if (rem > 4u) { q = float4(f * x4[ulong(i4) * is4 + k]); d4 += (q.x + q.y) + (q.z + q.w); }
+                if (rem > 5u) { q = float4(f * x4[ulong(i5) * is4 + k]); d5 += (q.x + q.y) + (q.z + q.w); }
+                if (rem > 6u) { q = float4(f * x4[ulong(i6) * is4 + k]); d6 += (q.x + q.y) + (q.z + q.w); }
+                if (rem > 7u) { q = float4(f * x4[ulong(i7) * is4 + k]); d7 += (q.x + q.y) + (q.z + q.w); }
+            }
+            a0 += d0 * s;
+            if (rem > 1u) a1 += d1 * s;
+            if (rem > 2u) a2 += d2 * s;
+            if (rem > 3u) a3 += d3 * s;
+            if (rem > 4u) a4 += d4 * s;
+            if (rem > 5u) a5 += d5 * s;
+            if (rem > 6u) a6 += d6 * s;
+            if (rem > 7u) a7 += d7 * s;
         }
-        float t0 = simd_sum(a0); if (lane == 0) { float r = t0 * outer[i0] * alpha; y[ulong(mk0) * p.out_stride + row] = p.per_row_input ? rbf(r) : r; }
-        if (rem > 1u) { float t1 = simd_sum(a1); if (lane == 0) { float r = t1 * outer[i1] * alpha; y[ulong(mk1) * p.out_stride + row] = p.per_row_input ? rbf(r) : r; } }
-        if (rem > 2u) { float t2 = simd_sum(a2); if (lane == 0) { float r = t2 * outer[i2] * alpha; y[ulong(mk2) * p.out_stride + row] = p.per_row_input ? rbf(r) : r; } }
-        if (rem > 3u) { float t3 = simd_sum(a3); if (lane == 0) { float r = t3 * outer[i3] * alpha; y[ulong(mk3) * p.out_stride + row] = p.per_row_input ? rbf(r) : r; } }
-        if (rem > 4u) { float t4 = simd_sum(a4); if (lane == 0) { float r = t4 * outer[i4] * alpha; y[ulong(mk4) * p.out_stride + row] = p.per_row_input ? rbf(r) : r; } }
-        if (rem > 5u) { float t5 = simd_sum(a5); if (lane == 0) { float r = t5 * outer[i5] * alpha; y[ulong(mk5) * p.out_stride + row] = p.per_row_input ? rbf(r) : r; } }
-        if (rem > 6u) { float t6 = simd_sum(a6); if (lane == 0) { float r = t6 * outer[i6] * alpha; y[ulong(mk6) * p.out_stride + row] = p.per_row_input ? rbf(r) : r; } }
-        if (rem > 7u) { float t7 = simd_sum(a7); if (lane == 0) { float r = t7 * outer[i7] * alpha; y[ulong(mk7) * p.out_stride + row] = p.per_row_input ? rbf(r) : r; } }
+        float t0 = red(a0); if (sl == 0u) { float r = t0 * outer[i0] * alpha; y[ulong(mk0) * p.out_stride + row] = p.per_row_input ? rbf(r) : r; }
+        if (rem > 1u) { float t1 = red(a1); if (sl == 0u) { float r = t1 * outer[i1] * alpha; y[ulong(mk1) * p.out_stride + row] = p.per_row_input ? rbf(r) : r; } }
+        if (rem > 2u) { float t2 = red(a2); if (sl == 0u) { float r = t2 * outer[i2] * alpha; y[ulong(mk2) * p.out_stride + row] = p.per_row_input ? rbf(r) : r; } }
+        if (rem > 3u) { float t3 = red(a3); if (sl == 0u) { float r = t3 * outer[i3] * alpha; y[ulong(mk3) * p.out_stride + row] = p.per_row_input ? rbf(r) : r; } }
+        if (rem > 4u) { float t4 = red(a4); if (sl == 0u) { float r = t4 * outer[i4] * alpha; y[ulong(mk4) * p.out_stride + row] = p.per_row_input ? rbf(r) : r; } }
+        if (rem > 5u) { float t5 = red(a5); if (sl == 0u) { float r = t5 * outer[i5] * alpha; y[ulong(mk5) * p.out_stride + row] = p.per_row_input ? rbf(r) : r; } }
+        if (rem > 6u) { float t6 = red(a6); if (sl == 0u) { float r = t6 * outer[i6] * alpha; y[ulong(mk6) * p.out_stride + row] = p.per_row_input ? rbf(r) : r; } }
+        if (rem > 7u) { float t7 = red(a7); if (sl == 0u) { float r = t7 * outer[i7] * alpha; y[ulong(mk7) * p.out_stride + row] = p.per_row_input ? rbf(r) : r; } }
     }
 }
 
-kernel void expert_mxfp8_grouped(device const uchar* w [[buffer(0)]],
+kernel void expert_nvfp4_g5p_16(device const uchar* w [[buffer(0)]], device const uchar* sc [[buffer(1)]],
+                                device const float* amax [[buffer(2)]], device const float* denom [[buffer(3)]],
+                                device const half* x [[buffer(4)]], device const float* outer [[buffer(5)]],
+                                device const uint* u_exp [[buffer(6)]], device const uint* u_cnt [[buffer(7)]],
+                                device const uint* u_off [[buffer(8)]], device const uint* u_pairs [[buffer(9)]],
+                                device const uint* u_bidx [[buffer(10)]], device const uint* ind_slot [[buffer(11)]],
+                                device float* y [[buffer(12)]], constant ExpertG& p [[buffer(13)]],
+                                uint2 group [[threadgroup_position_in_grid]], uint simd [[simdgroup_index_in_threadgroup]],
+                                uint simds [[simdgroups_per_threadgroup]], uint lane [[thread_index_in_simdgroup]]) {
+    uint row = (group.x * simds + simd) * 2u + (lane >> 4);
+    nvfp4_g5p_body(w, sc, amax, denom, x, outer, u_exp, u_cnt, u_off, u_pairs, u_bidx, ind_slot, y, p, row, group.y, lane & 15u, 16u);
+}
+
+kernel void expert_nvfp4_g5p_8(device const uchar* w [[buffer(0)]], device const uchar* sc [[buffer(1)]],
+                               device const float* amax [[buffer(2)]], device const float* denom [[buffer(3)]],
+                               device const half* x [[buffer(4)]], device const float* outer [[buffer(5)]],
+                               device const uint* u_exp [[buffer(6)]], device const uint* u_cnt [[buffer(7)]],
+                               device const uint* u_off [[buffer(8)]], device const uint* u_pairs [[buffer(9)]],
+                               device const uint* u_bidx [[buffer(10)]], device const uint* ind_slot [[buffer(11)]],
+                               device float* y [[buffer(12)]], constant ExpertG& p [[buffer(13)]],
+                               uint2 group [[threadgroup_position_in_grid]], uint simd [[simdgroup_index_in_threadgroup]],
+                               uint simds [[simdgroups_per_threadgroup]], uint lane [[thread_index_in_simdgroup]]) {
+    uint row = (group.x * simds + simd) * 4u + (lane >> 3);
+    nvfp4_g5p_body(w, sc, amax, denom, x, outer, u_exp, u_cnt, u_off, u_pairs, u_bidx, ind_slot, y, p, row, group.y, lane & 7u, 8u);
+}
+
+inline void mxfp8_grouped_body(device const uchar* w, device const uchar* sc, device const float* x,
+                               device const uint* u_exp, device const uint* u_cnt, device const uint* u_off, device const uint* u_pairs,
+                               device float* y, constant ExpertG& p, uint row, uint u, uint sl, uint stride_lanes) {
+    if (row >= p.rows) return;
+    uint e = u_exp[u];
+    uint cnt = u_cnt[u];
+    if (p.skip_5p && cnt >= 5u) return;
+    uint off = u_off[u];
+    device const uint4* wr4 = (device const uint4*)(w + ulong(e) * p.expert_bytes + ulong(row) * p.cols);
+    device const uchar* sr = sc + ulong(e) * p.scale_bytes + ulong(row) * (p.cols / 32u);
+    device const float4* x4 = (device const float4*)x;
+    uint is4 = p.in_stride / 4u;
+    uint blocks = p.cols / 32u;
+    auto red = [&](float v) {
+        if (stride_lanes == 8u) return simd8_sum(v);
+        return simd4_sum(v);
+    };
+    for (uint j0 = 0; j0 < cnt; j0 += 4u) {
+        uint rem = min(4u, cnt - j0);
+        uint mk0 = u_pairs[off + j0];
+        uint mk1 = rem > 1u ? u_pairs[off + j0 + 1u] : mk0;
+        uint mk2 = rem > 2u ? u_pairs[off + j0 + 2u] : mk0;
+        uint mk3 = rem > 3u ? u_pairs[off + j0 + 3u] : mk0;
+        uint i0 = p.per_row_input ? mk0 : (mk0 / p.top);
+        uint i1 = p.per_row_input ? mk1 : (mk1 / p.top);
+        uint i2 = p.per_row_input ? mk2 : (mk2 / p.top);
+        uint i3 = p.per_row_input ? mk3 : (mk3 / p.top);
+        device const float4* x0 = x4 + ulong(i0) * is4;
+        device const float4* x1 = x4 + ulong(i1) * is4;
+        device const float4* x2 = x4 + ulong(i2) * is4;
+        device const float4* x3 = x4 + ulong(i3) * is4;
+        float a0 = 0.0f, a1 = 0.0f, a2 = 0.0f, a3 = 0.0f;
+        for (uint b = sl; b < blocks; b += stride_lanes) {
+            uint4 w0 = wr4[b * 2u];
+            uint4 w1 = wr4[b * 2u + 1u];
+            float s = as_type<float>(uint(sr[b]) << 23);
+            uint b8 = b * 8u;
+            uint ws[8] = {w0.x, w0.y, w0.z, w0.w, w1.x, w1.y, w1.z, w1.w};
+            float d0 = 0.0f, d1 = 0.0f, d2 = 0.0f, d3 = 0.0f;
+            for (uint t = 0; t < 8u; ++t) {
+                float4 f = e4m3x4(ws[t]);
+                uint k = b8 + t;
+                d0 += dot(f, x0[k]);
+                if (rem > 1u) d1 += dot(f, x1[k]);
+                if (rem > 2u) d2 += dot(f, x2[k]);
+                if (rem > 3u) d3 += dot(f, x3[k]);
+            }
+            a0 += d0 * s;
+            if (rem > 1u) a1 += d1 * s;
+            if (rem > 2u) a2 += d2 * s;
+            if (rem > 3u) a3 += d3 * s;
+        }
+        float t0 = red(a0); if (sl == 0u) y[ulong(mk0) * p.out_stride + row] = rbf(t0);
+        if (rem > 1u) { float t1 = red(a1); if (sl == 0u) y[ulong(mk1) * p.out_stride + row] = rbf(t1); }
+        if (rem > 2u) { float t2 = red(a2); if (sl == 0u) y[ulong(mk2) * p.out_stride + row] = rbf(t2); }
+        if (rem > 3u) { float t3 = red(a3); if (sl == 0u) y[ulong(mk3) * p.out_stride + row] = rbf(t3); }
+    }
+}
+
+kernel void expert_mxfp8_grouped_8(device const uchar* w [[buffer(0)]],
+                                   device const uchar* sc [[buffer(1)]],
+                                   device const float* x [[buffer(4)]],
+                                   device const uint* u_exp [[buffer(6)]],
+                                   device const uint* u_cnt [[buffer(7)]],
+                                   device const uint* u_off [[buffer(11)]],
+                                   device const uint* u_pairs [[buffer(8)]],
+                                   device float* y [[buffer(9)]],
+                                   constant ExpertG& p [[buffer(10)]],
+                                   uint2 group [[threadgroup_position_in_grid]],
+                                   uint simd [[simdgroup_index_in_threadgroup]],
+                                   uint simds [[simdgroups_per_threadgroup]],
+                                   uint lane [[thread_index_in_simdgroup]]) {
+    uint row = (group.x * simds + simd) * 4u + (lane >> 3);
+    mxfp8_grouped_body(w, sc, x, u_exp, u_cnt, u_off, u_pairs, y, p, row, group.y, lane & 7u, 8u);
+}
+
+kernel void expert_mxfp8_grouped_4(device const uchar* w [[buffer(0)]],
+                                   device const uchar* sc [[buffer(1)]],
+                                   device const float* x [[buffer(4)]],
+                                   device const uint* u_exp [[buffer(6)]],
+                                   device const uint* u_cnt [[buffer(7)]],
+                                   device const uint* u_off [[buffer(11)]],
+                                   device const uint* u_pairs [[buffer(8)]],
+                                   device float* y [[buffer(9)]],
+                                   constant ExpertG& p [[buffer(10)]],
+                                   uint2 group [[threadgroup_position_in_grid]],
+                                   uint simd [[simdgroup_index_in_threadgroup]],
+                                   uint simds [[simdgroups_per_threadgroup]],
+                                   uint lane [[thread_index_in_simdgroup]]) {
+    uint row = (group.x * simds + simd) * 8u + (lane >> 2);
+    mxfp8_grouped_body(w, sc, x, u_exp, u_cnt, u_off, u_pairs, y, p, row, group.y, lane & 3u, 4u);
+}
+
+kernel void expert_nvfp4_grouped(device const uchar* w [[buffer(0)]],
                                  device const uchar* sc [[buffer(1)]],
-                                 device const float* x [[buffer(4)]],
+                                 device const float* amax [[buffer(2)]],
+                                 device const float* denom [[buffer(3)]],
+                                 device const half* x [[buffer(4)]],
+                                 device const float* outer [[buffer(5)]],
                                  device const uint* u_exp [[buffer(6)]],
                                  device const uint* u_cnt [[buffer(7)]],
+                                 device const uint* u_off [[buffer(11)]],
                                  device const uint* u_pairs [[buffer(8)]],
                                  device float* y [[buffer(9)]],
                                  constant ExpertG& p [[buffer(10)]],
@@ -973,6 +1418,69 @@ kernel void expert_mxfp8_grouped(device const uchar* w [[buffer(0)]],
     if (row >= p.rows) return;
     uint e = u_exp[u];
     uint cnt = u_cnt[u];
+    uint off = u_off[u];
+    device const uchar* wr = w + ulong(e) * p.expert_bytes + ulong(row) * (p.cols / 2u);
+    device const uchar* sr = sc + ulong(e) * p.scale_bytes + ulong(row) * (p.cols / 16u);
+    device const half4* x4 = (device const half4*)x;
+    uint is4 = p.in_stride / 4u;
+    uint blocks = p.cols / 16u;
+    float alpha = amax[e] / denom[0];
+    for (uint j0 = 0; j0 < cnt; j0 += 4u) {
+        uint rem = min(4u, cnt - j0);
+        uint mk0 = u_pairs[off + j0];
+        uint mk1 = rem > 1u ? u_pairs[off + j0 + 1u] : mk0;
+        uint mk2 = rem > 2u ? u_pairs[off + j0 + 2u] : mk0;
+        uint mk3 = rem > 3u ? u_pairs[off + j0 + 3u] : mk0;
+        uint i0 = p.per_row_input ? mk0 : (mk0 / p.top);
+        uint i1 = p.per_row_input ? mk1 : (mk1 / p.top);
+        uint i2 = p.per_row_input ? mk2 : (mk2 / p.top);
+        uint i3 = p.per_row_input ? mk3 : (mk3 / p.top);
+        float a0 = 0, a1 = 0, a2 = 0, a3 = 0;
+        for (uint b = lane; b < blocks; b += 32u) {
+            uint2 packed = *(device const uint2*)(wr + b * 8u);
+            float s = e4m3_decode(sr[b]);
+            uint b4 = b * 4u;
+            float4 p0 = 0, p1 = 0, p2 = 0, p3 = 0;
+            half4 fs[4] = {fp4x4_h(packed.x), fp4x4_h(packed.x >> 16), fp4x4_h(packed.y), fp4x4_h(packed.y >> 16)};
+            for (uint t = 0; t < 4u; ++t) {
+                half4 f = fs[t];
+                uint k = b4 + t;
+                p0 += float4(f * x4[ulong(i0) * is4 + k]);
+                if (rem > 1u) p1 += float4(f * x4[ulong(i1) * is4 + k]);
+                if (rem > 2u) p2 += float4(f * x4[ulong(i2) * is4 + k]);
+                if (rem > 3u) p3 += float4(f * x4[ulong(i3) * is4 + k]);
+            }
+            a0 += ((p0.x + p0.y) + (p0.z + p0.w)) * s;
+            if (rem > 1u) a1 += ((p1.x + p1.y) + (p1.z + p1.w)) * s;
+            if (rem > 2u) a2 += ((p2.x + p2.y) + (p2.z + p2.w)) * s;
+            if (rem > 3u) a3 += ((p3.x + p3.y) + (p3.z + p3.w)) * s;
+        }
+        float t0 = simd_sum(a0); if (lane == 0) { float r = t0 * outer[i0] * alpha; y[ulong(mk0) * p.out_stride + row] = p.per_row_input ? rbf(r) : r; }
+        if (rem > 1u) { float t1 = simd_sum(a1); if (lane == 0) { float r = t1 * outer[i1] * alpha; y[ulong(mk1) * p.out_stride + row] = p.per_row_input ? rbf(r) : r; } }
+        if (rem > 2u) { float t2 = simd_sum(a2); if (lane == 0) { float r = t2 * outer[i2] * alpha; y[ulong(mk2) * p.out_stride + row] = p.per_row_input ? rbf(r) : r; } }
+        if (rem > 3u) { float t3 = simd_sum(a3); if (lane == 0) { float r = t3 * outer[i3] * alpha; y[ulong(mk3) * p.out_stride + row] = p.per_row_input ? rbf(r) : r; } }
+    }
+}
+
+kernel void expert_mxfp8_grouped(device const uchar* w [[buffer(0)]],
+                                 device const uchar* sc [[buffer(1)]],
+                                 device const float* x [[buffer(4)]],
+                                 device const uint* u_exp [[buffer(6)]],
+                                 device const uint* u_cnt [[buffer(7)]],
+                                 device const uint* u_off [[buffer(11)]],
+                                 device const uint* u_pairs [[buffer(8)]],
+                                 device float* y [[buffer(9)]],
+                                 constant ExpertG& p [[buffer(10)]],
+                                 uint2 group [[threadgroup_position_in_grid]],
+                                 uint simd [[simdgroup_index_in_threadgroup]],
+                                 uint simds [[simdgroups_per_threadgroup]],
+                                 uint lane [[thread_index_in_simdgroup]]) {
+    uint row = group.x * simds + simd;
+    uint u = group.y;
+    if (row >= p.rows) return;
+    uint e = u_exp[u];
+    uint cnt = u_cnt[u];
+    uint off = u_off[u];
     device const uint4* wr4 = (device const uint4*)(w + ulong(e) * p.expert_bytes + ulong(row) * p.cols);
     device const uchar* sr = sc + ulong(e) * p.scale_bytes + ulong(row) * (p.cols / 32u);
     device const float4* x4 = (device const float4*)x;
@@ -980,10 +1488,10 @@ kernel void expert_mxfp8_grouped(device const uchar* w [[buffer(0)]],
     uint blocks = p.cols / 32u;
     for (uint j0 = 0; j0 < cnt; j0 += 4u) {
         uint rem = min(4u, cnt - j0);
-        uint mk0 = u_pairs[u * 16u + j0];
-        uint mk1 = rem > 1u ? u_pairs[u * 16u + j0 + 1u] : mk0;
-        uint mk2 = rem > 2u ? u_pairs[u * 16u + j0 + 2u] : mk0;
-        uint mk3 = rem > 3u ? u_pairs[u * 16u + j0 + 3u] : mk0;
+        uint mk0 = u_pairs[off + j0];
+        uint mk1 = rem > 1u ? u_pairs[off + j0 + 1u] : mk0;
+        uint mk2 = rem > 2u ? u_pairs[off + j0 + 2u] : mk0;
+        uint mk3 = rem > 3u ? u_pairs[off + j0 + 3u] : mk0;
         uint i0 = p.per_row_input ? mk0 : (mk0 / p.top);
         uint i1 = p.per_row_input ? mk1 : (mk1 / p.top);
         uint i2 = p.per_row_input ? mk2 : (mk2 / p.top);
@@ -996,14 +1504,22 @@ kernel void expert_mxfp8_grouped(device const uchar* w [[buffer(0)]],
         for (uint b = lane; b < blocks; b += 32u) {
             uint4 w0 = wr4[b * 2u];
             uint4 w1 = wr4[b * 2u + 1u];
-            float4 f0 = e4m3x4(w0.x), f1 = e4m3x4(w0.y), f2 = e4m3x4(w0.z), f3 = e4m3x4(w0.w);
-            float4 f4 = e4m3x4(w1.x), f5 = e4m3x4(w1.y), f6 = e4m3x4(w1.z), f7 = e4m3x4(w1.w);
             float s = as_type<float>(uint(sr[b]) << 23);
             uint b8 = b * 8u;
-            { float4 pt = (f0*x0[b8] + f1*x0[b8+1u] + f2*x0[b8+2u] + f3*x0[b8+3u]) + (f4*x0[b8+4u] + f5*x0[b8+5u] + f6*x0[b8+6u] + f7*x0[b8+7u]); a0 += ((pt.x + pt.y) + (pt.z + pt.w)) * s; }
-            if (rem > 1u) { float4 pt = (f0*x1[b8] + f1*x1[b8+1u] + f2*x1[b8+2u] + f3*x1[b8+3u]) + (f4*x1[b8+4u] + f5*x1[b8+5u] + f6*x1[b8+6u] + f7*x1[b8+7u]); a1 += ((pt.x + pt.y) + (pt.z + pt.w)) * s; }
-            if (rem > 2u) { float4 pt = (f0*x2[b8] + f1*x2[b8+1u] + f2*x2[b8+2u] + f3*x2[b8+3u]) + (f4*x2[b8+4u] + f5*x2[b8+5u] + f6*x2[b8+6u] + f7*x2[b8+7u]); a2 += ((pt.x + pt.y) + (pt.z + pt.w)) * s; }
-            if (rem > 3u) { float4 pt = (f0*x3[b8] + f1*x3[b8+1u] + f2*x3[b8+2u] + f3*x3[b8+3u]) + (f4*x3[b8+4u] + f5*x3[b8+5u] + f6*x3[b8+6u] + f7*x3[b8+7u]); a3 += ((pt.x + pt.y) + (pt.z + pt.w)) * s; }
+            uint ws[8] = {w0.x, w0.y, w0.z, w0.w, w1.x, w1.y, w1.z, w1.w};
+            float d0 = 0.0f, d1 = 0.0f, d2 = 0.0f, d3 = 0.0f;
+            for (uint t = 0; t < 8u; ++t) {
+                float4 f = e4m3x4(ws[t]);
+                uint k = b8 + t;
+                d0 += dot(f, x0[k]);
+                if (rem > 1u) d1 += dot(f, x1[k]);
+                if (rem > 2u) d2 += dot(f, x2[k]);
+                if (rem > 3u) d3 += dot(f, x3[k]);
+            }
+            a0 += d0 * s;
+            if (rem > 1u) a1 += d1 * s;
+            if (rem > 2u) a2 += d2 * s;
+            if (rem > 3u) a3 += d3 * s;
         }
         float t0 = simd_sum(a0); if (lane == 0) y[ulong(mk0) * p.out_stride + row] = rbf(t0);
         if (rem > 1u) { float t1 = simd_sum(a1); if (lane == 0) y[ulong(mk1) * p.out_stride + row] = rbf(t1); }
@@ -1067,7 +1583,8 @@ kernel void combine_batch(device const float* rows_buf [[buffer(0)]],
 kernel void cert_head_xnorm_batch(device const float4* x [[buffer(0)]],
                                   device float* state [[buffer(1)]],
                                   device uint* count [[buffer(2)]],
-                                  constant uint& n [[buffer(3)]],
+                                  device half4* xh [[buffer(3)]],
+                                  constant uint& n [[buffer(4)]],
                                   uint m [[threadgroup_position_in_grid]],
                                   uint tid [[thread_position_in_threadgroup]],
                                   uint threads [[threads_per_threadgroup]],
@@ -1076,8 +1593,13 @@ kernel void cert_head_xnorm_batch(device const float4* x [[buffer(0)]],
     threadgroup float part[20];
     uint n4 = n / 4u;
     device const float4* xm = x + ulong(m) * n4;
-    float s = tid < n4 ? dot(xm[tid], xm[tid]) : 0.0f;
-    for (uint i = tid + threads; i < n4; i += threads) s += dot(xm[i], xm[i]);
+    device half4* xhm = xh + ulong(m) * n4;
+    float s = 0.0f;
+    for (uint i = tid; i < n4; i += threads) {
+        float4 v = xm[i];
+        xhm[i] = half4(v);
+        s += dot(v, v);
+    }
     s = simd_sum(s);
     if (lane == 0) part[simd] = s;
     threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -1094,7 +1616,7 @@ struct CertHeadB { uint vocab; uint cols; uint ng; uint ntg; uint m_base; float 
 kernel void cert_head_scan_rows(device const uint4* q4 [[buffer(0)]],
                                 device const half* sc [[buffer(1)]],
                                 device const float* err [[buffer(2)]],
-                                device const float4* x4 [[buffer(3)]],
+                                device const half4* x4 [[buffer(3)]],
                                 device const float* state [[buffer(4)]],
                                 device float* ub_out [[buffer(5)]],
                                 device float* tg_val [[buffer(6)]],
@@ -1104,54 +1626,88 @@ kernel void cert_head_scan_rows(device const uint4* q4 [[buffer(0)]],
                                 uint simd [[simdgroup_index_in_threadgroup]],
                                 uint simds [[simdgroups_per_threadgroup]],
                                 uint lane [[thread_index_in_simdgroup]]) {
-    threadgroup float svals[8];
-    threadgroup uint srows[8];
-    uint row = group * simds + simd;
+    threadgroup float svals[32];
+    threadgroup uint srows[32];
+    uint sub = lane >> 3;
+    uint sl = lane & 7u;
+    uint slot = simd * 4u + sub;
+    uint row = (group * simds + simd) * 4u + sub;
     uint xs4 = p.cols / 4u;
     float a0 = 0, a1 = 0, a2 = 0, a3 = 0, a4 = 0, a5 = 0, a6 = 0, a7 = 0;
     if (row < p.vocab) {
         device const uint4* qr = q4 + ulong(row) * p.ng;
         device const half* sr = sc + ulong(row) * p.ng;
-        for (uint g = lane; g < p.ng; g += 32u) {
+        for (uint g = sl; g < p.ng; g += 8u) {
             uint4 pk = qr[g];
             float s = float(sr[g]);
-            float4 w0 = u4_lo(pk.x), w1 = u4_hi(pk.x), w2 = u4_lo(pk.y), w3 = u4_hi(pk.y);
-            float4 w4 = u4_lo(pk.z), w5 = u4_hi(pk.z), w6 = u4_lo(pk.w), w7 = u4_hi(pk.w);
             uint g8 = g * 8u;
-            if (ROWS > 0u) { device const float4* xg = x4 + ulong(p.m_base + 0u) * xs4 + g8; float4 d = w0*xg[0]+w1*xg[1]+w2*xg[2]+w3*xg[3]+w4*xg[4]+w5*xg[5]+w6*xg[6]+w7*xg[7]; a0 += ((d.x+d.y)+(d.z+d.w))*s; }
-            if (ROWS > 1u) { device const float4* xg = x4 + ulong(p.m_base + 1u) * xs4 + g8; float4 d = w0*xg[0]+w1*xg[1]+w2*xg[2]+w3*xg[3]+w4*xg[4]+w5*xg[5]+w6*xg[6]+w7*xg[7]; a1 += ((d.x+d.y)+(d.z+d.w))*s; }
-            if (ROWS > 2u) { device const float4* xg = x4 + ulong(p.m_base + 2u) * xs4 + g8; float4 d = w0*xg[0]+w1*xg[1]+w2*xg[2]+w3*xg[3]+w4*xg[4]+w5*xg[5]+w6*xg[6]+w7*xg[7]; a2 += ((d.x+d.y)+(d.z+d.w))*s; }
-            if (ROWS > 3u) { device const float4* xg = x4 + ulong(p.m_base + 3u) * xs4 + g8; float4 d = w0*xg[0]+w1*xg[1]+w2*xg[2]+w3*xg[3]+w4*xg[4]+w5*xg[5]+w6*xg[6]+w7*xg[7]; a3 += ((d.x+d.y)+(d.z+d.w))*s; }
-            if (ROWS > 4u) { device const float4* xg = x4 + ulong(p.m_base + 4u) * xs4 + g8; float4 d = w0*xg[0]+w1*xg[1]+w2*xg[2]+w3*xg[3]+w4*xg[4]+w5*xg[5]+w6*xg[6]+w7*xg[7]; a4 += ((d.x+d.y)+(d.z+d.w))*s; }
-            if (ROWS > 5u) { device const float4* xg = x4 + ulong(p.m_base + 5u) * xs4 + g8; float4 d = w0*xg[0]+w1*xg[1]+w2*xg[2]+w3*xg[3]+w4*xg[4]+w5*xg[5]+w6*xg[6]+w7*xg[7]; a5 += ((d.x+d.y)+(d.z+d.w))*s; }
-            if (ROWS > 6u) { device const float4* xg = x4 + ulong(p.m_base + 6u) * xs4 + g8; float4 d = w0*xg[0]+w1*xg[1]+w2*xg[2]+w3*xg[3]+w4*xg[4]+w5*xg[5]+w6*xg[6]+w7*xg[7]; a6 += ((d.x+d.y)+(d.z+d.w))*s; }
-            if (ROWS > 7u) { device const float4* xg = x4 + ulong(p.m_base + 7u) * xs4 + g8; float4 d = w0*xg[0]+w1*xg[1]+w2*xg[2]+w3*xg[3]+w4*xg[4]+w5*xg[5]+w6*xg[6]+w7*xg[7]; a7 += ((d.x+d.y)+(d.z+d.w))*s; }
+            half d0 = 0, d1 = 0, d2 = 0, d3 = 0, d4 = 0, d5 = 0, d6 = 0, d7 = 0;
+            uint ws[4] = {pk.x, pk.y, pk.z, pk.w};
+            for (uint t = 0; t < 4u; ++t) {
+                uint ww = ws[t];
+                uint k0 = g8 + t * 2u;
+                {
+                    half4 w = u4_lo_h_fast(ww);
+                    if (ROWS > 0u) d0 += dot(w, x4[ulong(p.m_base + 0u) * xs4 + k0]);
+                    if (ROWS > 1u) d1 += dot(w, x4[ulong(p.m_base + 1u) * xs4 + k0]);
+                    if (ROWS > 2u) d2 += dot(w, x4[ulong(p.m_base + 2u) * xs4 + k0]);
+                    if (ROWS > 3u) d3 += dot(w, x4[ulong(p.m_base + 3u) * xs4 + k0]);
+                    if (ROWS > 4u) d4 += dot(w, x4[ulong(p.m_base + 4u) * xs4 + k0]);
+                    if (ROWS > 5u) d5 += dot(w, x4[ulong(p.m_base + 5u) * xs4 + k0]);
+                    if (ROWS > 6u) d6 += dot(w, x4[ulong(p.m_base + 6u) * xs4 + k0]);
+                    if (ROWS > 7u) d7 += dot(w, x4[ulong(p.m_base + 7u) * xs4 + k0]);
+                }
+                {
+                    half4 w = u4_hi_h_fast(ww);
+                    uint k1 = k0 + 1u;
+                    if (ROWS > 0u) d0 += dot(w, x4[ulong(p.m_base + 0u) * xs4 + k1]);
+                    if (ROWS > 1u) d1 += dot(w, x4[ulong(p.m_base + 1u) * xs4 + k1]);
+                    if (ROWS > 2u) d2 += dot(w, x4[ulong(p.m_base + 2u) * xs4 + k1]);
+                    if (ROWS > 3u) d3 += dot(w, x4[ulong(p.m_base + 3u) * xs4 + k1]);
+                    if (ROWS > 4u) d4 += dot(w, x4[ulong(p.m_base + 4u) * xs4 + k1]);
+                    if (ROWS > 5u) d5 += dot(w, x4[ulong(p.m_base + 5u) * xs4 + k1]);
+                    if (ROWS > 6u) d6 += dot(w, x4[ulong(p.m_base + 6u) * xs4 + k1]);
+                    if (ROWS > 7u) d7 += dot(w, x4[ulong(p.m_base + 7u) * xs4 + k1]);
+                }
+            }
+            if (ROWS > 0u) a0 += float(d0) * s;
+            if (ROWS > 1u) a1 += float(d1) * s;
+            if (ROWS > 2u) a2 += float(d2) * s;
+            if (ROWS > 3u) a3 += float(d3) * s;
+            if (ROWS > 4u) a4 += float(d4) * s;
+            if (ROWS > 5u) a5 += float(d5) * s;
+            if (ROWS > 6u) a6 += float(d6) * s;
+            if (ROWS > 7u) a7 += float(d7) * s;
         }
     }
     float er = row < p.vocab ? err[row] : 0.0f;
     for (uint m = 0; m < ROWS; ++m) {
         uint gm = p.m_base + m;
         float av = m == 0u ? a0 : (m == 1u ? a1 : (m == 2u ? a2 : (m == 3u ? a3 : (m == 4u ? a4 : (m == 5u ? a5 : (m == 6u ? a6 : a7))))));
-        if (row < p.vocab) {
-            float shat = simd_sum(av);
-            if (lane == 0) {
+        float shat = simd8_sum(av);
+        if (sl == 0u) {
+            if (row < p.vocab) {
                 ub_out[ulong(gm) * p.vocab + row] = shat + state[gm * 4u + 2u] * er;
-                svals[simd] = shat;
-                srows[simd] = row;
+                svals[slot] = shat;
+                srows[slot] = row;
+            } else {
+                svals[slot] = -INFINITY;
+                srows[slot] = 0xffffffffu;
             }
-        } else if (lane == 0) {
-            svals[simd] = -INFINITY;
-            srows[simd] = 0xffffffffu;
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        if (simd == 0 && lane == 0) {
-            float bv = svals[0];
-            uint br = srows[0];
-            for (uint i = 1; i < simds; ++i) {
-                if (svals[i] > bv || (svals[i] == bv && srows[i] < br)) { bv = svals[i]; br = srows[i]; }
+        if (simd == 0u) {
+            float bv = lane < (simds * 4u) ? svals[lane] : -INFINITY;
+            uint br = lane < (simds * 4u) ? srows[lane] : 0xffffffffu;
+            for (uint off = 16u; off > 0u; off >>= 1) {
+                float ov = simd_shuffle_xor(bv, off);
+                uint oi = simd_shuffle_xor(br, off);
+                if (ov > bv || (ov == bv && oi < br)) { bv = ov; br = oi; }
             }
-            tg_val[ulong(gm) * p.ntg + group] = bv;
-            tg_row[ulong(gm) * p.ntg + group] = br;
+            if (lane == 0u) {
+                tg_val[ulong(gm) * p.ntg + group] = bv;
+                tg_row[ulong(gm) * p.ntg + group] = br;
+            }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
@@ -1305,3 +1861,265 @@ kernel void gemv_q4_f32_rows(device const uint4* q4 [[buffer(0)]],
     if (ROWS > 6u) { float t = simd_sum(a6); if (lane == 0) y[6ul * p.y_stride + row] = p.round_out ? rbf(t) : t; }
     if (ROWS > 7u) { float t = simd_sum(a7); if (lane == 0) y[7ul * p.y_stride + row] = p.round_out ? rbf(t) : t; }
 }
+
+#if defined(__METAL_VERSION__) && __METAL_VERSION__ >= 400
+#include <metal_tensor>
+#include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>
+
+struct CastBf16P { uint M; uint M_pad; uint K; uint x_stride; };
+
+kernel void f32_to_bf16_rows(device const float* x [[buffer(0)]],
+                             device bfloat* y [[buffer(1)]],
+                             constant CastBf16P& p [[buffer(2)]],
+                             uint2 gid [[thread_position_in_grid]]) {
+    uint k = gid.x, m = gid.y;
+    if (k >= p.K || m >= p.M_pad) return;
+    y[ulong(m) * p.K + k] = m < p.M ? bfloat(x[ulong(m) * p.x_stride + k]) : bfloat(0.0f);
+}
+
+struct M4Bf12P { uint M; uint M_pad; uint N; uint K; uint round_out; uint has_outliers; uint elut[16]; };
+
+inline ushort4 bf12_u16_4(uint smw, uint ex16, constant uint* elut) {
+    return ushort4(
+        ushort(((smw << 8) & 0x8000u) | (smw & 0x7fu) | (elut[ex16 & 15u] >> 16)),
+        ushort((smw & 0x8000u) | ((smw >> 8) & 0x7fu) | (elut[(ex16 >> 4) & 15u] >> 16)),
+        ushort(((smw >> 8) & 0x8000u) | ((smw >> 16) & 0x7fu) | (elut[(ex16 >> 8) & 15u] >> 16)),
+        ushort(((smw >> 16) & 0x8000u) | ((smw >> 24) & 0x7fu) | (elut[(ex16 >> 12) & 15u] >> 16))
+    );
+}
+
+kernel void m4_bf12_mm32(device const uint4* SM [[buffer(0)]],
+                         device const uint2* EX [[buffer(1)]],
+                         device bfloat* X [[buffer(2)]],
+                         device float* Y [[buffer(3)]],
+                         constant M4Bf12P& p [[buffer(4)]],
+                         uint2 tgid [[threadgroup_position_in_grid]],
+                         uint tid [[thread_index_in_threadgroup]]) {
+    threadgroup bfloat Wtg[64 * 32];
+    int n0 = int(tgid.x) * 64;
+    int m0 = int(tgid.y) * 32;
+    tensor<device bfloat, dextents<int32_t, 2>, tensor_inline> tX(X, dextents<int32_t, 2>(int(p.K), int(p.M_pad)));
+    tensor<threadgroup bfloat, extents<int32_t, 32, 64>, tensor_inline> tW(Wtg, extents<int32_t, 32, 64>());
+    tensor<device float, dextents<int32_t, 2>, tensor_inline> tY(Y, dextents<int32_t, 2>(int(p.N), int(p.M)));
+    constexpr auto desc = mpp::tensor_ops::matmul2d_descriptor(32, 64, 32, false, true, false, mpp::tensor_ops::matmul2d_descriptor::mode::multiply_accumulate);
+    mpp::tensor_ops::matmul2d<desc, execution_simdgroups<4>> op;
+    auto cT = op.get_destination_cooperative_tensor<decltype(tX.slice<32, 32>(0, 0)), decltype(tW), float>();
+    #pragma clang loop unroll(full)
+    for (uint16_t i = 0; i < cT.get_capacity(); ++i) if (cT.is_valid_element(i)) cT[i] = 0.0f;
+    uint chunks16 = p.K / 16u;
+    uint r = tid >> 1;
+    uint sub16 = tid & 1u;
+    uint row = uint(n0) + r;
+    for (uint c0 = 0; c0 < chunks16; c0 += 2u) {
+        if (row < p.N) {
+            uint c = c0 + sub16;
+            uint4 sm = SM[ulong(row) * chunks16 + c];
+            uint2 ex = EX[ulong(row) * chunks16 + c];
+            threadgroup ushort4* dst = (threadgroup ushort4*)(Wtg + r * 32u + sub16 * 16u);
+            dst[0] = bf12_u16_4(sm.x, ex.x & 0xffffu, p.elut);
+            dst[1] = bf12_u16_4(sm.y, ex.x >> 16, p.elut);
+            dst[2] = bf12_u16_4(sm.z, ex.y & 0xffffu, p.elut);
+            dst[3] = bf12_u16_4(sm.w, ex.y >> 16, p.elut);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        auto sX = tX.slice<32, 32>(int(c0 * 16u), m0);
+        op.run(sX, tW, cT);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (p.round_out && !p.has_outliers) {
+        #pragma clang loop unroll(full)
+        for (uint16_t i = 0; i < cT.get_capacity(); ++i) if (cT.is_valid_element(i)) cT[i] = rbf(cT[i]);
+    }
+    auto sY = tY.slice(n0, m0);
+    cT.store(sY);
+}
+
+struct OutlierPatchP { uint M; uint N; uint x_stride; uint y_stride; uint round_out; };
+
+kernel void bf12_outlier_patch_rows(device const uint* ro_buf [[buffer(0)]],
+                                    device const uint* op_buf [[buffer(1)]],
+                                    device const float* xf [[buffer(2)]],
+                                    device float* y [[buffer(3)]],
+                                    constant OutlierPatchP& p [[buffer(4)]],
+                                    uint2 gid [[thread_position_in_grid]]) {
+    uint row = gid.x, m = gid.y;
+    if (row >= p.N || m >= p.M) return;
+    uint s = ro_buf[row];
+    uint e = ro_buf[row + 1u];
+    float v = y[ulong(m) * p.y_stride + row];
+    if (s < e) {
+        device const float* xm = xf + ulong(m) * p.x_stride;
+        for (uint j = s; j < e; ++j) {
+            uint pk = op_buf[j];
+            v += bfv(ushort(pk & 0xffffu)) * xm[pk >> 16];
+        }
+    }
+    y[ulong(m) * p.y_stride + row] = p.round_out ? rbf(v) : v;
+}
+
+kernel void m4_nvfp4_g5p(device const uchar* w [[buffer(0)]],
+                         device const uchar* sc [[buffer(1)]],
+                         device const float* amax [[buffer(2)]],
+                         device const float* denom [[buffer(3)]],
+                         device const half* x [[buffer(4)]],
+                         device const float* outer [[buffer(5)]],
+                         device const uint* u_exp [[buffer(6)]],
+                         device const uint* u_cnt [[buffer(7)]],
+                         device const uint* u_off [[buffer(8)]],
+                         device const uint* u_pairs [[buffer(9)]],
+                         device const uint* u_bidx [[buffer(10)]],
+                         device const uint* ind_slot [[buffer(11)]],
+                         device float* y [[buffer(12)]],
+                         constant ExpertG& p [[buffer(13)]],
+                         uint2 tgid [[threadgroup_position_in_grid]],
+                         uint tid [[thread_index_in_threadgroup]]) {
+    uint bi = tgid.y;
+    if (bi >= ind_slot[3]) return;
+    threadgroup half Wtg[64 * 32];
+    threadgroup half Xtg[16 * 32];
+    threadgroup float Ytg[16 * 64];
+    threadgroup uint mks[16];
+    threadgroup uint ins[16];
+    uint u = u_bidx[bi];
+    uint e = u_exp[u];
+    uint cnt = u_cnt[u];
+    uint off = u_off[u];
+    uint n0 = tgid.x * 64u;
+    device const uchar* we = w + ulong(e) * p.expert_bytes;
+    device const uchar* se = sc + ulong(e) * p.scale_bytes;
+    device const half4* x4 = (device const half4*)x;
+    uint is4 = p.in_stride / 4u;
+    uint blocks = p.cols / 16u;
+    float alpha = amax[e] / denom[0];
+    tensor<threadgroup half, extents<int32_t, 32, 16>, tensor_inline> tX(Xtg, extents<int32_t, 32, 16>());
+    tensor<threadgroup half, extents<int32_t, 32, 64>, tensor_inline> tW(Wtg, extents<int32_t, 32, 64>());
+    tensor<threadgroup float, extents<int32_t, 64, 16>, tensor_inline> tY(Ytg, extents<int32_t, 64, 16>());
+    constexpr auto desc = mpp::tensor_ops::matmul2d_descriptor(16, 64, 32, false, true, false, mpp::tensor_ops::matmul2d_descriptor::mode::multiply_accumulate);
+    mpp::tensor_ops::matmul2d<desc, execution_simdgroups<4>> op;
+    uint wr = tid >> 1;
+    uint sub16 = tid & 1u;
+    uint row = n0 + wr;
+    uint xr = tid >> 3;
+    uint xc4 = tid & 7u;
+    for (uint j0 = 0; j0 < cnt; j0 += 16u) {
+        uint rem = min(16u, cnt - j0);
+        if (tid < rem) {
+            uint mk = u_pairs[off + j0 + tid];
+            mks[tid] = mk;
+            ins[tid] = p.per_row_input ? mk : (mk / p.top);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        auto cT = op.get_destination_cooperative_tensor<decltype(tX), decltype(tW), float>();
+        #pragma clang loop unroll(full)
+        for (uint16_t i = 0; i < cT.get_capacity(); ++i) if (cT.is_valid_element(i)) cT[i] = 0.0f;
+        for (uint b0 = 0; b0 < blocks; b0 += 2u) {
+            if (row < p.rows) {
+                uint b = b0 + sub16;
+                uint2 pk = *(device const uint2*)(we + ulong(row) * (p.cols / 2u) + b * 8u);
+                half s = half(e4m3_decode(se[ulong(row) * blocks + b]));
+                threadgroup half4* dst = (threadgroup half4*)(Wtg + wr * 32u + sub16 * 16u);
+                dst[0] = fp4x4_h(pk.x) * s;
+                dst[1] = fp4x4_h(pk.x >> 16) * s;
+                dst[2] = fp4x4_h(pk.y) * s;
+                dst[3] = fp4x4_h(pk.y >> 16) * s;
+            }
+            threadgroup half4* xdst = (threadgroup half4*)(Xtg + xr * 32u);
+            xdst[xc4] = xr < rem ? x4[ulong(ins[xr]) * is4 + b0 * 4u + xc4] : half4(0);
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            op.run(tX, tW, cT);
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+        cT.store(tY);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint idx = tid; idx < rem * 64u; idx += 128u) {
+            uint j = idx >> 6;
+            uint c = idx & 63u;
+            uint out_r = n0 + c;
+            if (out_r < p.rows) {
+                float r = Ytg[idx] * outer[ins[j]] * alpha;
+                y[ulong(mks[j]) * p.out_stride + out_r] = p.per_row_input ? rbf(r) : r;
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+}
+
+kernel void m4_mxfp8_g5p(device const uchar* w [[buffer(0)]],
+                         device const uchar* sc [[buffer(1)]],
+                         device const float* x [[buffer(4)]],
+                         device const uint* u_exp [[buffer(6)]],
+                         device const uint* u_cnt [[buffer(7)]],
+                         device const uint* u_off [[buffer(8)]],
+                         device const uint* u_pairs [[buffer(9)]],
+                         device const uint* u_bidx [[buffer(10)]],
+                         device const uint* ind_slot [[buffer(11)]],
+                         device float* y [[buffer(12)]],
+                         constant ExpertG& p [[buffer(13)]],
+                         uint2 tgid [[threadgroup_position_in_grid]],
+                         uint tid [[thread_index_in_threadgroup]]) {
+    uint bi = tgid.y;
+    if (bi >= ind_slot[3]) return;
+    threadgroup bfloat Wtg[64 * 32];
+    threadgroup bfloat Xtg[16 * 32];
+    threadgroup float Ytg[16 * 64];
+    threadgroup uint mks[16];
+    threadgroup uint ins[16];
+    uint u = u_bidx[bi];
+    uint e = u_exp[u];
+    uint cnt = u_cnt[u];
+    uint off = u_off[u];
+    uint n0 = tgid.x * 64u;
+    device const uchar* we = w + ulong(e) * p.expert_bytes;
+    device const uchar* se = sc + ulong(e) * p.scale_bytes;
+    device const float4* x4 = (device const float4*)x;
+    uint is4 = p.in_stride / 4u;
+    uint blocks = p.cols / 32u;
+    tensor<threadgroup bfloat, extents<int32_t, 32, 16>, tensor_inline> tX(Xtg, extents<int32_t, 32, 16>());
+    tensor<threadgroup bfloat, extents<int32_t, 32, 64>, tensor_inline> tW(Wtg, extents<int32_t, 32, 64>());
+    tensor<threadgroup float, extents<int32_t, 64, 16>, tensor_inline> tY(Ytg, extents<int32_t, 64, 16>());
+    constexpr auto desc = mpp::tensor_ops::matmul2d_descriptor(16, 64, 32, false, true, false, mpp::tensor_ops::matmul2d_descriptor::mode::multiply_accumulate);
+    mpp::tensor_ops::matmul2d<desc, execution_simdgroups<4>> op;
+    uint wr = tid >> 1;
+    uint sub16 = tid & 1u;
+    uint row = n0 + wr;
+    uint xr = tid >> 3;
+    uint xc4 = tid & 7u;
+    for (uint j0 = 0; j0 < cnt; j0 += 16u) {
+        uint rem = min(16u, cnt - j0);
+        if (tid < rem) {
+            uint mk = u_pairs[off + j0 + tid];
+            mks[tid] = mk;
+            ins[tid] = p.per_row_input ? mk : (mk / p.top);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        auto cT = op.get_destination_cooperative_tensor<decltype(tX), decltype(tW), float>();
+        #pragma clang loop unroll(full)
+        for (uint16_t i = 0; i < cT.get_capacity(); ++i) if (cT.is_valid_element(i)) cT[i] = 0.0f;
+        for (uint b = 0; b < blocks; ++b) {
+            if (row < p.rows) {
+                uint4 pk = *(device const uint4*)(we + ulong(row) * p.cols + b * 32u + sub16 * 16u);
+                float s = as_type<float>(uint(se[ulong(row) * blocks + b]) << 23);
+                threadgroup bfloat4* dst = (threadgroup bfloat4*)(Wtg + wr * 32u + sub16 * 16u);
+                dst[0] = bfloat4(e4m3x4(pk.x) * s);
+                dst[1] = bfloat4(e4m3x4(pk.y) * s);
+                dst[2] = bfloat4(e4m3x4(pk.z) * s);
+                dst[3] = bfloat4(e4m3x4(pk.w) * s);
+            }
+            threadgroup bfloat4* xdst = (threadgroup bfloat4*)(Xtg + xr * 32u);
+            xdst[xc4] = xr < rem ? bfloat4(x4[ulong(ins[xr]) * is4 + b * 8u + xc4]) : bfloat4(bfloat(0.0f));
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            op.run(tX, tW, cT);
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+        cT.store(tY);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint idx = tid; idx < rem * 64u; idx += 128u) {
+            uint j = idx >> 6;
+            uint c = idx & 63u;
+            uint out_r = n0 + c;
+            if (out_r < p.rows) y[ulong(mks[j]) * p.out_stride + out_r] = rbf(Ytg[idx]);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+}
+#endif

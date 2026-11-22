@@ -140,10 +140,11 @@ test('delphi generate opt-in --mode lean and --mode turbo report mode and preser
 test('delphi generate batched prefill and speculative verify match --spec off token-for-token', { tags: ['model'], timeout: 900_000 }, () => {
   const deadline = Date.now() + 900_000;
   withBuiltDelphi(deadline, (bin) => {
-    for (const c of [fibonacci, truth.cases[2]]) {
-      const offRun = spawnSync(bin, ['generate', '--model', model, '--input-ids', JSON.stringify(c.input_ids), '--steps', '64', '--spec', 'off'], { encoding: 'utf8', timeout: remainingMs(deadline) });
+    const widePrompt = Array.from({ length: 8 }, () => fibonacci.input_ids).flat();
+    for (const ids of [fibonacci.input_ids, truth.cases[2].input_ids, widePrompt]) {
+      const offRun = spawnSync(bin, ['generate', '--model', model, '--input-ids', JSON.stringify(ids), '--steps', '64', '--spec', 'off'], { encoding: 'utf8', timeout: remainingMs(deadline) });
       checkRun('delphi generate --spec off', offRun);
-      const specRun = spawnSync(bin, ['generate', '--model', model, '--input-ids', JSON.stringify(c.input_ids), '--steps', '64', '--spec', 'auto'], { encoding: 'utf8', timeout: remainingMs(deadline) });
+      const specRun = spawnSync(bin, ['generate', '--model', model, '--input-ids', JSON.stringify(ids), '--steps', '64', '--spec', 'auto'], { encoding: 'utf8', timeout: remainingMs(deadline) });
       checkRun('delphi generate --spec auto', specRun);
       expect((JSON.parse(specRun.stdout) as Generated).output_ids).toEqual((JSON.parse(offRun.stdout) as Generated).output_ids);
     }
