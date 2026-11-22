@@ -95,7 +95,7 @@ float f(NSDictionary* d, NSString* k) { return [d[k] floatValue]; }
 class Engine {
 public:
     static constexpr uint32_t MAX_BATCH = 128;
-    static constexpr uint32_t MAX_LOGITS_BATCH = 32;
+    static constexpr uint32_t MAX_LOGITS_BATCH = 64;
     static constexpr uint32_t PERSIST_SLOTS = 64;
     enum LogitsMode { LOGITS_NONE = 0, LOGITS_LAST = 1, LOGITS_ALL = 2 };
 
@@ -111,7 +111,7 @@ public:
     id<MTLComputePipelineState> p_ctl_norm, p_ctl_mix_norm, p_embed, p_softcap, p_argmax, p_round;
     id<MTLComputePipelineState> p_ch_build, p_ch_xnorm, p_ch_scan, p_ch_tau, p_ch_filter, p_ch_setup, p_ch_rescore, p_ch_argmax;
     id<MTLComputePipelineState> p_bf12_hist, p_bf12_pack, p_gemv12;
-    id<MTLComputePipelineState> p_embed_b, p_norm_b, p_res_b, p_ctl_norm_b, p_ctl_mix_b, p_sconv_b, p_conv_commit;
+    id<MTLComputePipelineState> p_embed_b, p_norm_b, p_res_b, p_ctl_norm_b, p_ctl_mix_b, p_sconv_b, p_conv_commit, p_kv_compact;
     id<MTLComputePipelineState> p_clip_b, p_clip_kv_b, p_rel_b, p_attend_b, p_route_b, p_union, p_env4_g, p_emxf8_g, p_emxf8_g8, p_emxf8_g4, p_combine_b;
     id<MTLComputePipelineState> p_env4_g1_16, p_env4_g1_8, p_env4_g24_16, p_env4_g24_8, p_env4_g5p_16, p_env4_g5p_8;
     id<MTLComputePipelineState> p_f32_to_bf16 = nil, p_m4_bf12_mm32 = nil, p_bf12_outlier_patch = nil, p_m4_nvfp4_g5p = nil, p_m4_mxfp8_g5p = nil;
@@ -136,7 +136,7 @@ public:
     bool mtp_ready = false;
     bool has_m4_mpp = false;
     uint32_t eff_top = 8;
-    std::array<double, 9> cost_ms = {0.0, 21.6, 30.1, 35.8, 40.3, 47.9, 57.6, 63.4, 71.8};
+    std::array<double, 13> cost_ms = {0.0, 21.6, 30.1, 35.8, 40.3, 47.9, 57.6, 63.4, 71.8, 80.0, 88.0, 96.0, 104.0};
     struct MtpQ4Mat { uint64_t q4_off = 0, sc_off = 0; uint32_t rows = 0, cols = 0; };
     struct MtpLayer {
         bool local = false;
@@ -157,8 +157,22 @@ public:
     std::vector<id<MTLBuffer>> m_kcache, m_vcache;
     id<MTLBuffer> m_f_rnn = nil, m_ctx_x = nil, m_ctx_kv = nil, m_h = nil, m_hn = nil, m_h1 = nil;
     id<MTLBuffer> m_qkv = nil, m_attn_out = nil, m_gu = nil, m_mlp_h = nil, m_base_logits = nil;
-    id<MTLBuffer> m_rnn_state = nil, m_rnn_in = nil, m_rnn_proj_out = nil, m_latent = nil;
+    id<MTLBuffer> m_rnn_state[2] = {nil, nil}, m_beam_tok[2] = {nil, nil}, m_rnn_in = nil, m_rnn_proj_out = nil, m_latent = nil;
     id<MTLBuffer> m_tg_val = nil, m_tg_row = nil, m_tg_sum = nil, m_out = nil;
+    struct TreeSpec {
+        uint32_t is_tree = 0;
+        uint32_t dep[16] = {};
+        uint32_t mask[16] = {};
+        uint32_t p1[16] = {};
+        uint32_t p2[16] = {};
+        uint32_t p3[16] = {};
+    };
+    TreeSpec active_tree{};
+    uint32_t pending_conv_src[3] = {0, 0, 0};
+    bool has_pending_conv = false;
+    uint32_t pending_kv_pos0 = 0;
+    uint32_t pending_kv_count = 0;
+    uint32_t pending_kv_src[16] = {};
     uint32_t q_stride = 0, k_stride_local = 0, k_stride_global = 0;
     uint64_t s_qbundle, s_kbundle, s_vbundle;
     uint64_t s_q, s_qc, s_r, s_rc, s_gate, s_sinks, s_kraw, s_vraw, s_k, s_v, s_dynk, s_dynv, s_rel, s_gated;
@@ -295,6 +309,7 @@ public:
         p_ctl_mix_b = pipeline(gpu, @"ctl_mix_norm_batch");
         p_sconv_b = pipeline(gpu, @"sconv_batch");
         p_conv_commit = pipeline(gpu, @"conv_commit_all");
+        p_kv_compact = pipeline(gpu, @"kv_compact_tree");
         p_clip_b = pipeline(gpu, @"clip_rows_batch");
         p_clip_kv_b = pipeline(gpu, @"clip_kv_store_batch");
         p_rel_b = pipeline(gpu, @"rel_bias_batch");
@@ -445,8 +460,8 @@ public:
         if (!conv_buf || !conv_meta) { error = "conv state allocation failed"; return false; }
         reset_state();
         eff_top = (mode == "turbo") ? std::min<uint32_t>(4u, c.top) : c.top;
-        if (mode == "lean") cost_ms = {0.0, 17.1, 25.5, 31.2, 35.7, 43.3, 53.0, 58.8, 67.2};
-        else if (mode == "turbo") cost_ms = {0.0, 13.2, 18.8, 23.0, 26.8, 32.0, 38.2, 43.0, 48.5};
+        if (mode == "lean") cost_ms = {0.0, 17.6, 22.4, 30.1, 33.8, 41.4, 47.2, 54.2, 61.9, 68.5, 75.0, 82.0, 88.9};
+        else if (mode == "turbo") cost_ms = {0.0, 13.4, 16.8, 21.5, 25.6, 31.0, 35.9, 39.4, 45.3, 50.0, 54.5, 59.0, 63.4};
         if ((use_cert_head || want_mtp) && (c.hidden % 32 == 0) && c.vocab >= 64) {
             if (!build_cert_head(error)) return false;
             cert_head_active = use_cert_head;
@@ -730,18 +745,22 @@ public:
         m_gu = [gpu.device newBufferWithLength:uint64_t(8) * 2 * mc.inter * 4 options:MTLResourceStorageModePrivate];
         m_mlp_h = [gpu.device newBufferWithLength:uint64_t(8) * mc.inter * 2 options:MTLResourceStorageModePrivate];
         m_base_logits = [gpu.device newBufferWithLength:uint64_t(7) * DV * 2 options:MTLResourceStorageModePrivate];
-        m_rnn_state = [gpu.device newBufferWithLength:uint64_t(mc.rank) * 4 options:MTLResourceStorageModePrivate];
-        m_rnn_in = [gpu.device newBufferWithLength:uint64_t(2 * mc.rank + 2 * mc.hidden) * 2 options:MTLResourceStorageModePrivate];
-        m_rnn_proj_out = [gpu.device newBufferWithLength:uint64_t(3 * mc.rank) * 4 options:MTLResourceStorageModePrivate];
-        m_latent = [gpu.device newBufferWithLength:uint64_t(mc.rank) * 4 options:MTLResourceStorageModePrivate];
+        m_rnn_state[0] = [gpu.device newBufferWithLength:uint64_t(3) * mc.rank * 4 options:MTLResourceStorageModePrivate];
+        m_rnn_state[1] = [gpu.device newBufferWithLength:uint64_t(3) * mc.rank * 4 options:MTLResourceStorageModePrivate];
+        m_beam_tok[0] = [gpu.device newBufferWithLength:64 options:MTLResourceStorageModeShared];
+        m_beam_tok[1] = [gpu.device newBufferWithLength:64 options:MTLResourceStorageModeShared];
+        m_rnn_in = [gpu.device newBufferWithLength:uint64_t(3) * (2 * mc.rank + 2 * mc.hidden) * 2 options:MTLResourceStorageModePrivate];
+        m_rnn_proj_out = [gpu.device newBufferWithLength:uint64_t(3) * 3 * mc.rank * 4 options:MTLResourceStorageModePrivate];
+        m_latent = [gpu.device newBufferWithLength:uint64_t(3) * mc.rank * 2 options:MTLResourceStorageModePrivate];
         uint32_t mntg = (DV + 31) / 32;
-        m_tg_val = [gpu.device newBufferWithLength:uint64_t(mntg) * 4 options:MTLResourceStorageModePrivate];
-        m_tg_row = [gpu.device newBufferWithLength:uint64_t(mntg) * 4 options:MTLResourceStorageModePrivate];
-        m_tg_sum = [gpu.device newBufferWithLength:uint64_t(mntg) * 4 options:MTLResourceStorageModePrivate];
-        m_out = [gpu.device newBufferWithLength:128 options:MTLResourceStorageModeShared];
+        m_tg_val = [gpu.device newBufferWithLength:uint64_t(3) * mntg * 3 * 4 options:MTLResourceStorageModePrivate];
+        m_tg_row = [gpu.device newBufferWithLength:uint64_t(3) * mntg * 3 * 4 options:MTLResourceStorageModePrivate];
+        m_tg_sum = [gpu.device newBufferWithLength:uint64_t(3) * mntg * 4 options:MTLResourceStorageModePrivate];
+        m_out = [gpu.device newBufferWithLength:512 options:MTLResourceStorageModeShared];
         if (!m_alpha || !m_q4 || !m_sc || !m_vocab_ids || !m_head_q4 || !m_head_sc || !m_fold_q4 || !m_fold_sc || !m_fold_b
             || !m_f_rnn || !m_ctx_x || !m_ctx_kv || !m_h || !m_hn || !m_h1 || !m_qkv || !m_attn_out || !m_gu || !m_mlp_h
-            || !m_base_logits || !m_rnn_state || !m_rnn_in || !m_rnn_proj_out || !m_latent || !m_tg_val || !m_tg_row || !m_tg_sum || !m_out) {
+            || !m_base_logits || !m_rnn_state[0] || !m_rnn_state[1] || !m_beam_tok[0] || !m_beam_tok[1]
+            || !m_rnn_in || !m_rnn_proj_out || !m_latent || !m_tg_val || !m_tg_row || !m_tg_sum || !m_out) {
             error = "mtp buffer allocation failed";
             return false;
         }
@@ -1176,7 +1195,7 @@ public:
     struct OutlierPatchPP { uint32_t M, N, x_stride, y_stride, round_out; };
 
     void gemv12_m(const Mat12& m, id<MTLBuffer> in_buf, uint64_t in_off, uint32_t x_stride, id<MTLBuffer> out_buf, uint64_t out_off, uint32_t y_stride, uint32_t M, bool round_out = true) {
-        if (M >= 32 && has_m4_mpp && y_stride == m.rows && (m.cols % 32u) == 0u) {
+        if (M >= 24 && has_m4_mpp && y_stride == m.rows && (m.cols % 32u) == 0u) {
             uint32_t m_pad = (M + 31u) / 32u * 32u;
             CastBf16PP cp{M, m_pad, m.cols, x_stride};
             [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
@@ -1402,9 +1421,23 @@ public:
         return out;
     }
 
-    struct ConvBP { uint32_t channels, dynamic, head_dim, rows, x_stride, dyn_stride, y_stride; float scale; };
+    struct ConvBP { uint32_t channels, dynamic, head_dim, rows, x_stride, dyn_stride, y_stride, is_tree; float scale; uint32_t p1[16], p2[16], p3[16]; };
     void sconv_run(id<MTLBuffer> xb, uint64_t xoff, uint64_t state_off, uint64_t woff, uint64_t dynoff, id<MTLBuffer> yb, uint64_t yoff, uint32_t channels, bool dynamic, uint32_t M, uint32_t x_stride, uint32_t dyn_stride, uint32_t y_stride) {
-        ConvBP p{channels, dynamic ? 1u : 0u, c.head_dim, M, x_stride, dyn_stride, y_stride, dynamic ? 1.0f / 3.0f : 0.4472135955f};
+        ConvBP p{};
+        p.channels = channels;
+        p.dynamic = dynamic ? 1u : 0u;
+        p.head_dim = c.head_dim;
+        p.rows = M;
+        p.x_stride = x_stride;
+        p.dyn_stride = dyn_stride;
+        p.y_stride = y_stride;
+        p.is_tree = active_tree.is_tree;
+        p.scale = dynamic ? 1.0f / 3.0f : 0.4472135955f;
+        if (p.is_tree) {
+            std::memcpy(p.p1, active_tree.p1, sizeof(p.p1));
+            std::memcpy(p.p2, active_tree.p2, sizeof(p.p2));
+            std::memcpy(p.p3, active_tree.p3, sizeof(p.p3));
+        }
         [enc setComputePipelineState:p_sconv_b];
         [enc setBuffer:xb offset:xoff atIndex:0];
         [enc setBuffer:conv_buf offset:state_off atIndex:1];
@@ -1416,18 +1449,51 @@ public:
         grid((channels + tpg - 1) / tpg, tpg);
     }
 
-    void conv_commit_encode(uint32_t commit) {
-        if (commit == 0) return;
+    void conv_commit_src_encode(uint32_t s0, uint32_t s1, uint32_t s2) {
+        uint32_t csrc[4] = {s0, s1, s2, 0u};
         [enc setComputePipelineState:p_conv_commit];
         [enc setBuffer:conv_buf offset:0 atIndex:0];
         [enc setBuffer:conv_meta offset:0 atIndex:1];
-        [enc setBytes:&commit length:4 atIndex:2];
+        [enc setBytes:csrc length:16 atIndex:2];
         grid(conv_count, 256);
     }
 
-    struct ClipBP { uint32_t width, has_scale, pos0, is_local, n_floor, in_stride, out_stride, mode; float threshold, alpha; };
+    void conv_commit_encode(uint32_t commit) {
+        if (commit == 0) return;
+        conv_commit_src_encode(commit, commit + 1u, commit + 2u);
+    }
+
+    struct KvCompactPP { uint32_t pos0, kv_cap, kv_stride, count; uint32_t src[16]; };
+
+    void kv_compact_encode() {
+        if (pending_kv_count <= 1) return;
+        uint32_t kvw = c.kv_heads * c.head_dim;
+        [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+        together = true;
+        [enc setComputePipelineState:p_kv_compact];
+        for (size_t v = 0; v < kcache.size(); ++v) {
+            KvCompactPP kp{};
+            kp.pos0 = pending_kv_pos0;
+            kp.kv_cap = kv_cap[v];
+            kp.kv_stride = kvw;
+            kp.count = pending_kv_count;
+            std::memcpy(kp.src, pending_kv_src, sizeof(kp.src));
+            [enc setBuffer:kcache[v] offset:0 atIndex:0];
+            [enc setBuffer:vcache[v] offset:0 atIndex:1];
+            [enc setBytes:&kp length:sizeof(kp) atIndex:2];
+            grid((kvw + 127) / 128, 128);
+        }
+        together = false;
+        pending_kv_count = 0;
+    }
+
+    struct ClipBP { uint32_t width, has_scale, pos0, is_local, n_floor, in_stride, out_stride, mode; float threshold, alpha; uint32_t is_tree; uint32_t dep[16]; };
     void clip_run(uint64_t in_off, uint64_t scale_off, uint64_t out_off, uint32_t rows, uint32_t width, float thr, uint32_t pos0, bool is_local, uint32_t in_stride, uint32_t out_stride, uint32_t mode, uint32_t M) {
-        ClipBP p{width, scale_off ? 1u : 0u, pos0, is_local ? 1u : 0u, c.n_floor, in_stride, out_stride, mode, thr, c.alpha};
+        ClipBP p{};
+        p.width = width; p.has_scale = scale_off ? 1u : 0u; p.pos0 = pos0; p.is_local = is_local ? 1u : 0u;
+        p.n_floor = c.n_floor; p.in_stride = in_stride; p.out_stride = out_stride; p.mode = mode;
+        p.threshold = thr; p.alpha = c.alpha; p.is_tree = active_tree.is_tree;
+        if (p.is_tree) std::memcpy(p.dep, active_tree.dep, sizeof(p.dep));
         [enc setComputePipelineState:p_clip_b];
         [enc setBuffer:scratch offset:in_off atIndex:0];
         if (scale_off) [enc setBuffer:file offset:scale_off atIndex:1]; else [enc setBuffer:scratch offset:in_off atIndex:1];
@@ -1447,7 +1513,7 @@ public:
     }
 
     struct AttnP { uint32_t pos, start, kv_heads, group, head_dim, extent, kv_cap; float scale; };
-    struct AttnBP { uint32_t pos0, rows, window, is_local, kv_heads, group, head_dim, extent, heads, q_stride, gate_stride, gate_off, sink_off, out_stride, kv_cap; float scale; };
+    struct AttnBP { uint32_t pos0, rows, window, is_local, kv_heads, group, head_dim, extent, heads, q_stride, gate_stride, gate_off, sink_off, out_stride, kv_cap; float scale; uint32_t is_tree; uint32_t dep[16], mask[16]; };
     struct RelBP { uint32_t d_rel, extent, heads; };
 
     uint32_t attention(const LayerWeights& w, uint32_t visit, uint32_t sq, uint32_t sk, uint32_t sv, uint32_t pos0, uint32_t M) {
@@ -1512,7 +1578,17 @@ public:
             [enc setBytes:&a length:sizeof(a) atIndex:7];
             grid(c.heads, 128);
         } else {
-            AttnBP a{pos0, M, c.window, w.local ? 1u : 0u, c.kv_heads, c.heads / c.kv_heads, c.head_dim, c.rel_extent, c.heads, qdim, q_stride, qdim + rdim, qdim * 2 + rdim, qdim, kv_cap[visit], 1.0f / std::sqrt(float(c.head_dim))};
+            AttnBP a{};
+            a.pos0 = pos0; a.rows = M; a.window = c.window; a.is_local = w.local ? 1u : 0u;
+            a.kv_heads = c.kv_heads; a.group = c.heads / c.kv_heads; a.head_dim = c.head_dim;
+            a.extent = c.rel_extent; a.heads = c.heads; a.q_stride = qdim; a.gate_stride = q_stride;
+            a.gate_off = qdim + rdim; a.sink_off = qdim * 2 + rdim; a.out_stride = qdim;
+            a.kv_cap = kv_cap[visit]; a.scale = 1.0f / std::sqrt(float(c.head_dim));
+            a.is_tree = active_tree.is_tree;
+            if (a.is_tree) {
+                std::memcpy(a.dep, active_tree.dep, sizeof(a.dep));
+                std::memcpy(a.mask, active_tree.mask, sizeof(a.mask));
+            }
             [enc setComputePipelineState:p_attend_b];
             [enc setBuffer:scratch offset:s_qc atIndex:0];
             [enc setBuffer:kcache[visit] offset:0 atIndex:1];
@@ -1570,8 +1646,8 @@ public:
         if (M > 1) {
             uint32_t w13_g = fast_w13 ? (2 * I + 15) / 16 : (2 * I + 7) / 8;
             uint32_t w2_g = fast_w2 ? (H + 15) / 16 : (H + 7) / 8;
-            uint32_t w13_g5p = (M >= 32 && has_m4_mpp) ? (2 * I + 63) / 64 : w13_g;
-            uint32_t w2_g5p = (M >= 32 && has_m4_mpp) ? (H + 63) / 64 : w2_g;
+            uint32_t w13_g5p = (M >= 24 && has_m4_mpp) ? (2 * I + 63) / 64 : w13_g;
+            uint32_t w2_g5p = (M >= 24 && has_m4_mpp) ? (H + 63) / 64 : w2_g;
             UnionPP up{M, eff_top, c.experts, w13_g, w2_g, w13_g5p, w2_g5p};
             [enc setComputePipelineState:p_union];
             [enc setBuffer:scratch offset:s_ids atIndex:0];
@@ -1644,7 +1720,7 @@ public:
                 [enc setBuffer:scratch offset:out_off atIndex:12];
                 [enc setBytes:&p length:sizeof(p) atIndex:13];
                 [enc dispatchThreadgroupsWithIndirectBuffer:u_ind_b indirectBufferOffset:ibase + 16 threadsPerThreadgroup:MTLSizeMake(tpg, 1, 1)];
-                bool use_m4_g5p = (M >= 32 && has_m4_mpp);
+                bool use_m4_g5p = (M >= 24 && has_m4_mpp);
                 [enc setComputePipelineState:use_m4_g5p ? p_m4_nvfp4_g5p : (is_w2 ? p_env4_g5p_8 : p_env4_g5p_16)];
                 [enc setBuffer:file offset:is_w2 ? w.w2_w : w.w13_w atIndex:0];
                 [enc setBuffer:file offset:is_w2 ? w.w2_s : w.w13_s atIndex:1];
@@ -1661,7 +1737,7 @@ public:
                 [enc setBuffer:scratch offset:out_off atIndex:12];
                 [enc setBytes:&p length:sizeof(p) atIndex:13];
                 [enc dispatchThreadgroupsWithIndirectBuffer:u_ind_b indirectBufferOffset:ibase + 32 threadsPerThreadgroup:MTLSizeMake(use_m4_g5p ? 128 : tpg, 1, 1)];
-            } else if (!w.nvfp4 && fast && M >= 32 && has_m4_mpp) {
+            } else if (!w.nvfp4 && fast && M >= 24 && has_m4_mpp) {
                 ExpertGP p{rows, cols, per_row ? I : H, per_row ? H : 2 * I, per_row ? 1u : 0u, eff_top, 1u, 0u, is_w2 ? w.w2_eb : w.w13_eb, is_w2 ? w.w2_sb : w.w13_sb};
                 uint64_t ibase = is_w2 ? 48 : 0;
                 barrier();
@@ -1736,7 +1812,7 @@ public:
         run_expert(true, H, I, s_hq, s_houter, s_rows, true);
     }
 
-    struct CombineBP { uint32_t n, top, boundary, rows; };
+    struct CombineBP { uint32_t n, top, boundary, rows, is_tree; uint32_t p1[16], p2[16], p3[16]; };
     struct TapCopyP { uint32_t n4, tap_idx; };
 
     void copy_tap(uint32_t slot, uint32_t tap_idx, uint32_t M) {
@@ -1817,7 +1893,13 @@ public:
         }
         experts(w, x, M);
         uint32_t out = alloc();
-        CombineBP cp{c.hidden, eff_top, boundary ? 1u : 0u, M};
+        CombineBP cp{};
+        cp.n = c.hidden; cp.top = eff_top; cp.boundary = boundary ? 1u : 0u; cp.rows = M; cp.is_tree = active_tree.is_tree;
+        if (cp.is_tree) {
+            std::memcpy(cp.p1, active_tree.p1, sizeof(cp.p1));
+            std::memcpy(cp.p2, active_tree.p2, sizeof(cp.p2));
+            std::memcpy(cp.p3, active_tree.p3, sizeof(cp.p3));
+        }
         [enc setComputePipelineState:p_combine_b];
         [enc setBuffer:scratch offset:s_rows atIndex:0];
         [enc setBuffer:scratch offset:s_ids atIndex:1];
@@ -1996,19 +2078,27 @@ public:
         together = false;
     }
 
-    double step_rows(const uint32_t* toks, uint32_t pos0, uint32_t M, LogitsMode lmode, bool auto_commit = true, bool full_logits = false, bool capture_taps = false, uint32_t ingest_pos = 0, uint32_t ingest_commit = 0) {
+    double step_rows(const uint32_t* toks, uint32_t pos0, uint32_t M, LogitsMode lmode, bool auto_commit = true, bool full_logits = false, bool capture_taps = false, uint32_t ingest_pos = 0, uint32_t ingest_commit = 0, const TreeSpec* tree = nullptr, const uint32_t* ingest_map = nullptr) {
         next_slot = 0;
         tmp_slot = PERSIST_SLOTS;
         cur_batch = M;
+        active_tree = tree ? *tree : TreeSpec{};
         std::memcpy(token.contents, toks, M * 4);
         id<MTLCommandBuffer> cb = [gpu.queue commandBuffer];
         enc = [cb computeCommandEncoderWithDispatchType:MTLDispatchTypeConcurrent];
-        if (pending_conv_commit > 0) {
+        if (has_pending_conv) {
+            conv_commit_src_encode(pending_conv_src[0], pending_conv_src[1], pending_conv_src[2]);
+            has_pending_conv = false;
+            pending_conv_commit = 0;
+        } else if (pending_conv_commit > 0) {
             conv_commit_encode(pending_conv_commit);
             pending_conv_commit = 0;
         }
+        if (pending_kv_count > 1) {
+            kv_compact_encode();
+        }
         if (ingest_commit > 0 && mtp_ready) {
-            mtp_ingest_encode(ingest_pos, ingest_commit, false);
+            mtp_ingest_encode(ingest_pos, ingest_commit, false, ingest_map);
         }
         uint32_t emb = alloc();
         uint32_t H = c.hidden;
@@ -2067,6 +2157,8 @@ public:
 
     void reset_state() {
         pending_conv_commit = 0;
+        has_pending_conv = false;
+        pending_kv_count = 0;
         id<MTLCommandBuffer> cb = [gpu.queue commandBuffer];
         id<MTLBlitCommandEncoder> blit = [cb blitCommandEncoder];
         [blit fillBuffer:conv_buf range:NSMakeRange(0, conv_buf.length) value:0];
@@ -2074,16 +2166,17 @@ public:
         gpu_seconds(cb);
     }
 
-    struct MtpMixPP { uint32_t hidden, alpha_row, row_start; float eps; };
+    struct MtpMixPP { uint32_t hidden, alpha_row, row_start; float eps; uint32_t use_map; uint32_t map[16]; };
     struct MtpGemvQ4PP { uint32_t rows, cols, ng, x_stride, y_stride, round_out, has_bias; };
     struct MtpCtxKvPP { uint32_t kv_heads, head_dim, pos0, kv_cap; float eps, log_theta; };
     struct MtpEmbedPP { uint32_t hidden; float eps; };
     struct MtpQkRopePP { uint32_t q_heads, kv_heads, head_dim, qkv_stride, pos0; float eps, log_theta; };
     struct MtpAttnPP { uint32_t prefix_len, ctx_start, q_heads, kv_heads, group, qkv_stride, q_dim, kv_dim, kv_cap; float scale; };
     struct MtpBasePP { uint32_t vocab, ng, xs4; };
-    struct MtpRnnInPP { uint32_t rank, hidden, step; };
-    struct MtpMarkovPP { uint32_t dvocab, step; float cap, inv_temp; };
-    struct MtpReducePP { uint32_t ntg, step; float inv_temp; };
+    struct MtpRnnInPP { uint32_t rank, hidden, step, beams; uint32_t parent_b[4]; };
+    struct MtpRnnGatePP { uint32_t rank, step; uint32_t parent_b[4]; };
+    struct MtpMarkovPP { uint32_t dvocab, step, beams, ntg; float cap, inv_temp; };
+    struct MtpReducePP { uint32_t ntg, step, beams; float inv_temp; };
 
     void mtp_gemv_q4(const MtpQ4Mat& m, id<MTLBuffer> xbuf, uint32_t x_stride, id<MTLBuffer> ybuf, uint32_t y_stride, uint32_t M, bool round_out, uint64_t bias_off = 0, bool has_bias = false) {
         MtpGemvQ4PP p{m.rows, m.cols, m.cols / 32, x_stride, y_stride, round_out ? 1u : 0u, has_bias ? 1u : 0u};
@@ -2094,17 +2187,22 @@ public:
         [enc setBuffer:mtp_file offset:has_bias ? bias_off : 0 atIndex:3];
         [enc setBuffer:ybuf offset:0 atIndex:4];
         [enc setBytes:&p length:sizeof(p) atIndex:5];
-        grid((m.rows + 7) / 8, 256);
+        grid((m.rows + 31) / 32, 256);
     }
 
-    void mtp_ingest_encode(uint32_t pos0, uint32_t commit, bool write_f_rnn) {
+    void mtp_ingest_encode(uint32_t pos0, uint32_t commit, bool write_f_rnn, const uint32_t* tap_map = nullptr) {
         uint32_t H = mc.hidden;
         uint32_t kvw = mc.kv_heads * mc.head_dim;
         for (uint32_t off = 0; off < commit; off += 8) {
             uint32_t mb = std::min<uint32_t>(8, commit - off);
             for (uint32_t i = 0; i < mc.layers; ++i) {
                 const MtpLayer& ml = mlw[i];
-                MtpMixPP mp{H, i, off, mc.eps};
+                MtpMixPP mp{};
+                mp.hidden = H; mp.alpha_row = i; mp.row_start = off; mp.eps = mc.eps;
+                if (tap_map) {
+                    mp.use_map = 1u;
+                    for (uint32_t j = 0; j < commit && j < 16u; ++j) mp.map[j] = tap_map[j];
+                }
                 [enc setComputePipelineState:p_mtp_mix];
                 [enc setBuffer:tap_buf offset:0 atIndex:0];
                 [enc setBuffer:m_alpha offset:0 atIndex:1];
@@ -2124,7 +2222,12 @@ public:
             }
         }
         if (write_f_rnn && commit > 0) {
-            MtpMixPP mp{H, mc.layers, commit - 1, mc.eps};
+            MtpMixPP mp{};
+            mp.hidden = H; mp.alpha_row = mc.layers; mp.row_start = commit - 1; mp.eps = mc.eps;
+            if (tap_map && commit <= 16u) {
+                mp.use_map = 1u;
+                mp.map[commit - 1] = tap_map[commit - 1];
+            }
             [enc setComputePipelineState:p_mtp_mix];
             [enc setBuffer:tap_buf offset:0 atIndex:0];
             [enc setBuffer:m_alpha offset:0 atIndex:1];
@@ -2135,20 +2238,20 @@ public:
         }
     }
 
-    double mtp_ingest_ctx(uint32_t pos0, uint32_t commit, bool write_f_rnn) {
+    double mtp_ingest_ctx(uint32_t pos0, uint32_t commit, bool write_f_rnn, const uint32_t* tap_map = nullptr) {
         if (!mtp_ready || commit == 0) return 0.0;
         id<MTLCommandBuffer> cb = [gpu.queue commandBuffer];
         enc = [cb computeCommandEncoderWithDispatchType:MTLDispatchTypeConcurrent];
-        mtp_ingest_encode(pos0, commit, write_f_rnn);
+        mtp_ingest_encode(pos0, commit, write_f_rnn, tap_map);
         [enc endEncoding];
         return gpu_seconds(cb);
     }
 
-    double mtp_propose(uint32_t anchor, uint32_t prefix_len, uint32_t pending_pos0, uint32_t pending_commit) {
-        static_cast<uint32_t*>(m_out.contents)[0] = anchor;
+    double mtp_propose(uint32_t anchor, uint32_t prefix_len, uint32_t pending_pos0, uint32_t pending_commit, const uint32_t* pending_map = nullptr) {
+        static_cast<uint32_t*>(m_beam_tok[0].contents)[0] = anchor;
         id<MTLCommandBuffer> cb = [gpu.queue commandBuffer];
         enc = [cb computeCommandEncoderWithDispatchType:MTLDispatchTypeConcurrent];
-        if (pending_commit > 0) mtp_ingest_encode(pending_pos0, pending_commit, true);
+        if (pending_commit > 0) mtp_ingest_encode(pending_pos0, pending_commit, true, pending_map);
         uint32_t H = mc.hidden;
         uint32_t kvw = mc.kv_heads * mc.head_dim;
         uint32_t qdim = mc.heads * mc.head_dim;
@@ -2158,7 +2261,7 @@ public:
         [enc setBuffer:file offset:embed_off atIndex:0];
         [enc setBuffer:file offset:embed_norm_off atIndex:1];
         [enc setBuffer:mtp_file offset:m_mask_embed atIndex:2];
-        [enc setBuffer:m_out offset:0 atIndex:3];
+        [enc setBuffer:m_beam_tok[0] offset:0 atIndex:3];
         [enc setBuffer:m_h offset:0 atIndex:4];
         [enc setBytes:&ep length:sizeof(ep) atIndex:5];
         grid(8, 576);
@@ -2224,30 +2327,37 @@ public:
         [enc setBuffer:m_hn offset:0 atIndex:2];
         [enc setBuffer:m_base_logits offset:0 atIndex:3];
         [enc setBytes:&bp length:sizeof(bp) atIndex:4];
-        grid((DV + 7) / 8, 256);
+        grid((DV + 31) / 32, 256);
         uint32_t mntg = (DV + 31) / 32;
         uint32_t rnn_in_dim = 2 * mc.rank + 2 * H;
         float inv_temp = 0.90f;
         for (uint32_t k = 0; k < 7; ++k) {
-            MtpRnnInPP rip{mc.rank, H, k};
+            uint32_t beams = k == 0u ? 1u : 3u;
+            uint32_t pb[4] = {0u, 0u, k >= 2u ? 1u : 0u, 0u};
+            id<MTLBuffer> st_in = m_rnn_state[k & 1u];
+            id<MTLBuffer> st_out = m_rnn_state[(k + 1u) & 1u];
+            id<MTLBuffer> bt_in = m_beam_tok[k & 1u];
+            id<MTLBuffer> bt_out = m_beam_tok[(k + 1u) & 1u];
+            MtpRnnInPP rip{mc.rank, H, k, beams, {pb[0], pb[1], pb[2], pb[3]}};
             [enc setComputePipelineState:p_mtp_rnn_in];
-            [enc setBuffer:m_rnn_state offset:0 atIndex:0];
+            [enc setBuffer:st_in offset:0 atIndex:0];
             [enc setBuffer:mtp_file offset:m_markov_w1 atIndex:1];
-            [enc setBuffer:m_out offset:0 atIndex:2];
+            [enc setBuffer:bt_in offset:0 atIndex:2];
             [enc setBuffer:m_hn offset:0 atIndex:3];
             [enc setBuffer:m_f_rnn offset:0 atIndex:4];
             [enc setBuffer:m_rnn_in offset:0 atIndex:5];
             [enc setBytes:&rip length:sizeof(rip) atIndex:6];
-            grid(1, 576);
-            mtp_gemv_q4(m_rnn_proj, m_rnn_in, rnn_in_dim, m_rnn_proj_out, 3 * mc.rank, 1, false, m_rnn_bias, true);
-            uint32_t rs[2] = {mc.rank, k};
+            grid(beams, 576);
+            mtp_gemv_q4(m_rnn_proj, m_rnn_in, rnn_in_dim, m_rnn_proj_out, 3 * mc.rank, beams, false, m_rnn_bias, true);
+            MtpRnnGatePP rgp{mc.rank, k, {pb[0], pb[1], pb[2], pb[3]}};
             [enc setComputePipelineState:p_mtp_rnn_gates];
             [enc setBuffer:m_rnn_proj_out offset:0 atIndex:0];
-            [enc setBuffer:m_rnn_state offset:0 atIndex:1];
-            [enc setBuffer:m_latent offset:0 atIndex:2];
-            [enc setBytes:rs length:8 atIndex:3];
-            grid(1, 256);
-            MtpMarkovPP mkp{DV, k, c.softcap, inv_temp};
+            [enc setBuffer:st_in offset:0 atIndex:1];
+            [enc setBuffer:st_out offset:0 atIndex:2];
+            [enc setBuffer:m_latent offset:0 atIndex:3];
+            [enc setBytes:&rgp length:sizeof(rgp) atIndex:4];
+            grid(beams, 256);
+            MtpMarkovPP mkp{DV, k, beams, mntg, c.softcap, inv_temp};
             [enc setComputePipelineState:p_mtp_mscan];
             [enc setBuffer:m_fold_q4 offset:0 atIndex:0];
             [enc setBuffer:m_fold_sc offset:0 atIndex:1];
@@ -2259,23 +2369,24 @@ public:
             [enc setBuffer:m_tg_sum offset:0 atIndex:7];
             [enc setBytes:&mkp length:sizeof(mkp) atIndex:8];
             grid(mntg, 256);
-            MtpReducePP rdp{mntg, k, inv_temp};
+            MtpReducePP rdp{mntg, k, beams, inv_temp};
             [enc setComputePipelineState:p_mtp_mred];
             [enc setBuffer:m_tg_val offset:0 atIndex:0];
             [enc setBuffer:m_tg_row offset:0 atIndex:1];
             [enc setBuffer:m_tg_sum offset:0 atIndex:2];
             [enc setBuffer:m_vocab_ids offset:0 atIndex:3];
             [enc setBuffer:m_out offset:0 atIndex:4];
-            [enc setBuffer:m_out offset:32 atIndex:5];
-            [enc setBytes:&rdp length:sizeof(rdp) atIndex:6];
-            grid(1, 512);
+            [enc setBuffer:m_out offset:256 atIndex:5];
+            [enc setBuffer:bt_out offset:0 atIndex:6];
+            [enc setBytes:&rdp length:sizeof(rdp) atIndex:7];
+            grid(beams, 512);
         }
         [enc endEncoding];
         return gpu_seconds(cb);
     }
 
-    const uint32_t* mtp_draft_ids() const { return static_cast<const uint32_t*>(m_out.contents) + 1; }
-    const float* mtp_draft_probs() const { return reinterpret_cast<const float*>(static_cast<const char*>(m_out.contents) + 32); }
+    const uint32_t* mtp_tree_ids() const { return static_cast<const uint32_t*>(m_out.contents); }
+    const float* mtp_tree_probs() const { return reinterpret_cast<const float*>(static_cast<const char*>(m_out.contents) + 256); }
 
     uint32_t chosen_at(uint32_t m) const { return static_cast<const uint32_t*>(token.contents)[128 + m]; }
     uint32_t chosen() const { return chosen_at(0); }
@@ -2336,15 +2447,23 @@ std::vector<uint32_t> lookup_draft(const std::vector<uint32_t>& history, uint32_
         if (len >= 5 && len > best_len) {
             best_len = len;
             best_end = i;
-            if (best_len >= 12) break;
+            if (best_len >= 16 && (L - 1 - i) >= 63) break;
         }
     }
     if (best_len < 5) return {};
-    uint32_t cap = best_len >= 8 ? 15u : (best_len >= 6 ? 11u : 7u);
+    uint32_t cap = 7u;
+    if (best_len >= 12 && max_k >= 48u) cap = 63u;
+    else if (best_len >= 8) cap = (max_k >= 23u) ? 31u : 15u;
+    else if (best_len >= 6) cap = 15u;
     uint32_t k = std::min<uint32_t>(max_k, cap);
     std::vector<uint32_t> out;
     out.reserve(k);
-    for (uint32_t j = 1; j <= k && best_end + j < L; ++j) out.push_back(history[best_end + j]);
+    for (uint32_t j = 1; j <= k; ++j) {
+        if (best_end + j < L) out.push_back(history[best_end + j]);
+        else if (best_len >= 12 && best_end + j - L < out.size()) out.push_back(out[best_end + j - L]);
+        else break;
+    }
+    if (out.size() > 15 && out.size() < 23) out.resize(15);
     return out;
 }
 
@@ -2396,6 +2515,8 @@ DecodeStats run_decode_pass(Engine& engine, const std::vector<uint32_t>& ids, ui
     bool use_spec = (spec != "off") && !logprobs;
     uint32_t pending_mtp_pos = 0;
     uint32_t pending_mtp_commit = 0;
+    bool pending_mtp_has_map = false;
+    std::array<uint32_t, 16> pending_mtp_map{};
     double ema_cal = 0.90;
     double last_exp_acc = 0.0;
     bool last_was_mtp = false;
@@ -2406,30 +2527,65 @@ DecodeStats run_decode_pass(Engine& engine, const std::vector<uint32_t>& ids, ui
         uint32_t ctx_room = pos < engine.max_context ? engine.max_context - pos : 0;
         if (ctx_room == 0) break;
         std::vector<uint32_t> draft;
+        Engine::TreeSpec tree{};
+        std::array<uint32_t, 16> node_par{};
+        uint32_t tree_m = 0;
         last_was_mtp = false;
         last_exp_acc = 0.0;
         if (use_spec && rem > 1 && ctx_room > 1) {
-            uint32_t max_k = uint32_t(std::min<uint64_t>({15ull, rem - 1, uint64_t(ctx_room - 1)}));
+            uint32_t max_k = uint32_t(std::min<uint64_t>({63ull, rem - 1, uint64_t(ctx_room - 1)}));
             if (spec == "lookup" || spec == "auto") draft = lookup_draft(history, max_k);
             if (draft.empty() && use_mtp) {
                 if (mtp_cooldown > 0) {
                     mtp_cooldown--;
                 } else {
-                    st.decode_gpu += engine.mtp_propose(anchor, pos, pending_mtp_pos, pending_mtp_commit);
+                    st.decode_gpu += engine.mtp_propose(anchor, pos, pending_mtp_pos, pending_mtp_commit, pending_mtp_has_map ? pending_mtp_map.data() : nullptr);
                     pending_mtp_commit = 0;
-                    const uint32_t* dids = engine.mtp_draft_ids();
-                    const float* dprobs = engine.mtp_draft_probs();
-                    uint32_t k_lim = std::min<uint32_t>(7u, max_k);
+                    pending_mtp_has_map = false;
+                    const uint32_t* tids = engine.mtp_tree_ids();
+                    const float* tprobs = engine.mtp_tree_probs();
+                    uint32_t max_depth = std::min<uint32_t>(7u, max_k);
+                    struct Cand { int par; uint32_t depth; uint32_t tok; double p; };
+                    std::array<Cand, 57> cands{};
+                    for (uint32_t j = 0; j < 3u; ++j) {
+                        cands[j] = {-1, 1u, tids[j], std::clamp(double(tprobs[j]) * ema_cal, 0.0, 0.99)};
+                    }
+                    for (uint32_t b = 0; b < 3u; ++b) {
+                        for (uint32_t j = 0; j < 3u; ++j) {
+                            uint32_t idx = 3u + b * 3u + j;
+                            double cp = std::clamp(double(tprobs[idx]) * ema_cal, 0.0, 0.99);
+                            cands[idx] = {int(b), 2u, tids[idx], cands[b].p * cp};
+                        }
+                    }
+                    for (uint32_t k = 2u; k < 7u; ++k) {
+                        uint32_t base = 3u + (k - 1u) * 9u;
+                        uint32_t pbase = 3u + (k - 2u) * 9u;
+                        uint32_t pmap[3] = {pbase + 0u, pbase + 1u, pbase + 3u};
+                        for (uint32_t b = 0; b < 3u; ++b) {
+                            for (uint32_t j = 0; j < 3u; ++j) {
+                                uint32_t idx = base + b * 3u + j;
+                                double cp = std::clamp(double(tprobs[idx]) * ema_cal, 0.0, 0.99);
+                                cands[idx] = {int(pmap[b]), k + 1u, tids[idx], cands[pmap[b]].p * cp};
+                            }
+                        }
+                    }
+                    std::vector<uint32_t> order;
+                    order.reserve(57);
+                    for (uint32_t i = 0; i < 57u; ++i) {
+                        if (cands[i].depth <= max_depth && cands[i].p > 1e-4) order.push_back(i);
+                    }
+                    std::stable_sort(order.begin(), order.end(), [&](uint32_t a, uint32_t b) {
+                        if (cands[a].p != cands[b].p) return cands[a].p > cands[b].p;
+                        return cands[a].depth < cands[b].depth;
+                    });
+                    uint32_t k_lim = std::min<uint32_t>(7u, uint32_t(order.size()));
                     uint32_t best_k = 0;
                     double base_rate = 1.0 / engine.cost_ms[1];
                     double best_rate = base_rate;
-                    double cum_p = 1.0;
                     double exp_tok = 1.0;
                     double best_exp = 0.0;
                     for (uint32_t k = 1; k <= k_lim; ++k) {
-                        double pk = std::clamp(double(dprobs[k - 1]) * ema_cal, 0.0, 0.99);
-                        cum_p *= pk;
-                        exp_tok += cum_p;
+                        exp_tok += cands[order[k - 1]].p;
                         double rate = exp_tok / engine.cost_ms[k + 1];
                         if (rate > best_rate) {
                             best_rate = rate;
@@ -2438,7 +2594,33 @@ DecodeStats run_decode_pass(Engine& engine, const std::vector<uint32_t>& ids, ui
                         }
                     }
                     if (best_k > 0) {
-                        draft.assign(dids, dids + best_k);
+                        std::vector<uint32_t> chosen(order.begin(), order.begin() + best_k);
+                        std::stable_sort(chosen.begin(), chosen.end(), [&](uint32_t a, uint32_t b) {
+                            if (cands[a].depth != cands[b].depth) return cands[a].depth < cands[b].depth;
+                            return a < b;
+                        });
+                        std::array<int, 57> c2node;
+                        c2node.fill(-1);
+                        draft.reserve(best_k);
+                        tree.is_tree = 0u;
+                        tree.dep[0] = 0u; tree.mask[0] = 1u;
+                        tree.p1[0] = 2u; tree.p2[0] = 1u; tree.p3[0] = 0u;
+                        node_par[0] = 0u;
+                        for (uint32_t i = 0; i < best_k; ++i) {
+                            uint32_t ci = chosen[i];
+                            uint32_t m = i + 1u;
+                            c2node[ci] = int(m);
+                            uint32_t pm = cands[ci].par < 0 ? 0u : uint32_t(c2node[cands[ci].par]);
+                            node_par[m] = pm;
+                            draft.push_back(cands[ci].tok);
+                            tree.dep[m] = tree.dep[pm] + 1u;
+                            tree.mask[m] = tree.mask[pm] | (1u << m);
+                            tree.p1[m] = 3u + pm;
+                            tree.p2[m] = tree.p1[pm];
+                            tree.p3[m] = tree.p2[pm];
+                            if (pm != m - 1u) tree.is_tree = 1u;
+                        }
+                        tree_m = best_k + 1u;
                         last_was_mtp = true;
                         last_exp_acc = best_exp;
                     } else if (engine.lean_q4_ready) {
@@ -2450,10 +2632,12 @@ DecodeStats run_decode_pass(Engine& engine, const std::vector<uint32_t>& ids, ui
         }
         uint32_t ing_pos = pending_mtp_pos;
         uint32_t ing_commit = use_mtp ? pending_mtp_commit : 0;
+        const uint32_t* ing_map = (use_mtp && pending_mtp_has_map) ? pending_mtp_map.data() : nullptr;
         pending_mtp_commit = 0;
+        pending_mtp_has_map = false;
         if (draft.empty()) {
             uint32_t old_pos = pos;
-            st.decode_gpu += engine.step_rows(&anchor, pos, 1, Engine::LOGITS_ALL, true, logprobs, use_mtp, ing_pos, ing_commit);
+            st.decode_gpu += engine.step_rows(&anchor, pos, 1, Engine::LOGITS_ALL, true, logprobs, use_mtp, ing_pos, ing_commit, nullptr, ing_map);
             pos++;
             st.verify_steps++;
             anchor = engine.chosen();
@@ -2463,6 +2647,7 @@ DecodeStats run_decode_pass(Engine& engine, const std::vector<uint32_t>& ids, ui
             if (use_mtp) {
                 pending_mtp_pos = old_pos;
                 pending_mtp_commit = 1;
+                pending_mtp_has_map = false;
             }
             if (logprobs && steps_json) {
                 auto top = engine.top5();
@@ -2472,6 +2657,75 @@ DecodeStats run_decode_pass(Engine& engine, const std::vector<uint32_t>& ids, ui
                 s << "]}";
                 *steps_json += s.str();
             }
+        } else if (tree.is_tree) {
+            uint32_t M = tree_m;
+            std::array<uint32_t, 16> batch{};
+            batch[0] = anchor;
+            for (uint32_t j = 0; j < draft.size(); ++j) batch[1 + j] = draft[j];
+            uint32_t old_pos = pos;
+            st.decode_gpu += engine.step_rows(batch.data(), pos, M, Engine::LOGITS_ALL, false, false, use_mtp, ing_pos, ing_commit, &tree, ing_map);
+            st.verify_steps++;
+            std::vector<uint32_t> win;
+            win.reserve(M);
+            win.push_back(0u);
+            uint32_t cur = 0u;
+            uint32_t accepted = 0u;
+            uint32_t next_tok = 0u;
+            while (st.out.size() < steps) {
+                uint32_t v = engine.chosen_at(cur);
+                uint32_t child = 0u;
+                for (uint32_t m = cur + 1u; m < M; ++m) {
+                    if (node_par[m] == cur && batch[m] == v) { child = m; break; }
+                }
+                if (child > 0u) {
+                    accepted++;
+                    st.out.push_back(v);
+                    history.push_back(v);
+                    win.push_back(child);
+                    cur = child;
+                } else {
+                    next_tok = v;
+                    st.out.push_back(next_tok);
+                    history.push_back(next_tok);
+                    break;
+                }
+            }
+            uint32_t commit = uint32_t(win.size());
+            pos += commit;
+            engine.pending_conv_src[2] = 3u + win[commit - 1u];
+            engine.pending_conv_src[1] = commit >= 2u ? (3u + win[commit - 2u]) : 2u;
+            engine.pending_conv_src[0] = commit >= 3u ? (3u + win[commit - 3u]) : (commit == 2u ? 2u : 1u);
+            engine.has_pending_conv = true;
+            bool need_compact = false;
+            for (uint32_t j = 1u; j < commit; ++j) if (win[j] != j) need_compact = true;
+            if (need_compact) {
+                engine.pending_kv_pos0 = old_pos;
+                engine.pending_kv_count = commit;
+                for (uint32_t j = 0u; j < commit; ++j) engine.pending_kv_src[j] = win[j];
+            }
+            anchor = next_tok;
+            st.spec_tokens += commit;
+            if (use_mtp) {
+                pending_mtp_pos = old_pos;
+                pending_mtp_commit = commit;
+                pending_mtp_has_map = need_compact;
+                if (need_compact) {
+                    for (uint32_t j = 0u; j < commit; ++j) pending_mtp_map[j] = win[j];
+                }
+                if (last_was_mtp) {
+                    if (accepted >= 1) {
+                        mtp_miss_streak = 0;
+                        mtp_cooldown = 0;
+                    } else if (engine.lean_q4_ready) {
+                        mtp_miss_streak++;
+                        if (mtp_miss_streak >= 3) mtp_cooldown = std::min<uint32_t>(6u, mtp_miss_streak - 2u);
+                    }
+                    if (last_exp_acc > 0.1) {
+                        double ratio = std::clamp((double(accepted) + 0.15) / (last_exp_acc + 0.15), 0.4, 1.2);
+                        ema_cal = std::clamp(0.75 * ema_cal + 0.25 * (ema_cal * ratio), 0.45, 1.15);
+                    }
+                }
+            }
         } else {
             uint32_t K = uint32_t(draft.size());
             uint32_t M = K + 1;
@@ -2479,7 +2733,7 @@ DecodeStats run_decode_pass(Engine& engine, const std::vector<uint32_t>& ids, ui
             batch[0] = anchor;
             for (uint32_t j = 0; j < K; ++j) batch[1 + j] = draft[j];
             uint32_t old_pos = pos;
-            st.decode_gpu += engine.step_rows(batch.data(), pos, M, Engine::LOGITS_ALL, false, false, use_mtp, ing_pos, ing_commit);
+            st.decode_gpu += engine.step_rows(batch.data(), pos, M, Engine::LOGITS_ALL, false, false, use_mtp, ing_pos, ing_commit, nullptr, ing_map);
             st.verify_steps++;
             uint32_t accepted = 0;
             uint32_t next_tok = 0;
@@ -2509,6 +2763,7 @@ DecodeStats run_decode_pass(Engine& engine, const std::vector<uint32_t>& ids, ui
             if (use_mtp) {
                 pending_mtp_pos = old_pos;
                 pending_mtp_commit = commit;
+                pending_mtp_has_map = false;
                 if (last_was_mtp) {
                     if (accepted >= 1) {
                         mtp_miss_streak = 0;

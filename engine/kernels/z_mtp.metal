@@ -180,7 +180,7 @@ kernel void mtp_build_fold_bias(device const uint4* unembed [[buffer(0)]],
     if (lane == 0u) fold_b[row] = t;
 }
 
-struct MtpMixP { uint hidden; uint alpha_row; uint row_start; float eps; };
+struct MtpMixP { uint hidden; uint alpha_row; uint row_start; float eps; uint use_map; uint map[16]; };
 
 kernel void mtp_mix_rmsnorm_h(device const float4* taps [[buffer(0)]],
                               device const float* alpha [[buffer(1)]],
@@ -194,7 +194,7 @@ kernel void mtp_mix_rmsnorm_h(device const float4* taps [[buffer(0)]],
                               uint simd [[simdgroup_index_in_threadgroup]]) {
     threadgroup float part[20];
     uint n4 = p.hidden / 4u;
-    uint sm = p.row_start + m;
+    uint sm = p.use_map ? p.map[p.row_start + m] : (p.row_start + m);
     float a0 = alpha[p.alpha_row * 4u + 0u];
     float a1 = alpha[p.alpha_row * 4u + 1u];
     float a2 = alpha[p.alpha_row * 4u + 2u];
@@ -266,16 +266,6 @@ kernel void mtp_rmsnorm_h(device const float4* x [[buffer(0)]],
     }
 }
 
-inline half4 u4_lo_h(uint word) {
-    return half4(half(int(word & 15u) - 8), half(int((word >> 4) & 15u) - 8),
-                 half(int((word >> 8) & 15u) - 8), half(int((word >> 12) & 15u) - 8));
-}
-
-inline half4 u4_hi_h(uint word) {
-    return half4(half(int((word >> 16) & 15u) - 8), half(int((word >> 20) & 15u) - 8),
-                 half(int((word >> 24) & 15u) - 8), half(int((word >> 28) & 15u) - 8));
-}
-
 struct MtpGemvQ4P { uint rows; uint cols; uint ng; uint x_stride; uint y_stride; uint round_out; uint has_bias; };
 
 kernel void mtp_gemv_q4_rows(device const uint4* q4 [[buffer(0)]],
@@ -288,43 +278,65 @@ kernel void mtp_gemv_q4_rows(device const uint4* q4 [[buffer(0)]],
                              uint simd [[simdgroup_index_in_threadgroup]],
                              uint simds [[simdgroups_per_threadgroup]],
                              uint lane [[thread_index_in_simdgroup]]) {
-    uint row = group * simds + simd;
+    uint sub = lane >> 3;
+    uint sl = lane & 7u;
+    uint row = (group * simds + simd) * 4u + sub;
     if (row >= p.rows) return;
     uint xs4 = p.x_stride / 4u;
     device const uint4* qr = q4 + ulong(row) * p.ng;
     device const half* sr = sc + ulong(row) * p.ng;
     float a0 = 0, a1 = 0, a2 = 0, a3 = 0, a4 = 0, a5 = 0, a6 = 0, a7 = 0;
-    for (uint g = lane; g < p.ng; g += 32u) {
+    for (uint g = sl; g < p.ng; g += 8u) {
         uint4 pk = qr[g];
         float s = float(sr[g]);
         uint g8 = g * 8u;
-        float d0 = 0, d1 = 0, d2 = 0, d3 = 0, d4 = 0, d5 = 0, d6 = 0, d7 = 0;
-        { half4 w = u4_lo_h(pk.x); if (ROWS > 0u) d0 += float(dot(w, x4[0ul*xs4 + g8])); if (ROWS > 1u) d1 += float(dot(w, x4[1ul*xs4 + g8])); if (ROWS > 2u) d2 += float(dot(w, x4[2ul*xs4 + g8])); if (ROWS > 3u) d3 += float(dot(w, x4[3ul*xs4 + g8])); if (ROWS > 4u) d4 += float(dot(w, x4[4ul*xs4 + g8])); if (ROWS > 5u) d5 += float(dot(w, x4[5ul*xs4 + g8])); if (ROWS > 6u) d6 += float(dot(w, x4[6ul*xs4 + g8])); if (ROWS > 7u) d7 += float(dot(w, x4[7ul*xs4 + g8])); }
-        { half4 w = u4_hi_h(pk.x); uint k = g8 + 1u; if (ROWS > 0u) d0 += float(dot(w, x4[0ul*xs4 + k])); if (ROWS > 1u) d1 += float(dot(w, x4[1ul*xs4 + k])); if (ROWS > 2u) d2 += float(dot(w, x4[2ul*xs4 + k])); if (ROWS > 3u) d3 += float(dot(w, x4[3ul*xs4 + k])); if (ROWS > 4u) d4 += float(dot(w, x4[4ul*xs4 + k])); if (ROWS > 5u) d5 += float(dot(w, x4[5ul*xs4 + k])); if (ROWS > 6u) d6 += float(dot(w, x4[6ul*xs4 + k])); if (ROWS > 7u) d7 += float(dot(w, x4[7ul*xs4 + k])); }
-        { half4 w = u4_lo_h(pk.y); uint k = g8 + 2u; if (ROWS > 0u) d0 += float(dot(w, x4[0ul*xs4 + k])); if (ROWS > 1u) d1 += float(dot(w, x4[1ul*xs4 + k])); if (ROWS > 2u) d2 += float(dot(w, x4[2ul*xs4 + k])); if (ROWS > 3u) d3 += float(dot(w, x4[3ul*xs4 + k])); if (ROWS > 4u) d4 += float(dot(w, x4[4ul*xs4 + k])); if (ROWS > 5u) d5 += float(dot(w, x4[5ul*xs4 + k])); if (ROWS > 6u) d6 += float(dot(w, x4[6ul*xs4 + k])); if (ROWS > 7u) d7 += float(dot(w, x4[7ul*xs4 + k])); }
-        { half4 w = u4_hi_h(pk.y); uint k = g8 + 3u; if (ROWS > 0u) d0 += float(dot(w, x4[0ul*xs4 + k])); if (ROWS > 1u) d1 += float(dot(w, x4[1ul*xs4 + k])); if (ROWS > 2u) d2 += float(dot(w, x4[2ul*xs4 + k])); if (ROWS > 3u) d3 += float(dot(w, x4[3ul*xs4 + k])); if (ROWS > 4u) d4 += float(dot(w, x4[4ul*xs4 + k])); if (ROWS > 5u) d5 += float(dot(w, x4[5ul*xs4 + k])); if (ROWS > 6u) d6 += float(dot(w, x4[6ul*xs4 + k])); if (ROWS > 7u) d7 += float(dot(w, x4[7ul*xs4 + k])); }
-        { half4 w = u4_lo_h(pk.z); uint k = g8 + 4u; if (ROWS > 0u) d0 += float(dot(w, x4[0ul*xs4 + k])); if (ROWS > 1u) d1 += float(dot(w, x4[1ul*xs4 + k])); if (ROWS > 2u) d2 += float(dot(w, x4[2ul*xs4 + k])); if (ROWS > 3u) d3 += float(dot(w, x4[3ul*xs4 + k])); if (ROWS > 4u) d4 += float(dot(w, x4[4ul*xs4 + k])); if (ROWS > 5u) d5 += float(dot(w, x4[5ul*xs4 + k])); if (ROWS > 6u) d6 += float(dot(w, x4[6ul*xs4 + k])); if (ROWS > 7u) d7 += float(dot(w, x4[7ul*xs4 + k])); }
-        { half4 w = u4_hi_h(pk.z); uint k = g8 + 5u; if (ROWS > 0u) d0 += float(dot(w, x4[0ul*xs4 + k])); if (ROWS > 1u) d1 += float(dot(w, x4[1ul*xs4 + k])); if (ROWS > 2u) d2 += float(dot(w, x4[2ul*xs4 + k])); if (ROWS > 3u) d3 += float(dot(w, x4[3ul*xs4 + k])); if (ROWS > 4u) d4 += float(dot(w, x4[4ul*xs4 + k])); if (ROWS > 5u) d5 += float(dot(w, x4[5ul*xs4 + k])); if (ROWS > 6u) d6 += float(dot(w, x4[6ul*xs4 + k])); if (ROWS > 7u) d7 += float(dot(w, x4[7ul*xs4 + k])); }
-        { half4 w = u4_lo_h(pk.w); uint k = g8 + 6u; if (ROWS > 0u) d0 += float(dot(w, x4[0ul*xs4 + k])); if (ROWS > 1u) d1 += float(dot(w, x4[1ul*xs4 + k])); if (ROWS > 2u) d2 += float(dot(w, x4[2ul*xs4 + k])); if (ROWS > 3u) d3 += float(dot(w, x4[3ul*xs4 + k])); if (ROWS > 4u) d4 += float(dot(w, x4[4ul*xs4 + k])); if (ROWS > 5u) d5 += float(dot(w, x4[5ul*xs4 + k])); if (ROWS > 6u) d6 += float(dot(w, x4[6ul*xs4 + k])); if (ROWS > 7u) d7 += float(dot(w, x4[7ul*xs4 + k])); }
-        { half4 w = u4_hi_h(pk.w); uint k = g8 + 7u; if (ROWS > 0u) d0 += float(dot(w, x4[0ul*xs4 + k])); if (ROWS > 1u) d1 += float(dot(w, x4[1ul*xs4 + k])); if (ROWS > 2u) d2 += float(dot(w, x4[2ul*xs4 + k])); if (ROWS > 3u) d3 += float(dot(w, x4[3ul*xs4 + k])); if (ROWS > 4u) d4 += float(dot(w, x4[4ul*xs4 + k])); if (ROWS > 5u) d5 += float(dot(w, x4[5ul*xs4 + k])); if (ROWS > 6u) d6 += float(dot(w, x4[6ul*xs4 + k])); if (ROWS > 7u) d7 += float(dot(w, x4[7ul*xs4 + k])); }
-        if (ROWS > 0u) a0 += d0 * s;
-        if (ROWS > 1u) a1 += d1 * s;
-        if (ROWS > 2u) a2 += d2 * s;
-        if (ROWS > 3u) a3 += d3 * s;
-        if (ROWS > 4u) a4 += d4 * s;
-        if (ROWS > 5u) a5 += d5 * s;
-        if (ROWS > 6u) a6 += d6 * s;
-        if (ROWS > 7u) a7 += d7 * s;
+        half d0 = 0, d1 = 0, d2 = 0, d3 = 0, d4 = 0, d5 = 0, d6 = 0, d7 = 0;
+        uint ws[4] = {pk.x, pk.y, pk.z, pk.w};
+        for (uint t = 0; t < 4u; ++t) {
+            uint ww = ws[t];
+            uint k0 = g8 + t * 2u;
+            {
+                half4 w = u4_lo_h_fast(ww);
+                if (ROWS > 0u) d0 += dot(w, x4[0ul*xs4 + k0]);
+                if (ROWS > 1u) d1 += dot(w, x4[1ul*xs4 + k0]);
+                if (ROWS > 2u) d2 += dot(w, x4[2ul*xs4 + k0]);
+                if (ROWS > 3u) d3 += dot(w, x4[3ul*xs4 + k0]);
+                if (ROWS > 4u) d4 += dot(w, x4[4ul*xs4 + k0]);
+                if (ROWS > 5u) d5 += dot(w, x4[5ul*xs4 + k0]);
+                if (ROWS > 6u) d6 += dot(w, x4[6ul*xs4 + k0]);
+                if (ROWS > 7u) d7 += dot(w, x4[7ul*xs4 + k0]);
+            }
+            {
+                half4 w = u4_hi_h_fast(ww);
+                uint k1 = k0 + 1u;
+                if (ROWS > 0u) d0 += dot(w, x4[0ul*xs4 + k1]);
+                if (ROWS > 1u) d1 += dot(w, x4[1ul*xs4 + k1]);
+                if (ROWS > 2u) d2 += dot(w, x4[2ul*xs4 + k1]);
+                if (ROWS > 3u) d3 += dot(w, x4[3ul*xs4 + k1]);
+                if (ROWS > 4u) d4 += dot(w, x4[4ul*xs4 + k1]);
+                if (ROWS > 5u) d5 += dot(w, x4[5ul*xs4 + k1]);
+                if (ROWS > 6u) d6 += dot(w, x4[6ul*xs4 + k1]);
+                if (ROWS > 7u) d7 += dot(w, x4[7ul*xs4 + k1]);
+            }
+        }
+        if (ROWS > 0u) a0 += float(d0) * s;
+        if (ROWS > 1u) a1 += float(d1) * s;
+        if (ROWS > 2u) a2 += float(d2) * s;
+        if (ROWS > 3u) a3 += float(d3) * s;
+        if (ROWS > 4u) a4 += float(d4) * s;
+        if (ROWS > 5u) a5 += float(d5) * s;
+        if (ROWS > 6u) a6 += float(d6) * s;
+        if (ROWS > 7u) a7 += float(d7) * s;
     }
     float bv = p.has_bias ? bfv(bias[row]) : 0.0f;
-    if (ROWS > 0u) { float t = simd_sum(a0) + bv; if (lane == 0) y[0ul * p.y_stride + row] = p.round_out ? rbf(t) : t; }
-    if (ROWS > 1u) { float t = simd_sum(a1) + bv; if (lane == 0) y[1ul * p.y_stride + row] = p.round_out ? rbf(t) : t; }
-    if (ROWS > 2u) { float t = simd_sum(a2) + bv; if (lane == 0) y[2ul * p.y_stride + row] = p.round_out ? rbf(t) : t; }
-    if (ROWS > 3u) { float t = simd_sum(a3) + bv; if (lane == 0) y[3ul * p.y_stride + row] = p.round_out ? rbf(t) : t; }
-    if (ROWS > 4u) { float t = simd_sum(a4) + bv; if (lane == 0) y[4ul * p.y_stride + row] = p.round_out ? rbf(t) : t; }
-    if (ROWS > 5u) { float t = simd_sum(a5) + bv; if (lane == 0) y[5ul * p.y_stride + row] = p.round_out ? rbf(t) : t; }
-    if (ROWS > 6u) { float t = simd_sum(a6) + bv; if (lane == 0) y[6ul * p.y_stride + row] = p.round_out ? rbf(t) : t; }
-    if (ROWS > 7u) { float t = simd_sum(a7) + bv; if (lane == 0) y[7ul * p.y_stride + row] = p.round_out ? rbf(t) : t; }
+    if (ROWS > 0u) { float t = simd8_sum(a0) + bv; if (sl == 0u) y[0ul * p.y_stride + row] = p.round_out ? rbf(t) : t; }
+    if (ROWS > 1u) { float t = simd8_sum(a1) + bv; if (sl == 0u) y[1ul * p.y_stride + row] = p.round_out ? rbf(t) : t; }
+    if (ROWS > 2u) { float t = simd8_sum(a2) + bv; if (sl == 0u) y[2ul * p.y_stride + row] = p.round_out ? rbf(t) : t; }
+    if (ROWS > 3u) { float t = simd8_sum(a3) + bv; if (sl == 0u) y[3ul * p.y_stride + row] = p.round_out ? rbf(t) : t; }
+    if (ROWS > 4u) { float t = simd8_sum(a4) + bv; if (sl == 0u) y[4ul * p.y_stride + row] = p.round_out ? rbf(t) : t; }
+    if (ROWS > 5u) { float t = simd8_sum(a5) + bv; if (sl == 0u) y[5ul * p.y_stride + row] = p.round_out ? rbf(t) : t; }
+    if (ROWS > 6u) { float t = simd8_sum(a6) + bv; if (sl == 0u) y[6ul * p.y_stride + row] = p.round_out ? rbf(t) : t; }
+    if (ROWS > 7u) { float t = simd8_sum(a7) + bv; if (sl == 0u) y[7ul * p.y_stride + row] = p.round_out ? rbf(t) : t; }
 }
 
 struct MtpCtxKvP { uint kv_heads; uint head_dim; uint pos0; uint kv_cap; float eps; float log_theta; };
@@ -596,28 +608,38 @@ kernel void mtp_base_logits_7(device const uint4* q4 [[buffer(0)]],
                               uint simd [[simdgroup_index_in_threadgroup]],
                               uint simds [[simdgroups_per_threadgroup]],
                               uint lane [[thread_index_in_simdgroup]]) {
-    uint row = group * simds + simd;
+    uint sub = lane >> 3;
+    uint sl = lane & 7u;
+    uint row = (group * simds + simd) * 4u + sub;
     if (row >= p.dvocab) return;
     device const uint4* qr = q4 + ulong(row) * p.ng;
     device const half* sr = sc + ulong(row) * p.ng;
     float a0 = 0, a1 = 0, a2 = 0, a3 = 0, a4 = 0, a5 = 0, a6 = 0;
-    for (uint g = lane; g < p.ng; g += 32u) {
+    for (uint g = sl; g < p.ng; g += 8u) {
         uint4 pk = qr[g];
         float s = float(sr[g]);
         uint g8 = g * 8u;
-        float d0 = 0, d1 = 0, d2 = 0, d3 = 0, d4 = 0, d5 = 0, d6 = 0;
-        { half4 w = u4_lo_h(pk.x); d0 += float(dot(w, x4[1ul*p.xs4 + g8])); d1 += float(dot(w, x4[2ul*p.xs4 + g8])); d2 += float(dot(w, x4[3ul*p.xs4 + g8])); d3 += float(dot(w, x4[4ul*p.xs4 + g8])); d4 += float(dot(w, x4[5ul*p.xs4 + g8])); d5 += float(dot(w, x4[6ul*p.xs4 + g8])); d6 += float(dot(w, x4[7ul*p.xs4 + g8])); }
-        { half4 w = u4_hi_h(pk.x); uint k = g8 + 1u; d0 += float(dot(w, x4[1ul*p.xs4 + k])); d1 += float(dot(w, x4[2ul*p.xs4 + k])); d2 += float(dot(w, x4[3ul*p.xs4 + k])); d3 += float(dot(w, x4[4ul*p.xs4 + k])); d4 += float(dot(w, x4[5ul*p.xs4 + k])); d5 += float(dot(w, x4[6ul*p.xs4 + k])); d6 += float(dot(w, x4[7ul*p.xs4 + k])); }
-        { half4 w = u4_lo_h(pk.y); uint k = g8 + 2u; d0 += float(dot(w, x4[1ul*p.xs4 + k])); d1 += float(dot(w, x4[2ul*p.xs4 + k])); d2 += float(dot(w, x4[3ul*p.xs4 + k])); d3 += float(dot(w, x4[4ul*p.xs4 + k])); d4 += float(dot(w, x4[5ul*p.xs4 + k])); d5 += float(dot(w, x4[6ul*p.xs4 + k])); d6 += float(dot(w, x4[7ul*p.xs4 + k])); }
-        { half4 w = u4_hi_h(pk.y); uint k = g8 + 3u; d0 += float(dot(w, x4[1ul*p.xs4 + k])); d1 += float(dot(w, x4[2ul*p.xs4 + k])); d2 += float(dot(w, x4[3ul*p.xs4 + k])); d3 += float(dot(w, x4[4ul*p.xs4 + k])); d4 += float(dot(w, x4[5ul*p.xs4 + k])); d5 += float(dot(w, x4[6ul*p.xs4 + k])); d6 += float(dot(w, x4[7ul*p.xs4 + k])); }
-        { half4 w = u4_lo_h(pk.z); uint k = g8 + 4u; d0 += float(dot(w, x4[1ul*p.xs4 + k])); d1 += float(dot(w, x4[2ul*p.xs4 + k])); d2 += float(dot(w, x4[3ul*p.xs4 + k])); d3 += float(dot(w, x4[4ul*p.xs4 + k])); d4 += float(dot(w, x4[5ul*p.xs4 + k])); d5 += float(dot(w, x4[6ul*p.xs4 + k])); d6 += float(dot(w, x4[7ul*p.xs4 + k])); }
-        { half4 w = u4_hi_h(pk.z); uint k = g8 + 5u; d0 += float(dot(w, x4[1ul*p.xs4 + k])); d1 += float(dot(w, x4[2ul*p.xs4 + k])); d2 += float(dot(w, x4[3ul*p.xs4 + k])); d3 += float(dot(w, x4[4ul*p.xs4 + k])); d4 += float(dot(w, x4[5ul*p.xs4 + k])); d5 += float(dot(w, x4[6ul*p.xs4 + k])); d6 += float(dot(w, x4[7ul*p.xs4 + k])); }
-        { half4 w = u4_lo_h(pk.w); uint k = g8 + 6u; d0 += float(dot(w, x4[1ul*p.xs4 + k])); d1 += float(dot(w, x4[2ul*p.xs4 + k])); d2 += float(dot(w, x4[3ul*p.xs4 + k])); d3 += float(dot(w, x4[4ul*p.xs4 + k])); d4 += float(dot(w, x4[5ul*p.xs4 + k])); d5 += float(dot(w, x4[6ul*p.xs4 + k])); d6 += float(dot(w, x4[7ul*p.xs4 + k])); }
-        { half4 w = u4_hi_h(pk.w); uint k = g8 + 7u; d0 += float(dot(w, x4[1ul*p.xs4 + k])); d1 += float(dot(w, x4[2ul*p.xs4 + k])); d2 += float(dot(w, x4[3ul*p.xs4 + k])); d3 += float(dot(w, x4[4ul*p.xs4 + k])); d4 += float(dot(w, x4[5ul*p.xs4 + k])); d5 += float(dot(w, x4[6ul*p.xs4 + k])); d6 += float(dot(w, x4[7ul*p.xs4 + k])); }
-        a0 += d0 * s; a1 += d1 * s; a2 += d2 * s; a3 += d3 * s; a4 += d4 * s; a5 += d5 * s; a6 += d6 * s;
+        half d0 = 0, d1 = 0, d2 = 0, d3 = 0, d4 = 0, d5 = 0, d6 = 0;
+        uint ws[4] = {pk.x, pk.y, pk.z, pk.w};
+        for (uint t = 0; t < 4u; ++t) {
+            uint ww = ws[t];
+            uint k0 = g8 + t * 2u;
+            {
+                half4 w = u4_lo_h_fast(ww);
+                d0 += dot(w, x4[1ul*p.xs4 + k0]); d1 += dot(w, x4[2ul*p.xs4 + k0]); d2 += dot(w, x4[3ul*p.xs4 + k0]); d3 += dot(w, x4[4ul*p.xs4 + k0]);
+                d4 += dot(w, x4[5ul*p.xs4 + k0]); d5 += dot(w, x4[6ul*p.xs4 + k0]); d6 += dot(w, x4[7ul*p.xs4 + k0]);
+            }
+            {
+                half4 w = u4_hi_h_fast(ww);
+                uint k1 = k0 + 1u;
+                d0 += dot(w, x4[1ul*p.xs4 + k1]); d1 += dot(w, x4[2ul*p.xs4 + k1]); d2 += dot(w, x4[3ul*p.xs4 + k1]); d3 += dot(w, x4[4ul*p.xs4 + k1]);
+                d4 += dot(w, x4[5ul*p.xs4 + k1]); d5 += dot(w, x4[6ul*p.xs4 + k1]); d6 += dot(w, x4[7ul*p.xs4 + k1]);
+            }
+        }
+        a0 += float(d0) * s; a1 += float(d1) * s; a2 += float(d2) * s; a3 += float(d3) * s; a4 += float(d4) * s; a5 += float(d5) * s; a6 += float(d6) * s;
     }
-    float t0 = simd_sum(a0), t1 = simd_sum(a1), t2 = simd_sum(a2), t3 = simd_sum(a3), t4 = simd_sum(a4), t5 = simd_sum(a5), t6 = simd_sum(a6);
-    if (lane == 0) {
+    float t0 = simd8_sum(a0), t1 = simd8_sum(a1), t2 = simd8_sum(a2), t3 = simd8_sum(a3), t4 = simd8_sum(a4), t5 = simd8_sum(a5), t6 = simd8_sum(a6);
+    if (sl == 0u) {
         base_out[0ul * p.dvocab + row] = half(t0);
         base_out[1ul * p.dvocab + row] = half(t1);
         base_out[2ul * p.dvocab + row] = half(t2);
@@ -628,56 +650,66 @@ kernel void mtp_base_logits_7(device const uint4* q4 [[buffer(0)]],
     }
 }
 
-struct MtpRnnInP { uint rank; uint hidden; uint step; };
+struct MtpRnnInP { uint rank; uint hidden; uint step; uint beams; uint parent_b[4]; };
 
 kernel void mtp_rnn_input(device const float* state [[buffer(0)]],
                           device const ushort* markov_w1 [[buffer(1)]],
-                          device const uint* out_ids [[buffer(2)]],
+                          device const uint* beam_toks [[buffer(2)]],
                           device const half* hn [[buffer(3)]],
                           device const half* f_rnn [[buffer(4)]],
                           device half* rnn_in [[buffer(5)]],
                           constant MtpRnnInP& p [[buffer(6)]],
+                          uint b [[threadgroup_position_in_grid]],
                           uint tid [[thread_position_in_threadgroup]],
                           uint threads [[threads_per_threadgroup]]) {
-    uint prev_tok = out_ids[p.step];
+    uint prev_tok = beam_toks[b];
+    uint pb = p.parent_b[b];
+    uint dim = 2u * p.rank + 2u * p.hidden;
+    device half* dst = rnn_in + ulong(b) * dim;
+    device const float* st = state + ulong(pb) * p.rank;
     for (uint i = tid; i < p.rank; i += threads) {
-        rnn_in[i] = p.step == 0u ? half(0) : half(state[i]);
-        rnn_in[p.rank + i] = half(bfv(markov_w1[ulong(prev_tok) * p.rank + i]));
+        dst[i] = p.step == 0u ? half(0) : half(st[i]);
+        dst[p.rank + i] = half(bfv(markov_w1[ulong(prev_tok) * p.rank + i]));
     }
     device const half* hk = hn + ulong(p.step + 1u) * p.hidden;
     uint off0 = 2u * p.rank;
     uint off1 = off0 + p.hidden;
     for (uint i = tid; i < p.hidden; i += threads) {
-        rnn_in[off0 + i] = hk[i];
-        rnn_in[off1 + i] = f_rnn[i];
+        dst[off0 + i] = hk[i];
+        dst[off1 + i] = f_rnn[i];
     }
 }
 
+struct MtpRnnGateP { uint rank; uint step; uint parent_b[4]; };
+
 kernel void mtp_rnn_gates(device const float* proj [[buffer(0)]],
-                          device float* state [[buffer(1)]],
-                          device float* latent [[buffer(2)]],
-                          constant uint2& rs [[buffer(3)]],
+                          device const float* state_in [[buffer(1)]],
+                          device float* state_out [[buffer(2)]],
+                          device half* latent [[buffer(3)]],
+                          constant MtpRnnGateP& p [[buffer(4)]],
+                          uint b [[threadgroup_position_in_grid]],
                           uint tid [[thread_position_in_threadgroup]]) {
-    uint rank = rs.x, step = rs.y;
-    if (tid >= rank) return;
-    float st = step == 0u ? 0.0f : state[tid];
-    float gate_raw = proj[tid];
-    float cand_raw = proj[rank + tid];
-    float out_raw = proj[2u * rank + tid];
+    if (tid >= p.rank) return;
+    uint pb = p.parent_b[b];
+    float st = p.step == 0u ? 0.0f : state_in[ulong(pb) * p.rank + tid];
+    device const float* pr = proj + ulong(b) * (3u * p.rank);
+    float gate_raw = pr[tid];
+    float cand_raw = pr[p.rank + tid];
+    float out_raw = pr[2u * p.rank + tid];
     float gate = rbf(1.0f / (1.0f + precise::exp(-gate_raw)));
     float kept = rbf(gate * st);
     float blend = rbf(rbf(1.0f - gate) * rbf(precise::tanh(cand_raw)));
-    state[tid] = rbf(kept + blend);
-    latent[tid] = rbf(precise::tanh(out_raw));
+    state_out[ulong(b) * p.rank + tid] = rbf(kept + blend);
+    latent[ulong(b) * p.rank + tid] = half(rbf(precise::tanh(out_raw)));
 }
 
-struct MtpMarkovP { uint dvocab; uint step; float cap; float inv_temp; };
+struct MtpMarkovP { uint dvocab; uint step; uint beams; uint ntg; float cap; float inv_temp; };
 
 kernel void mtp_markov_scan(device const uint4* fold_q4 [[buffer(0)]],
                             device const half* fold_sc [[buffer(1)]],
                             device const float* fold_b [[buffer(2)]],
                             device const half* base_logits [[buffer(3)]],
-                            device const float4* latent4 [[buffer(4)]],
+                            device const half4* latent4 [[buffer(4)]],
                             device float* tg_val [[buffer(5)]],
                             device uint* tg_row [[buffer(6)]],
                             device float* tg_sum [[buffer(7)]],
@@ -685,94 +717,160 @@ kernel void mtp_markov_scan(device const uint4* fold_q4 [[buffer(0)]],
                             uint group [[threadgroup_position_in_grid]],
                             uint simd [[simdgroup_index_in_threadgroup]],
                             uint lane [[thread_index_in_simdgroup]]) {
-    threadgroup float sv[32];
+    threadgroup float sv[3][32];
     threadgroup uint sr[32];
     uint sub = lane >> 3;
     uint g = lane & 7u;
     uint slot = simd * 4u + sub;
     uint row = group * 32u + slot;
-    float dot_g = 0.0f;
+    float d0 = 0.0f, d1 = 0.0f, d2 = 0.0f;
     if (row < p.dvocab) {
         uint4 pk = fold_q4[ulong(row) * 8u + g];
         float s = float(fold_sc[ulong(row) * 8u + g]);
         uint g8 = g * 8u;
-        float d = dot(u4_lo(pk.x), latent4[g8 + 0u]) + dot(u4_hi(pk.x), latent4[g8 + 1u])
-                + dot(u4_lo(pk.y), latent4[g8 + 2u]) + dot(u4_hi(pk.y), latent4[g8 + 3u])
-                + dot(u4_lo(pk.z), latent4[g8 + 4u]) + dot(u4_hi(pk.z), latent4[g8 + 5u])
-                + dot(u4_lo(pk.w), latent4[g8 + 6u]) + dot(u4_hi(pk.w), latent4[g8 + 7u]);
-        dot_g = d * s;
-    }
-    dot_g += simd_shuffle_xor(dot_g, 4u);
-    dot_g += simd_shuffle_xor(dot_g, 2u);
-    dot_g += simd_shuffle_xor(dot_g, 1u);
-    if (g == 0u) {
-        float val = -INFINITY;
-        if (row < p.dvocab) {
-            float raw = float(base_logits[ulong(p.step) * p.dvocab + row]) + fold_b[row] + dot_g;
-            val = p.cap > 0.0f ? (p.cap * precise::tanh(raw / p.cap)) : raw;
+        device const half4* l0 = latent4 + g8;
+        device const half4* l1 = latent4 + 64u + g8;
+        device const half4* l2 = latent4 + 128u + g8;
+        half4 w0 = u4_lo_h_fast(pk.x), w1 = u4_hi_h_fast(pk.x);
+        half4 w2 = u4_lo_h_fast(pk.y), w3 = u4_hi_h_fast(pk.y);
+        half4 w4 = u4_lo_h_fast(pk.z), w5 = u4_hi_h_fast(pk.z);
+        half4 w6 = u4_lo_h_fast(pk.w), w7 = u4_hi_h_fast(pk.w);
+        half h0 = dot(w0, l0[0]) + dot(w1, l0[1]) + dot(w2, l0[2]) + dot(w3, l0[3])
+                + dot(w4, l0[4]) + dot(w5, l0[5]) + dot(w6, l0[6]) + dot(w7, l0[7]);
+        d0 = float(h0) * s;
+        if (p.beams > 1u) {
+            half h1 = dot(w0, l1[0]) + dot(w1, l1[1]) + dot(w2, l1[2]) + dot(w3, l1[3])
+                    + dot(w4, l1[4]) + dot(w5, l1[5]) + dot(w6, l1[6]) + dot(w7, l1[7]);
+            d1 = float(h1) * s;
         }
-        sv[slot] = val;
+        if (p.beams > 2u) {
+            half h2 = dot(w0, l2[0]) + dot(w1, l2[1]) + dot(w2, l2[2]) + dot(w3, l2[3])
+                    + dot(w4, l2[4]) + dot(w5, l2[5]) + dot(w6, l2[6]) + dot(w7, l2[7]);
+            d2 = float(h2) * s;
+        }
+    }
+    d0 = simd8_sum(d0);
+    if (p.beams > 1u) d1 = simd8_sum(d1);
+    if (p.beams > 2u) d2 = simd8_sum(d2);
+    if (g == 0u) {
         sr[slot] = row;
+        if (row < p.dvocab) {
+            float base = float(base_logits[ulong(p.step) * p.dvocab + row]) + fold_b[row];
+            float r0 = base + d0;
+            sv[0][slot] = p.cap > 0.0f ? (p.cap * precise::tanh(r0 / p.cap)) : r0;
+            if (p.beams > 1u) {
+                float r1 = base + d1;
+                sv[1][slot] = p.cap > 0.0f ? (p.cap * precise::tanh(r1 / p.cap)) : r1;
+            }
+            if (p.beams > 2u) {
+                float r2 = base + d2;
+                sv[2][slot] = p.cap > 0.0f ? (p.cap * precise::tanh(r2 / p.cap)) : r2;
+            }
+        } else {
+            sv[0][slot] = -INFINITY;
+            if (p.beams > 1u) sv[1][slot] = -INFINITY;
+            if (p.beams > 2u) sv[2][slot] = -INFINITY;
+        }
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
     if (simd == 0u) {
-        float v = sv[lane];
         uint r = sr[lane];
-        float bv = v;
-        uint br = r;
-        for (uint off = 16u; off > 0u; off >>= 1) {
-            float ov = simd_shuffle_xor(bv, off);
-            uint oi = simd_shuffle_xor(br, off);
-            if (ov > bv || (ov == bv && oi < br)) { bv = ov; br = oi; }
-        }
-        float e = v == -INFINITY ? 0.0f : precise::exp((v - bv) * p.inv_temp);
-        float esum = simd_sum(e);
-        if (lane == 0u) {
-            tg_val[group] = bv;
-            tg_row[group] = br;
-            tg_sum[group] = esum;
+        for (uint b = 0; b < p.beams; ++b) {
+            float v = sv[b][lane];
+            float v1 = v; uint r1 = r;
+            for (uint off = 16u; off > 0u; off >>= 1) {
+                float ov = simd_shuffle_xor(v1, off); uint oi = simd_shuffle_xor(r1, off);
+                if (ov > v1 || (ov == v1 && oi < r1)) { v1 = ov; r1 = oi; }
+            }
+            float e = v == -INFINITY ? 0.0f : precise::exp((v - v1) * p.inv_temp);
+            float esum = simd_sum(e);
+            float v2 = (r == r1) ? -INFINITY : v; uint r2 = (r == r1) ? 0xffffffffu : r;
+            for (uint off = 16u; off > 0u; off >>= 1) {
+                float ov = simd_shuffle_xor(v2, off); uint oi = simd_shuffle_xor(r2, off);
+                if (ov > v2 || (ov == v2 && oi < r2)) { v2 = ov; r2 = oi; }
+            }
+            float v3 = (r == r1 || r == r2) ? -INFINITY : v; uint r3 = (r == r1 || r == r2) ? 0xffffffffu : r;
+            for (uint off = 16u; off > 0u; off >>= 1) {
+                float ov = simd_shuffle_xor(v3, off); uint oi = simd_shuffle_xor(r3, off);
+                if (ov > v3 || (ov == v3 && oi < r3)) { v3 = ov; r3 = oi; }
+            }
+            if (lane == 0u) {
+                ulong dst = (ulong(b) * p.ntg + group) * 3u;
+                tg_val[dst + 0u] = v1; tg_row[dst + 0u] = r1;
+                tg_val[dst + 1u] = v2; tg_row[dst + 1u] = r2;
+                tg_val[dst + 2u] = v3; tg_row[dst + 2u] = r3;
+                tg_sum[ulong(b) * p.ntg + group] = esum;
+            }
         }
     }
 }
 
-struct MtpReduceP { uint ntg; uint step; float inv_temp; };
+struct MtpReduceP { uint ntg; uint step; uint beams; float inv_temp; };
 
 kernel void mtp_markov_reduce(device const float* tg_val [[buffer(0)]],
                               device const uint* tg_row [[buffer(1)]],
                               device const float* tg_sum [[buffer(2)]],
                               device const uint* vocab_ids [[buffer(3)]],
-                              device uint* out_ids [[buffer(4)]],
-                              device float* out_probs [[buffer(5)]],
-                              constant MtpReduceP& p [[buffer(6)]],
+                              device uint* tree_ids [[buffer(4)]],
+                              device float* tree_probs [[buffer(5)]],
+                              device uint* next_beam_tok [[buffer(6)]],
+                              constant MtpReduceP& p [[buffer(7)]],
+                              uint b [[threadgroup_position_in_grid]],
                               uint tid [[thread_position_in_threadgroup]],
                               uint lane [[thread_index_in_simdgroup]],
                               uint simd [[simdgroup_index_in_threadgroup]]) {
-    threadgroup float mv[16];
-    threadgroup uint mr[16];
+    threadgroup float mv[16][3];
+    threadgroup uint mr[16][3];
     threadgroup float ms[16];
-    float bv = -INFINITY;
-    uint br = 0xffffffffu;
+    device const float* tv = tg_val + ulong(b) * p.ntg * 3u;
+    device const uint* tr = tg_row + ulong(b) * p.ntg * 3u;
+    device const float* ts = tg_sum + ulong(b) * p.ntg;
+    float lv1 = -INFINITY, lv2 = -INFINITY, lv3 = -INFINITY;
+    uint lr1 = 0xffffffffu, lr2 = 0xffffffffu, lr3 = 0xffffffffu;
     for (uint i = tid; i < p.ntg; i += 512u) {
-        float v = tg_val[i];
-        uint r = tg_row[i];
-        if (v > bv || (v == bv && r < br)) { bv = v; br = r; }
+        for (uint j = 0; j < 3u; ++j) {
+            float v = tv[i * 3u + j];
+            uint r = tr[i * 3u + j];
+            if (v > lv1 || (v == lv1 && r < lr1)) {
+                lv3 = lv2; lr3 = lr2; lv2 = lv1; lr2 = lr1; lv1 = v; lr1 = r;
+            } else if (v > lv2 || (v == lv2 && r < lr2)) {
+                lv3 = lv2; lr3 = lr2; lv2 = v; lr2 = r;
+            } else if (v > lv3 || (v == lv3 && r < lr3)) {
+                lv3 = v; lr3 = r;
+            }
+        }
     }
-    for (uint off = 16u; off > 0u; off >>= 1) {
-        float ov = simd_shuffle_xor(bv, off);
-        uint oi = simd_shuffle_xor(br, off);
-        if (ov > bv || (ov == bv && oi < br)) { bv = ov; br = oi; }
+    for (uint k = 0; k < 3u; ++k) {
+        float bv = lv1;
+        uint br = lr1;
+        for (uint off = 16u; off > 0u; off >>= 1) {
+            float ov = simd_shuffle_xor(bv, off);
+            uint oi = simd_shuffle_xor(br, off);
+            if (ov > bv || (ov == bv && oi < br)) { bv = ov; br = oi; }
+        }
+        if (lane == 0u) { mv[simd][k] = bv; mr[simd][k] = br; }
+        if (lr1 == br && lv1 == bv) { lv1 = lv2; lr1 = lr2; lv2 = lv3; lr2 = lr3; lv3 = -INFINITY; lr3 = 0xffffffffu; }
     }
-    if (lane == 0u) { mv[simd] = bv; mr[simd] = br; }
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    float gm = mv[0];
-    uint gr = mr[0];
-    for (uint i = 1u; i < 16u; ++i) {
-        if (mv[i] > gm || (mv[i] == gm && mr[i] < gr)) { gm = mv[i]; gr = mr[i]; }
+    float g1 = -INFINITY, g2 = -INFINITY, g3 = -INFINITY;
+    uint r1 = 0xffffffffu, r2 = 0xffffffffu, r3 = 0xffffffffu;
+    for (uint s = 0; s < 16u; ++s) {
+        for (uint k = 0; k < 3u; ++k) {
+            float v = mv[s][k];
+            uint r = mr[s][k];
+            if (v > g1 || (v == g1 && r < r1)) {
+                g3 = g2; r3 = r2; g2 = g1; r2 = r1; g1 = v; r1 = r;
+            } else if (v > g2 || (v == g2 && r < r2)) {
+                g3 = g2; r3 = r2; g2 = v; r2 = r;
+            } else if (v > g3 || (v == g3 && r < r3)) {
+                g3 = v; r3 = r;
+            }
+        }
     }
     float ls = 0.0f;
     for (uint i = tid; i < p.ntg; i += 512u) {
-        float v = tg_val[i];
-        if (v != -INFINITY) ls += tg_sum[i] * precise::exp((v - gm) * p.inv_temp);
+        float v = tv[i * 3u];
+        if (v != -INFINITY) ls += ts[i] * precise::exp((v - g1) * p.inv_temp);
     }
     ls = simd_sum(ls);
     if (lane == 0u) ms[simd] = ls;
@@ -780,7 +878,26 @@ kernel void mtp_markov_reduce(device const float* tg_val [[buffer(0)]],
     if (tid == 0u) {
         float tot = 0.0f;
         for (uint i = 0u; i < 16u; ++i) tot += ms[i];
-        out_ids[p.step + 1u] = vocab_ids[gr];
-        out_probs[p.step] = tot > 0.0f ? (1.0f / tot) : 0.0f;
+        float inv_tot = tot > 0.0f ? (1.0f / tot) : 0.0f;
+        uint id1 = r1 != 0xffffffffu ? vocab_ids[r1] : 0u;
+        uint id2 = r2 != 0xffffffffu ? vocab_ids[r2] : 0u;
+        uint id3 = r3 != 0xffffffffu ? vocab_ids[r3] : 0u;
+        float p1 = r1 != 0xffffffffu ? inv_tot : 0.0f;
+        float p2 = r2 != 0xffffffffu ? (precise::exp((g2 - g1) * p.inv_temp) * inv_tot) : 0.0f;
+        float p3 = r3 != 0xffffffffu ? (precise::exp((g3 - g1) * p.inv_temp) * inv_tot) : 0.0f;
+        uint base = p.step == 0u ? 0u : (3u + (p.step - 1u) * 9u + b * 3u);
+        tree_ids[base + 0u] = id1; tree_probs[base + 0u] = p1;
+        tree_ids[base + 1u] = id2; tree_probs[base + 1u] = p2;
+        tree_ids[base + 2u] = id3; tree_probs[base + 2u] = p3;
+        if (p.step == 0u) {
+            next_beam_tok[0] = id1;
+            next_beam_tok[1] = id2;
+            next_beam_tok[2] = id3;
+        } else if (b == 0u) {
+            next_beam_tok[0] = id1;
+            next_beam_tok[1] = id2;
+        } else if (b == 1u) {
+            next_beam_tok[2] = id1;
+        }
     }
 }

@@ -167,7 +167,7 @@ test('delphi generate retrieves a needle past 4096 tokens using 32K ring-KV', { 
   });
 });
 
-test('delphi generate --spec mtp matches --spec off token-for-token with multi-token acceptance', { tags: ['model'], timeout: 900_000 }, () => {
+test('delphi generate --spec mtp matches --spec off token-for-token with multi-token tree acceptance', { tags: ['model'], timeout: 900_000 }, () => {
   const deadline = Date.now() + 900_000;
   withBuiltDelphi(deadline, (bin) => {
     for (const c of [fibonacci, truth.cases[2]]) {
@@ -177,7 +177,7 @@ test('delphi generate --spec mtp matches --spec off token-for-token with multi-t
       checkRun('delphi generate --spec mtp', mtpRun);
       const mtpOut = JSON.parse(mtpRun.stdout) as Generated;
       expect(mtpOut.output_ids).toEqual((JSON.parse(offRun.stdout) as Generated).output_ids);
-      expect(mtpOut.accepted_per_step ?? 0).toBeGreaterThan(1.3);
+      expect(mtpOut.accepted_per_step ?? 0).toBeGreaterThan(1.55);
     }
   });
 });

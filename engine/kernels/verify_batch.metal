@@ -609,7 +609,7 @@ kernel void gemv_bf16_rows(device const uint4* w [[buffer(0)]],
     if (ROWS > 7u) { float t = simd_sum(a7) * g.scale; if (lane == 0) y[7ul * g.y_stride + row] = g.round_out ? rbf(t) : t; }
 }
 
-struct ConvB { uint channels; uint dynamic; uint head_dim; uint rows; uint x_stride; uint dyn_stride; uint y_stride; float scale; };
+struct ConvB { uint channels; uint dynamic; uint head_dim; uint rows; uint x_stride; uint dyn_stride; uint y_stride; uint is_tree; float scale; uint p1[16]; uint p2[16]; uint p3[16]; };
 
 kernel void sconv_batch(device const float* x [[buffer(0)]],
                         device float* state [[buffer(1)]],
@@ -630,17 +630,20 @@ kernel void sconv_batch(device const float* x [[buffer(0)]],
     for (uint m = 0; m < p.rows; ++m) {
         float xm = x[ulong(m) * p.x_stride + c];
         state[(3u + m) * p.channels + c] = xm;
+        float th0 = p.is_tree ? state[p.p3[m] * p.channels + c] : h0;
+        float th1 = p.is_tree ? state[p.p2[m] * p.channels + c] : h1;
+        float th2 = p.is_tree ? state[p.p1[m] * p.channels + c] : h2;
         float acc = 0.0f;
         if (p.dynamic) {
             device const float* dm = dyn + ulong(m) * p.dyn_stride + head * 4u;
             acc += xm * (w0 + dm[0]);
-            acc += h2 * (w1 + dm[1]);
-            acc += h1 * (w2 + dm[2]);
-            acc += h0 * (w3 + dm[3]);
+            acc += th2 * (w1 + dm[1]);
+            acc += th1 * (w2 + dm[2]);
+            acc += th0 * (w3 + dm[3]);
         } else {
-            acc = fma(h0, w0, acc);
-            acc = fma(h1, w1, acc);
-            acc = fma(h2, w2, acc);
+            acc = fma(th0, w0, acc);
+            acc = fma(th1, w1, acc);
+            acc = fma(th2, w2, acc);
             acc = fma(xm, w3, acc);
         }
         y[ulong(m) * p.y_stride + c] = rbf((acc + xm) * p.scale);
@@ -654,23 +657,41 @@ struct ConvMeta { uint offset_f; uint width; };
 
 kernel void conv_commit_all(device float* conv_buf [[buffer(0)]],
                             device const ConvMeta* meta [[buffer(1)]],
-                            constant uint& commit [[buffer(2)]],
+                            constant uint4& csrc [[buffer(2)]],
                             uint group [[threadgroup_position_in_grid]],
                             uint tid [[thread_position_in_threadgroup]],
                             uint threads [[threads_per_threadgroup]]) {
     ConvMeta cm = meta[group];
     device float* st = conv_buf + cm.offset_f;
     for (uint c = tid; c < cm.width; c += threads) {
-        float s0 = st[(commit + 0u) * cm.width + c];
-        float s1 = st[(commit + 1u) * cm.width + c];
-        float s2 = st[(commit + 2u) * cm.width + c];
+        float s0 = st[csrc.x * cm.width + c];
+        float s1 = st[csrc.y * cm.width + c];
+        float s2 = st[csrc.z * cm.width + c];
         st[0u * cm.width + c] = s0;
         st[1u * cm.width + c] = s1;
         st[2u * cm.width + c] = s2;
     }
 }
 
-struct ClipB { uint width; uint has_scale; uint pos0; uint is_local; uint n_floor; uint in_stride; uint out_stride; uint mode; float threshold; float alpha; };
+struct KvCompactP { uint pos0; uint kv_cap; uint kv_stride; uint count; uint src[16]; };
+
+kernel void kv_compact_tree(device ushort* kc [[buffer(0)]],
+                            device ushort* vc [[buffer(1)]],
+                            constant KvCompactP& p [[buffer(2)]],
+                            uint c [[thread_position_in_grid]]) {
+    if (c >= p.kv_stride) return;
+    for (uint j = 1u; j < p.count; ++j) {
+        uint s = p.src[j];
+        if (s != j) {
+            ulong sidx = ulong((p.pos0 + s) % p.kv_cap) * p.kv_stride + c;
+            ulong didx = ulong((p.pos0 + j) % p.kv_cap) * p.kv_stride + c;
+            kc[didx] = kc[sidx];
+            vc[didx] = vc[sidx];
+        }
+    }
+}
+
+struct ClipB { uint width; uint has_scale; uint pos0; uint is_local; uint n_floor; uint in_stride; uint out_stride; uint mode; float threshold; float alpha; uint is_tree; uint dep[16]; };
 
 kernel void clip_rows_batch(device const float* x [[buffer(0)]],
                             device const ushort* scale [[buffer(1)]],
@@ -694,7 +715,8 @@ kernel void clip_rows_batch(device const float* x [[buffer(0)]],
     float coeff;
     if (p.mode == 1u) coeff = 1.0f / precise::sqrt(s / float(p.width) + 1e-6f);
     else coeff = min(p.threshold / (1e-6f + precise::sqrt(s)), 1.0f);
-    float tau = p.is_local ? 1.0f : (1.0f + p.alpha * precise::log(max((float(p.pos0 + m) + 1.0f) / float(p.n_floor), 1.0f)));
+    uint qpos = p.pos0 + (p.is_tree ? p.dep[m] : m);
+    float tau = p.is_local ? 1.0f : (1.0f + p.alpha * precise::log(max((float(qpos) + 1.0f) / float(p.n_floor), 1.0f)));
     n = 0;
     for (uint i = lane; i < p.width; i += 32u, ++n) {
         float out = v[n] * coeff;
@@ -742,7 +764,7 @@ kernel void rel_bias_batch(device const float* r [[buffer(0)]],
     rel[ulong(m) * p.heads * p.extent + h * p.extent + d] = rbf(acc);
 }
 
-struct AttnB { uint pos0; uint rows; uint window; uint is_local; uint kv_heads; uint group; uint head_dim; uint extent; uint heads; uint q_stride; uint gate_stride; uint gate_off; uint sink_off; uint out_stride; uint kv_cap; float scale; };
+struct AttnB { uint pos0; uint rows; uint window; uint is_local; uint kv_heads; uint group; uint head_dim; uint extent; uint heads; uint q_stride; uint gate_stride; uint gate_off; uint sink_off; uint out_stride; uint kv_cap; float scale; uint is_tree; uint dep[16]; uint mask[16]; };
 
 kernel void attend_gated_batch(device const float4* q [[buffer(0)]],
                                device const ushort4* kc [[buffer(1)]],
@@ -769,62 +791,175 @@ kernel void attend_gated_batch(device const float4* q [[buffer(0)]],
     float mv0 = -INFINITY, mv1 = -INFINITY, mv2 = -INFINITY, mv3 = -INFINITY;
     float lv0 = 0.0f, lv1 = 0.0f, lv2 = 0.0f, lv3 = 0.0f;
     float4 o0 = 0.0f, o1 = 0.0f, o2 = 0.0f, o3 = 0.0f;
-    uint pos_first = p.pos0 + m0;
-    uint pos_last = pos_first + mb - 1u;
-    uint kv_start = (p.is_local && pos_first + 1u > p.window) ? (pos_first + 1u - p.window) : 0u;
-    uint count = pos_last - kv_start + 1u;
-    for (uint t = simd; t < count; t += 4u) {
-        uint kp = kv_start + t;
-        ulong base = (ulong(kp % p.kv_cap) * p.kv_heads + kvh) * 32u + lane;
-        ushort4 ku = kc[base];
-        float4 k4 = float4(bfv(ku.x), bfv(ku.y), bfv(ku.z), bfv(ku.w));
-        ushort4 vu = vc[base];
-        float4 v4 = float4(bfv(vu.x), bfv(vu.y), bfv(vu.z), bfv(vu.w));
-        {
-            uint qpos = pos_first;
-            uint qstart = (p.is_local && qpos + 1u > p.window) ? (qpos + 1u - p.window) : 0u;
-            if (kp >= qstart && kp <= qpos) {
+    uint qp0 = p.pos0 + (p.is_tree ? p.dep[m0] : m0);
+    uint qp1 = mb > 1u ? (p.pos0 + (p.is_tree ? p.dep[m0 + 1u] : (m0 + 1u))) : qp0;
+    uint qp2 = mb > 2u ? (p.pos0 + (p.is_tree ? p.dep[m0 + 2u] : (m0 + 2u))) : qp0;
+    uint qp3 = mb > 3u ? (p.pos0 + (p.is_tree ? p.dep[m0 + 3u] : (m0 + 3u))) : qp0;
+    uint min_qp = min(min(qp0, qp1), min(qp2, qp3));
+    uint kv_start = (p.is_local && min_qp + 1u > p.window) ? (min_qp + 1u - p.window) : 0u;
+    if (!p.is_tree) {
+        uint pos_first = p.pos0 + m0;
+        uint pos_last = pos_first + mb - 1u;
+        uint count = pos_last - kv_start + 1u;
+        for (uint t = simd; t < count; t += 4u) {
+            uint kp = kv_start + t;
+            ulong base = (ulong(kp % p.kv_cap) * p.kv_heads + kvh) * 32u + lane;
+            ushort4 ku = kc[base];
+            float4 k4 = float4(bfv(ku.x), bfv(ku.y), bfv(ku.z), bfv(ku.w));
+            ushort4 vu = vc[base];
+            float4 v4 = float4(bfv(vu.x), bfv(vu.y), bfv(vu.z), bfv(vu.w));
+            {
+                uint qpos = pos_first;
+                uint qstart = (p.is_local && qpos + 1u > p.window) ? (qpos + 1u - p.window) : 0u;
+                if (kp >= qstart && kp <= qpos) {
+                    float s = simd_sum(dot(q0, k4)) * p.scale;
+                    uint dist = qpos - kp;
+                    s += dist < p.extent ? rel[(ulong(m0) * p.heads + h) * p.extent + dist] : 0.0f;
+                    float mn = max(mv0, s);
+                    float a = mv0 == -INFINITY ? 0.0f : precise::exp(mv0 - mn);
+                    float b = precise::exp(s - mn);
+                    o0 = o0 * a + v4 * b; lv0 = lv0 * a + b; mv0 = mn;
+                }
+            }
+            if (mb > 1u) {
+                uint qpos = pos_first + 1u;
+                uint qstart = (p.is_local && qpos + 1u > p.window) ? (qpos + 1u - p.window) : 0u;
+                if (kp >= qstart && kp <= qpos) {
+                    float s = simd_sum(dot(q1, k4)) * p.scale;
+                    uint dist = qpos - kp;
+                    s += dist < p.extent ? rel[(ulong(m0 + 1u) * p.heads + h) * p.extent + dist] : 0.0f;
+                    float mn = max(mv1, s);
+                    float a = mv1 == -INFINITY ? 0.0f : precise::exp(mv1 - mn);
+                    float b = precise::exp(s - mn);
+                    o1 = o1 * a + v4 * b; lv1 = lv1 * a + b; mv1 = mn;
+                }
+            }
+            if (mb > 2u) {
+                uint qpos = pos_first + 2u;
+                uint qstart = (p.is_local && qpos + 1u > p.window) ? (qpos + 1u - p.window) : 0u;
+                if (kp >= qstart && kp <= qpos) {
+                    float s = simd_sum(dot(q2, k4)) * p.scale;
+                    uint dist = qpos - kp;
+                    s += dist < p.extent ? rel[(ulong(m0 + 2u) * p.heads + h) * p.extent + dist] : 0.0f;
+                    float mn = max(mv2, s);
+                    float a = mv2 == -INFINITY ? 0.0f : precise::exp(mv2 - mn);
+                    float b = precise::exp(s - mn);
+                    o2 = o2 * a + v4 * b; lv2 = lv2 * a + b; mv2 = mn;
+                }
+            }
+            if (mb > 3u) {
+                uint qpos = pos_first + 3u;
+                uint qstart = (p.is_local && qpos + 1u > p.window) ? (qpos + 1u - p.window) : 0u;
+                if (kp >= qstart && kp <= qpos) {
+                    float s = simd_sum(dot(q3, k4)) * p.scale;
+                    uint dist = qpos - kp;
+                    s += dist < p.extent ? rel[(ulong(m0 + 3u) * p.heads + h) * p.extent + dist] : 0.0f;
+                    float mn = max(mv3, s);
+                    float a = mv3 == -INFINITY ? 0.0f : precise::exp(mv3 - mn);
+                    float b = precise::exp(s - mn);
+                    o3 = o3 * a + v4 * b; lv3 = lv3 * a + b; mv3 = mn;
+                }
+            }
+        }
+    } else {
+        uint qs0 = (p.is_local && qp0 + 1u > p.window) ? (qp0 + 1u - p.window) : 0u;
+        uint qs1 = (p.is_local && qp1 + 1u > p.window) ? (qp1 + 1u - p.window) : 0u;
+        uint qs2 = (p.is_local && qp2 + 1u > p.window) ? (qp2 + 1u - p.window) : 0u;
+        uint qs3 = (p.is_local && qp3 + 1u > p.window) ? (qp3 + 1u - p.window) : 0u;
+        uint pcnt = p.pos0 > kv_start ? (p.pos0 - kv_start) : 0u;
+        for (uint t = simd; t < pcnt; t += 4u) {
+            uint kp = kv_start + t;
+            ulong base = (ulong(kp % p.kv_cap) * p.kv_heads + kvh) * 32u + lane;
+            ushort4 ku = kc[base];
+            float4 k4 = float4(bfv(ku.x), bfv(ku.y), bfv(ku.z), bfv(ku.w));
+            ushort4 vu = vc[base];
+            float4 v4 = float4(bfv(vu.x), bfv(vu.y), bfv(vu.z), bfv(vu.w));
+            if (kp >= qs0) {
                 float s = simd_sum(dot(q0, k4)) * p.scale;
-                uint dist = qpos - kp;
+                uint dist = qp0 - kp;
                 s += dist < p.extent ? rel[(ulong(m0) * p.heads + h) * p.extent + dist] : 0.0f;
                 float mn = max(mv0, s);
                 float a = mv0 == -INFINITY ? 0.0f : precise::exp(mv0 - mn);
                 float b = precise::exp(s - mn);
                 o0 = o0 * a + v4 * b; lv0 = lv0 * a + b; mv0 = mn;
             }
-        }
-        if (mb > 1u) {
-            uint qpos = pos_first + 1u;
-            uint qstart = (p.is_local && qpos + 1u > p.window) ? (qpos + 1u - p.window) : 0u;
-            if (kp >= qstart && kp <= qpos) {
+            if (mb > 1u && kp >= qs1) {
                 float s = simd_sum(dot(q1, k4)) * p.scale;
-                uint dist = qpos - kp;
+                uint dist = qp1 - kp;
                 s += dist < p.extent ? rel[(ulong(m0 + 1u) * p.heads + h) * p.extent + dist] : 0.0f;
                 float mn = max(mv1, s);
                 float a = mv1 == -INFINITY ? 0.0f : precise::exp(mv1 - mn);
                 float b = precise::exp(s - mn);
                 o1 = o1 * a + v4 * b; lv1 = lv1 * a + b; mv1 = mn;
             }
-        }
-        if (mb > 2u) {
-            uint qpos = pos_first + 2u;
-            uint qstart = (p.is_local && qpos + 1u > p.window) ? (qpos + 1u - p.window) : 0u;
-            if (kp >= qstart && kp <= qpos) {
+            if (mb > 2u && kp >= qs2) {
                 float s = simd_sum(dot(q2, k4)) * p.scale;
-                uint dist = qpos - kp;
+                uint dist = qp2 - kp;
                 s += dist < p.extent ? rel[(ulong(m0 + 2u) * p.heads + h) * p.extent + dist] : 0.0f;
                 float mn = max(mv2, s);
                 float a = mv2 == -INFINITY ? 0.0f : precise::exp(mv2 - mn);
                 float b = precise::exp(s - mn);
                 o2 = o2 * a + v4 * b; lv2 = lv2 * a + b; mv2 = mn;
             }
-        }
-        if (mb > 3u) {
-            uint qpos = pos_first + 3u;
-            uint qstart = (p.is_local && qpos + 1u > p.window) ? (qpos + 1u - p.window) : 0u;
-            if (kp >= qstart && kp <= qpos) {
+            if (mb > 3u && kp >= qs3) {
                 float s = simd_sum(dot(q3, k4)) * p.scale;
-                uint dist = qpos - kp;
+                uint dist = qp3 - kp;
+                s += dist < p.extent ? rel[(ulong(m0 + 3u) * p.heads + h) * p.extent + dist] : 0.0f;
+                float mn = max(mv3, s);
+                float a = mv3 == -INFINITY ? 0.0f : precise::exp(mv3 - mn);
+                float b = precise::exp(s - mn);
+                o3 = o3 * a + v4 * b; lv3 = lv3 * a + b; mv3 = mn;
+            }
+        }
+        uint mk0 = p.mask[m0];
+        uint mk1 = mb > 1u ? p.mask[m0 + 1u] : 0u;
+        uint mk2 = mb > 2u ? p.mask[m0 + 2u] : 0u;
+        uint mk3 = mb > 3u ? p.mask[m0 + 3u] : 0u;
+        uint d0 = p.dep[m0];
+        uint d1 = mb > 1u ? p.dep[m0 + 1u] : 0u;
+        uint d2 = mb > 2u ? p.dep[m0 + 2u] : 0u;
+        uint d3 = mb > 3u ? p.dep[m0 + 3u] : 0u;
+        for (uint k = 0; k < p.rows; ++k) {
+            uint true_kp = p.pos0 + p.dep[k];
+            if (((true_kp - kv_start) & 3u) != simd) continue;
+            uint bit = 1u << k;
+            if (((mk0 | mk1 | mk2 | mk3) & bit) == 0u) continue;
+            ulong base = (ulong((p.pos0 + k) % p.kv_cap) * p.kv_heads + kvh) * 32u + lane;
+            ushort4 ku = kc[base];
+            float4 k4 = float4(bfv(ku.x), bfv(ku.y), bfv(ku.z), bfv(ku.w));
+            ushort4 vu = vc[base];
+            float4 v4 = float4(bfv(vu.x), bfv(vu.y), bfv(vu.z), bfv(vu.w));
+            uint dk = p.dep[k];
+            if (mk0 & bit) {
+                float s = simd_sum(dot(q0, k4)) * p.scale;
+                uint dist = d0 - dk;
+                s += dist < p.extent ? rel[(ulong(m0) * p.heads + h) * p.extent + dist] : 0.0f;
+                float mn = max(mv0, s);
+                float a = mv0 == -INFINITY ? 0.0f : precise::exp(mv0 - mn);
+                float b = precise::exp(s - mn);
+                o0 = o0 * a + v4 * b; lv0 = lv0 * a + b; mv0 = mn;
+            }
+            if (mk1 & bit) {
+                float s = simd_sum(dot(q1, k4)) * p.scale;
+                uint dist = d1 - dk;
+                s += dist < p.extent ? rel[(ulong(m0 + 1u) * p.heads + h) * p.extent + dist] : 0.0f;
+                float mn = max(mv1, s);
+                float a = mv1 == -INFINITY ? 0.0f : precise::exp(mv1 - mn);
+                float b = precise::exp(s - mn);
+                o1 = o1 * a + v4 * b; lv1 = lv1 * a + b; mv1 = mn;
+            }
+            if (mk2 & bit) {
+                float s = simd_sum(dot(q2, k4)) * p.scale;
+                uint dist = d2 - dk;
+                s += dist < p.extent ? rel[(ulong(m0 + 2u) * p.heads + h) * p.extent + dist] : 0.0f;
+                float mn = max(mv2, s);
+                float a = mv2 == -INFINITY ? 0.0f : precise::exp(mv2 - mn);
+                float b = precise::exp(s - mn);
+                o2 = o2 * a + v4 * b; lv2 = lv2 * a + b; mv2 = mn;
+            }
+            if (mk3 & bit) {
+                float s = simd_sum(dot(q3, k4)) * p.scale;
+                uint dist = d3 - dk;
                 s += dist < p.extent ? rel[(ulong(m0 + 3u) * p.heads + h) * p.extent + dist] : 0.0f;
                 float mn = max(mv3, s);
                 float a = mv3 == -INFINITY ? 0.0f : precise::exp(mv3 - mn);
@@ -842,7 +977,7 @@ kernel void attend_gated_batch(device const float4* q [[buffer(0)]],
         so[simd][lane] = oj;
         threadgroup_barrier(mem_flags::mem_threadgroup);
         if (simd == 0) {
-            uint qpos = pos_first + j;
+            uint qpos = j == 0u ? qp0 : (j == 1u ? qp1 : (j == 2u ? qp2 : qp3));
             uint qstart = (p.is_local && qpos + 1u > p.window) ? (qpos + 1u - p.window) : 0u;
             uint shift = (qstart - kv_start) & 3u;
             float mx = max(max(sm[shift], sm[(shift + 1u) & 3u]), max(sm[(shift + 2u) & 3u], sm[(shift + 3u) & 3u]));
@@ -1528,7 +1663,7 @@ kernel void expert_mxfp8_grouped(device const uchar* w [[buffer(0)]],
     }
 }
 
-struct CombineB { uint n; uint top; uint boundary; uint rows; };
+struct CombineB { uint n; uint top; uint boundary; uint rows; uint is_tree; uint p1[16]; uint p2[16]; uint p3[16]; };
 
 kernel void combine_batch(device const float* rows_buf [[buffer(0)]],
                           device const uint* ids [[buffer(1)]],
@@ -1565,10 +1700,13 @@ kernel void combine_batch(device const float* rows_buf [[buffer(0)]],
             for (uint k = 0; k < p.top; ++k) g += rm[order[k] * p.n + c];
             float cur = rbf(g);
             conv_state[(3u + m) * p.n + c] = cur;
+            float th0 = p.is_tree ? conv_state[p.p3[m] * p.n + c] : h0;
+            float th1 = p.is_tree ? conv_state[p.p2[m] * p.n + c] : h1;
+            float th2 = p.is_tree ? conv_state[p.p1[m] * p.n + c] : h2;
             float acc = 0.0f;
-            acc = fma(h0, w0, acc);
-            acc = fma(h1, w1, acc);
-            acc = fma(h2, w2, acc);
+            acc = fma(th0, w0, acc);
+            acc = fma(th1, w1, acc);
+            acc = fma(th2, w2, acc);
             acc = fma(cur, w3, acc);
             float yv = rbf((acc + cur) * 0.4472135955f);
             float attv = attention[ulong(m) * p.n + c];
