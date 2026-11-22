@@ -219,6 +219,9 @@ public:
         c.local.assign(c.layers, false);
         if (c.top != 8) { error = "only num_experts_per_tok == 8 is supported"; return false; }
         if (c.inter > 2048) { error = "intermediate_size > 2048 is not supported"; return false; }
+        if (c.passes == 0 || c.core_start > c.core_end || c.core_end > c.layers) { error = "invalid loop_config bounds"; return false; }
+        uint64_t total_visits = uint64_t(c.layers) + uint64_t(c.passes - 1) * uint64_t(c.core_end - c.core_start);
+        if (total_visits + 3 > PERSIST_SLOTS) { error = "layer visit count exceeds arena capacity"; return false; }
         for (NSNumber* n in t[@"local_layer_ids"]) {
             long long lid = n.longLongValue;
             if (lid < 0 || static_cast<uint64_t>(lid) >= c.layers) { error = "local_layer_ids contains out-of-range layer index"; return false; }
@@ -1001,7 +1004,7 @@ public:
         uint32_t ntg = (V + 7) / 8;
         head_q4 = [gpu.device newBufferWithLength:uint64_t(V) * ng * 16 options:MTLResourceStorageModePrivate];
         head_sc = [gpu.device newBufferWithLength:uint64_t(V) * ng * 2 options:MTLResourceStorageModePrivate];
-        head_err = [gpu.device newBufferWithLength:uint64_t(V) * 4 options:MTLResourceStorageModePrivate];
+        head_err = [gpu.device newBufferWithLength:uint64_t(V) * 8 options:MTLResourceStorageModePrivate];
         ch_ub = [gpu.device newBufferWithLength:uint64_t(MAX_LOGITS_BATCH) * V * 4 options:MTLResourceStorageModePrivate];
         ch_tg_val = [gpu.device newBufferWithLength:uint64_t(MAX_LOGITS_BATCH) * ntg * 4 options:MTLResourceStorageModePrivate];
         ch_tg_row = [gpu.device newBufferWithLength:uint64_t(MAX_LOGITS_BATCH) * ntg * 4 options:MTLResourceStorageModePrivate];
@@ -1414,7 +1417,7 @@ public:
             together = false;
         } else {
             [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
-            together = true;
+            together = !lean_q4_ready;
             for (int k = 0; k < 3; ++k) {
                 if (lean_q4_ready) gemv_q4_m(w.ctl[k].down4, scratch, s_normed[k], 2 * n, scratch, s_ctlh[k], 64, M);
                 else if (bf12_ready) gemv12_m(w.ctl[k].down12, scratch, s_normed[k], 2 * n, scratch, s_ctlh[k], 64, M);
@@ -1422,7 +1425,7 @@ public:
             }
             together = false;
             [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
-            together = true;
+            together = !lean_q4_ready;
             for (int k = 0; k < 3; ++k) {
                 if (lean_q4_ready) {
                     gemv_q4_m(w.ctl[k].gf4, scratch, s_ctlh[k], 64, scratch, s_gf[k], gfs, M, false);
@@ -2099,6 +2102,7 @@ public:
         uint32_t V = c.vocab;
         uint32_t ng = c.hidden / 32;
         uint32_t ntg = (V + 31) / 32;
+        uint32_t ntg_res = (V + 7) / 8;
         CertTauP ctp{ntg, c.hidden, c.softcap};
         [enc setComputePipelineState:p_ch_xnorm_b];
         [enc setBuffer:arena offset:so(hidden) atIndex:0];
@@ -2149,8 +2153,8 @@ public:
             [enc setBuffer:arena offset:so(hidden) + uint64_t(m) * H * 4 atIndex:1];
             [enc setBuffer:ch_cands offset:uint64_t(m) * V * 4 atIndex:2];
             [enc setBuffer:ch_count offset:uint64_t(m) * 4 atIndex:3];
-            [enc setBuffer:ch_tg_val offset:uint64_t(m) * ntg * 4 atIndex:4];
-            [enc setBuffer:ch_tg_row offset:uint64_t(m) * ntg * 4 atIndex:5];
+            [enc setBuffer:ch_tg_val offset:uint64_t(m) * ntg_res * 4 atIndex:4];
+            [enc setBuffer:ch_tg_row offset:uint64_t(m) * ntg_res * 4 atIndex:5];
             [enc setBytes:&ctp length:sizeof(ctp) atIndex:6];
             [enc dispatchThreadgroupsWithIndirectBuffer:ch_indirect indirectBufferOffset:uint64_t(m) * 16 threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
         }
@@ -2159,8 +2163,8 @@ public:
         together = true;
         [enc setComputePipelineState:p_ch_argmax];
         for (uint32_t m = 0; m < M; ++m) {
-            [enc setBuffer:ch_tg_val offset:uint64_t(m) * ntg * 4 atIndex:0];
-            [enc setBuffer:ch_tg_row offset:uint64_t(m) * ntg * 4 atIndex:1];
+            [enc setBuffer:ch_tg_val offset:uint64_t(m) * ntg_res * 4 atIndex:0];
+            [enc setBuffer:ch_tg_row offset:uint64_t(m) * ntg_res * 4 atIndex:1];
             [enc setBuffer:ch_indirect offset:uint64_t(m) * 16 atIndex:2];
             [enc setBuffer:token offset:uint64_t(128 + m) * 4 atIndex:3];
             grid(1, 256);

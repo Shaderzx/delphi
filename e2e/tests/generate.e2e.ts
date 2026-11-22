@@ -123,7 +123,7 @@ test('delphi bench refuses missing model or invalid repeat counts', { timeout: 3
   });
 });
 
-test('delphi generate opt-in --mode lean and --mode turbo report mode, stay spec-exact, and preserve Paris and 4.6K lean needle', { tags: ['model'], timeout: 900_000 }, () => {
+test('delphi generate opt-in --mode lean and --mode turbo report mode, stay spec-exact, and preserve Paris answer', { tags: ['model'], timeout: 900_000 }, () => {
   const deadline = Date.now() + 900_000;
   withBuiltDelphi(deadline, (bin) => {
     for (const m of ['lean', 'turbo']) {
@@ -137,6 +137,12 @@ test('delphi generate opt-in --mode lean and --mode turbo report mode, stay spec
       expect(out.output_ids[0]).toBe(paris.output_ids[0]);
       expect(out.output_ids).toEqual((JSON.parse(offRun.stdout) as Generated).output_ids);
     }
+  });
+});
+
+test('delphi generate --mode lean retrieves a needle past 4096 tokens', { tags: ['model'], timeout: 900_000 }, () => {
+  const deadline = Date.now() + 900_000;
+  withBuiltDelphi(deadline, (bin) => {
     const code = [19, 22, 17, 24, 16];
     const needle = [371, 153536, 150406, 149884, 220, ...code, 13, 198];
     const filler = [...truth.cases[2].input_ids, 198];

@@ -290,43 +290,43 @@ kernel void mtp_gemv_q4_rows(device const uint4* q4 [[buffer(0)]],
         uint4 pk = qr[g];
         float s = float(sr[g]);
         uint g8 = g * 8u;
-        half d0 = 0, d1 = 0, d2 = 0, d3 = 0, d4 = 0, d5 = 0, d6 = 0, d7 = 0;
+        float d0 = 0, d1 = 0, d2 = 0, d3 = 0, d4 = 0, d5 = 0, d6 = 0, d7 = 0;
         uint ws[4] = {pk.x, pk.y, pk.z, pk.w};
         for (uint t = 0; t < 4u; ++t) {
             uint ww = ws[t];
             uint k0 = g8 + t * 2u;
             {
                 half4 w = u4_lo_h_fast(ww);
-                if (ROWS > 0u) d0 += dot(w, x4[0ul*xs4 + k0]);
-                if (ROWS > 1u) d1 += dot(w, x4[1ul*xs4 + k0]);
-                if (ROWS > 2u) d2 += dot(w, x4[2ul*xs4 + k0]);
-                if (ROWS > 3u) d3 += dot(w, x4[3ul*xs4 + k0]);
-                if (ROWS > 4u) d4 += dot(w, x4[4ul*xs4 + k0]);
-                if (ROWS > 5u) d5 += dot(w, x4[5ul*xs4 + k0]);
-                if (ROWS > 6u) d6 += dot(w, x4[6ul*xs4 + k0]);
-                if (ROWS > 7u) d7 += dot(w, x4[7ul*xs4 + k0]);
+                if (ROWS > 0u) d0 += float(dot(w, x4[0ul*xs4 + k0]));
+                if (ROWS > 1u) d1 += float(dot(w, x4[1ul*xs4 + k0]));
+                if (ROWS > 2u) d2 += float(dot(w, x4[2ul*xs4 + k0]));
+                if (ROWS > 3u) d3 += float(dot(w, x4[3ul*xs4 + k0]));
+                if (ROWS > 4u) d4 += float(dot(w, x4[4ul*xs4 + k0]));
+                if (ROWS > 5u) d5 += float(dot(w, x4[5ul*xs4 + k0]));
+                if (ROWS > 6u) d6 += float(dot(w, x4[6ul*xs4 + k0]));
+                if (ROWS > 7u) d7 += float(dot(w, x4[7ul*xs4 + k0]));
             }
             {
                 half4 w = u4_hi_h_fast(ww);
                 uint k1 = k0 + 1u;
-                if (ROWS > 0u) d0 += dot(w, x4[0ul*xs4 + k1]);
-                if (ROWS > 1u) d1 += dot(w, x4[1ul*xs4 + k1]);
-                if (ROWS > 2u) d2 += dot(w, x4[2ul*xs4 + k1]);
-                if (ROWS > 3u) d3 += dot(w, x4[3ul*xs4 + k1]);
-                if (ROWS > 4u) d4 += dot(w, x4[4ul*xs4 + k1]);
-                if (ROWS > 5u) d5 += dot(w, x4[5ul*xs4 + k1]);
-                if (ROWS > 6u) d6 += dot(w, x4[6ul*xs4 + k1]);
-                if (ROWS > 7u) d7 += dot(w, x4[7ul*xs4 + k1]);
+                if (ROWS > 0u) d0 += float(dot(w, x4[0ul*xs4 + k1]));
+                if (ROWS > 1u) d1 += float(dot(w, x4[1ul*xs4 + k1]));
+                if (ROWS > 2u) d2 += float(dot(w, x4[2ul*xs4 + k1]));
+                if (ROWS > 3u) d3 += float(dot(w, x4[3ul*xs4 + k1]));
+                if (ROWS > 4u) d4 += float(dot(w, x4[4ul*xs4 + k1]));
+                if (ROWS > 5u) d5 += float(dot(w, x4[5ul*xs4 + k1]));
+                if (ROWS > 6u) d6 += float(dot(w, x4[6ul*xs4 + k1]));
+                if (ROWS > 7u) d7 += float(dot(w, x4[7ul*xs4 + k1]));
             }
         }
-        if (ROWS > 0u) a0 += float(d0) * s;
-        if (ROWS > 1u) a1 += float(d1) * s;
-        if (ROWS > 2u) a2 += float(d2) * s;
-        if (ROWS > 3u) a3 += float(d3) * s;
-        if (ROWS > 4u) a4 += float(d4) * s;
-        if (ROWS > 5u) a5 += float(d5) * s;
-        if (ROWS > 6u) a6 += float(d6) * s;
-        if (ROWS > 7u) a7 += float(d7) * s;
+        if (ROWS > 0u) a0 += d0 * s;
+        if (ROWS > 1u) a1 += d1 * s;
+        if (ROWS > 2u) a2 += d2 * s;
+        if (ROWS > 3u) a3 += d3 * s;
+        if (ROWS > 4u) a4 += d4 * s;
+        if (ROWS > 5u) a5 += d5 * s;
+        if (ROWS > 6u) a6 += d6 * s;
+        if (ROWS > 7u) a7 += d7 * s;
     }
     float bv = p.has_bias ? bfv(bias[row]) : 0.0f;
     if (ROWS > 0u) { float t = simd8_sum(a0) + bv; if (sl == 0u) y[0ul * p.y_stride + row] = p.round_out ? rbf(t) : t; }
@@ -619,24 +619,24 @@ kernel void mtp_base_logits_7(device const uint4* q4 [[buffer(0)]],
         uint4 pk = qr[g];
         float s = float(sr[g]);
         uint g8 = g * 8u;
-        half d0 = 0, d1 = 0, d2 = 0, d3 = 0, d4 = 0, d5 = 0, d6 = 0;
+        float d0 = 0, d1 = 0, d2 = 0, d3 = 0, d4 = 0, d5 = 0, d6 = 0;
         uint ws[4] = {pk.x, pk.y, pk.z, pk.w};
         for (uint t = 0; t < 4u; ++t) {
             uint ww = ws[t];
             uint k0 = g8 + t * 2u;
             {
                 half4 w = u4_lo_h_fast(ww);
-                d0 += dot(w, x4[1ul*p.xs4 + k0]); d1 += dot(w, x4[2ul*p.xs4 + k0]); d2 += dot(w, x4[3ul*p.xs4 + k0]); d3 += dot(w, x4[4ul*p.xs4 + k0]);
-                d4 += dot(w, x4[5ul*p.xs4 + k0]); d5 += dot(w, x4[6ul*p.xs4 + k0]); d6 += dot(w, x4[7ul*p.xs4 + k0]);
+                d0 += float(dot(w, x4[1ul*p.xs4 + k0])); d1 += float(dot(w, x4[2ul*p.xs4 + k0])); d2 += float(dot(w, x4[3ul*p.xs4 + k0])); d3 += float(dot(w, x4[4ul*p.xs4 + k0]));
+                d4 += float(dot(w, x4[5ul*p.xs4 + k0])); d5 += float(dot(w, x4[6ul*p.xs4 + k0])); d6 += float(dot(w, x4[7ul*p.xs4 + k0]));
             }
             {
                 half4 w = u4_hi_h_fast(ww);
                 uint k1 = k0 + 1u;
-                d0 += dot(w, x4[1ul*p.xs4 + k1]); d1 += dot(w, x4[2ul*p.xs4 + k1]); d2 += dot(w, x4[3ul*p.xs4 + k1]); d3 += dot(w, x4[4ul*p.xs4 + k1]);
-                d4 += dot(w, x4[5ul*p.xs4 + k1]); d5 += dot(w, x4[6ul*p.xs4 + k1]); d6 += dot(w, x4[7ul*p.xs4 + k1]);
+                d0 += float(dot(w, x4[1ul*p.xs4 + k1])); d1 += float(dot(w, x4[2ul*p.xs4 + k1])); d2 += float(dot(w, x4[3ul*p.xs4 + k1])); d3 += float(dot(w, x4[4ul*p.xs4 + k1]));
+                d4 += float(dot(w, x4[5ul*p.xs4 + k1])); d5 += float(dot(w, x4[6ul*p.xs4 + k1])); d6 += float(dot(w, x4[7ul*p.xs4 + k1]));
             }
         }
-        a0 += float(d0) * s; a1 += float(d1) * s; a2 += float(d2) * s; a3 += float(d3) * s; a4 += float(d4) * s; a5 += float(d5) * s; a6 += float(d6) * s;
+        a0 += d0 * s; a1 += d1 * s; a2 += d2 * s; a3 += d3 * s; a4 += d4 * s; a5 += d5 * s; a6 += d6 * s;
     }
     float t0 = simd8_sum(a0), t1 = simd8_sum(a1), t2 = simd8_sum(a2), t3 = simd8_sum(a3), t4 = simd8_sum(a4), t5 = simd8_sum(a5), t6 = simd8_sum(a6);
     if (sl == 0u) {
@@ -852,25 +852,31 @@ kernel void mtp_markov_reduce(device const float* tg_val [[buffer(0)]],
         if (lr1 == br && lv1 == bv) { lv1 = lv2; lr1 = lr2; lv2 = lv3; lr2 = lr3; lv3 = -INFINITY; lr3 = 0xffffffffu; }
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
+    threadgroup float tg_g1;
     float g1 = -INFINITY, g2 = -INFINITY, g3 = -INFINITY;
     uint r1 = 0xffffffffu, r2 = 0xffffffffu, r3 = 0xffffffffu;
-    for (uint s = 0; s < 16u; ++s) {
-        for (uint k = 0; k < 3u; ++k) {
-            float v = mv[s][k];
-            uint r = mr[s][k];
-            if (v > g1 || (v == g1 && r < r1)) {
-                g3 = g2; r3 = r2; g2 = g1; r2 = r1; g1 = v; r1 = r;
-            } else if (v > g2 || (v == g2 && r < r2)) {
-                g3 = g2; r3 = r2; g2 = v; r2 = r;
-            } else if (v > g3 || (v == g3 && r < r3)) {
-                g3 = v; r3 = r;
+    if (tid == 0u) {
+        for (uint s = 0; s < 16u; ++s) {
+            for (uint k = 0; k < 3u; ++k) {
+                float v = mv[s][k];
+                uint r = mr[s][k];
+                if (v > g1 || (v == g1 && r < r1)) {
+                    g3 = g2; r3 = r2; g2 = g1; r2 = r1; g1 = v; r1 = r;
+                } else if (v > g2 || (v == g2 && r < r2)) {
+                    g3 = g2; r3 = r2; g2 = v; r2 = r;
+                } else if (v > g3 || (v == g3 && r < r3)) {
+                    g3 = v; r3 = r;
+                }
             }
         }
+        tg_g1 = g1;
     }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float max_g1 = tg_g1;
     float ls = 0.0f;
     for (uint i = tid; i < p.ntg; i += 512u) {
         float v = tv[i * 3u];
-        if (v != -INFINITY) ls += ts[i] * precise::exp((v - g1) * p.inv_temp);
+        if (v != -INFINITY) ls += ts[i] * precise::exp((v - max_g1) * p.inv_temp);
     }
     ls = simd_sum(ls);
     if (lane == 0u) ms[simd] = ls;

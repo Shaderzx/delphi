@@ -24,6 +24,7 @@ std::optional<Gpu> open_gpu(std::string& error) {
         if (!library) {
             options = [MTLCompileOptions new];
             options.mathMode = MTLMathModeSafe;
+            options.languageVersion = MTLLanguageVersion3_2;
             compile_error = nil;
         }
     }

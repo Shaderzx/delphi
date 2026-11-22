@@ -77,10 +77,10 @@ Waves 1-8 are medians of 6 warm runs (64 decode steps, context `5-224` tokens; 5
 
 | Stage | Shipped variant | Bytes / step (`M=1`) | Ceiling (`M=1`, 266 GB/s) | Measured `M=1` GPU tok/s (% ceiling) | Measured spec GPU tok/s (`story` / `fib` / `copy_code` / `p160`) | Prefill 512 |
 |---|---|---:|---:|---:|---:|---:|
-| Wave 0 | Shipped BF16 + FP32 KV | 5.51 GB | 48.3 | 32.1 (66.5%) | 32.1 / 32.1 / 32.1 / 32.1 | 32.1 |
-| Wave 1 | Fused kernels + BF16 KV | 5.51 GB | 48.3 | 38.5 (79.8%) | 38.5 / 38.5 / 38.5 / - | 38.5 |
-| Wave 2 | + Certified INT4-g32 exact head | 4.85 GB | 54.9 | 42.3 (77.1%) | 42.3 / 42.1 / 42.1 / - | 43.0 |
-| Wave 3 | + 12-bit exact lossless BF16 pack | 4.17 GB | 63.8 | 46.1 (72.2%) | 46.0 / 46.1 / 45.4 / - | 46.9 |
+| Wave 0 | Shipped BF16 + FP32 KV | 5.51 GB | 48.3 | 32.1 (66.5%) | 32.1 / 32.1 / 32.1 / 32.1 | - |
+| Wave 1 | Fused kernels + BF16 KV | 5.51 GB | 48.3 | 38.5 (79.8%) | 38.5 / 38.5 / 38.5 / - | - |
+| Wave 2 | + Certified INT4-g32 exact head | 4.85 GB | 54.9 | 42.3 (77.1%) | 42.3 / 42.1 / 42.1 / - | - |
+| Wave 3 | + 12-bit exact lossless BF16 pack | 4.17 GB | 63.8 | 46.1 (72.2%) | 46.0 / 46.1 / 45.4 / - | - |
 | Wave 4B/4C | + Bundled 49K INT4-g32 MTP + lookup + 32K ring-KV | 4.17 GB | 63.8 | 46.1 (72.2%) | 49.7 / 74.0 / 90.1 / 106.5 (exact) | 109.1 |
 | Wave 6 | + Metal 4 `matmul2d` prefill + tail-free 16/8/4-lane kernels + 8-lane cert head | 4.17 GB | 63.8 | **47.2 (74.0%)** | 52.1 / 82.2 / 117.5 / 148.3 (exact) | **462.0** |
 | Wave 7 | + 8-lane MTP drafter (~0.70 ms) + 3-beam exact tree verify + `M=64` Metal 4 lookup | 4.17 GB | 63.8 | 47.1 (73.8%) | **57.2 / 85.3 / 132.7 / 345.2** (exact) | **462.0** |

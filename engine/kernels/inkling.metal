@@ -1111,7 +1111,7 @@ inline half4 u4_hi_h_fast(uint w) {
 kernel void build_cert_head(device const uint4* w [[buffer(0)]],
                             device uint4* q4 [[buffer(1)]],
                             device half* sc [[buffer(2)]],
-                            device float* err [[buffer(3)]],
+                            device float2* err [[buffer(3)]],
                             constant CertHead& p [[buffer(4)]],
                             uint group [[threadgroup_position_in_grid]],
                             uint simd [[simdgroup_index_in_threadgroup]],
@@ -1161,7 +1161,7 @@ kernel void build_cert_head(device const uint4* w [[buffer(0)]],
     }
     float total = simd_sum(err2);
     float total_w2 = simd_sum(w2);
-    if (lane == 0) err[row] = precise::sqrt(total) * 1.002f + precise::sqrt(total_w2) * 0.0025f + 1e-4f;
+    if (lane == 0) err[row] = float2(precise::sqrt(total) * 1.002f, precise::sqrt(total_w2) * 1.002f);
 }
 
 kernel void cert_head_xnorm(device const float4* x [[buffer(0)]],
@@ -1189,7 +1189,7 @@ kernel void cert_head_xnorm(device const float4* x [[buffer(0)]],
 
 kernel void cert_head_scan(device const uint4* q4 [[buffer(0)]],
                            device const half* sc [[buffer(1)]],
-                           device const float* err [[buffer(2)]],
+                           device const float2* err [[buffer(2)]],
                            device const float4* x4 [[buffer(3)]],
                            device const float* state [[buffer(4)]],
                            device float* ub_out [[buffer(5)]],
@@ -1219,7 +1219,7 @@ kernel void cert_head_scan(device const uint4* q4 [[buffer(0)]],
         }
         float shat = simd_sum(acc);
         if (lane == 0) {
-            ub_out[row] = shat + state[2] * err[row];
+            ub_out[row] = shat + state[2] * err[row].x + 1e-4f;
             svals[simd] = shat;
             srows[simd] = row;
         }

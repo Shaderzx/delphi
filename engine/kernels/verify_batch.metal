@@ -930,7 +930,7 @@ kernel void attend_gated_batch(device const float4* q [[buffer(0)]],
             ushort4 vu = vc[base];
             float4 v4 = float4(bfv(vu.x), bfv(vu.y), bfv(vu.z), bfv(vu.w));
             uint dk = p.dep[k];
-            if (mk0 & bit) {
+            if ((mk0 & bit) != 0u && (!p.is_local || true_kp >= qs0)) {
                 float s = simd_sum(dot(q0, k4)) * p.scale;
                 uint dist = d0 - dk;
                 s += dist < p.extent ? rel[(ulong(m0) * p.heads + h) * p.extent + dist] : 0.0f;
@@ -939,7 +939,7 @@ kernel void attend_gated_batch(device const float4* q [[buffer(0)]],
                 float b = precise::exp(s - mn);
                 o0 = o0 * a + v4 * b; lv0 = lv0 * a + b; mv0 = mn;
             }
-            if (mk1 & bit) {
+            if ((mk1 & bit) != 0u && (!p.is_local || true_kp >= qs1)) {
                 float s = simd_sum(dot(q1, k4)) * p.scale;
                 uint dist = d1 - dk;
                 s += dist < p.extent ? rel[(ulong(m0 + 1u) * p.heads + h) * p.extent + dist] : 0.0f;
@@ -948,7 +948,7 @@ kernel void attend_gated_batch(device const float4* q [[buffer(0)]],
                 float b = precise::exp(s - mn);
                 o1 = o1 * a + v4 * b; lv1 = lv1 * a + b; mv1 = mn;
             }
-            if (mk2 & bit) {
+            if ((mk2 & bit) != 0u && (!p.is_local || true_kp >= qs2)) {
                 float s = simd_sum(dot(q2, k4)) * p.scale;
                 uint dist = d2 - dk;
                 s += dist < p.extent ? rel[(ulong(m0 + 2u) * p.heads + h) * p.extent + dist] : 0.0f;
@@ -957,7 +957,7 @@ kernel void attend_gated_batch(device const float4* q [[buffer(0)]],
                 float b = precise::exp(s - mn);
                 o2 = o2 * a + v4 * b; lv2 = lv2 * a + b; mv2 = mn;
             }
-            if (mk3 & bit) {
+            if ((mk3 & bit) != 0u && (!p.is_local || true_kp >= qs3)) {
                 float s = simd_sum(dot(q3, k4)) * p.scale;
                 uint dist = d3 - dk;
                 s += dist < p.extent ? rel[(ulong(m0 + 3u) * p.heads + h) * p.extent + dist] : 0.0f;
@@ -1729,22 +1729,30 @@ kernel void cert_head_xnorm_batch(device const float4* x [[buffer(0)]],
                                   uint lane [[thread_index_in_simdgroup]],
                                   uint simd [[simdgroup_index_in_threadgroup]]) {
     threadgroup float part[20];
+    threadgroup float part_dx[20];
     uint n4 = n / 4u;
     device const float4* xm = x + ulong(m) * n4;
     device half4* xhm = xh + ulong(m) * n4;
     float s = 0.0f;
+    float sd = 0.0f;
     for (uint i = tid; i < n4; i += threads) {
         float4 v = xm[i];
-        xhm[i] = half4(v);
+        half4 vh = select(half4(v), half4(0.0h), fabs(v) > 65000.0f);
+        xhm[i] = vh;
+        float4 dv = v - float4(vh);
         s += dot(v, v);
+        sd += dot(dv, dv);
     }
     s = simd_sum(s);
-    if (lane == 0) part[simd] = s;
+    sd = simd_sum(sd);
+    if (lane == 0) { part[simd] = s; part_dx[simd] = sd; }
     threadgroup_barrier(mem_flags::mem_threadgroup);
     if (tid == 0) {
         float tot = 0.0f;
-        for (uint i = 0; i < (threads + 31u) / 32u; ++i) tot += part[i];
+        float tot_dx = 0.0f;
+        for (uint i = 0; i < (threads + 31u) / 32u; ++i) { tot += part[i]; tot_dx += part_dx[i]; }
         state[m * 4u + 2u] = precise::sqrt(tot);
+        state[m * 4u + 3u] = precise::sqrt(tot_dx);
         count[m] = 0u;
     }
 }
@@ -1753,7 +1761,7 @@ struct CertHeadB { uint vocab; uint cols; uint ng; uint ntg; uint m_base; float 
 
 kernel void cert_head_scan_rows(device const uint4* q4 [[buffer(0)]],
                                 device const half* sc [[buffer(1)]],
-                                device const float* err [[buffer(2)]],
+                                device const float2* err [[buffer(2)]],
                                 device const half4* x4 [[buffer(3)]],
                                 device const float* state [[buffer(4)]],
                                 device float* ub_out [[buffer(5)]],
@@ -1779,53 +1787,53 @@ kernel void cert_head_scan_rows(device const uint4* q4 [[buffer(0)]],
             uint4 pk = qr[g];
             float s = float(sr[g]);
             uint g8 = g * 8u;
-            half d0 = 0, d1 = 0, d2 = 0, d3 = 0, d4 = 0, d5 = 0, d6 = 0, d7 = 0;
+            float d0 = 0, d1 = 0, d2 = 0, d3 = 0, d4 = 0, d5 = 0, d6 = 0, d7 = 0;
             uint ws[4] = {pk.x, pk.y, pk.z, pk.w};
             for (uint t = 0; t < 4u; ++t) {
                 uint ww = ws[t];
                 uint k0 = g8 + t * 2u;
                 {
                     half4 w = u4_lo_h_fast(ww);
-                    if (ROWS > 0u) d0 += dot(w, x4[ulong(p.m_base + 0u) * xs4 + k0]);
-                    if (ROWS > 1u) d1 += dot(w, x4[ulong(p.m_base + 1u) * xs4 + k0]);
-                    if (ROWS > 2u) d2 += dot(w, x4[ulong(p.m_base + 2u) * xs4 + k0]);
-                    if (ROWS > 3u) d3 += dot(w, x4[ulong(p.m_base + 3u) * xs4 + k0]);
-                    if (ROWS > 4u) d4 += dot(w, x4[ulong(p.m_base + 4u) * xs4 + k0]);
-                    if (ROWS > 5u) d5 += dot(w, x4[ulong(p.m_base + 5u) * xs4 + k0]);
-                    if (ROWS > 6u) d6 += dot(w, x4[ulong(p.m_base + 6u) * xs4 + k0]);
-                    if (ROWS > 7u) d7 += dot(w, x4[ulong(p.m_base + 7u) * xs4 + k0]);
+                    if (ROWS > 0u) d0 += float(dot(w, x4[ulong(p.m_base + 0u) * xs4 + k0]));
+                    if (ROWS > 1u) d1 += float(dot(w, x4[ulong(p.m_base + 1u) * xs4 + k0]));
+                    if (ROWS > 2u) d2 += float(dot(w, x4[ulong(p.m_base + 2u) * xs4 + k0]));
+                    if (ROWS > 3u) d3 += float(dot(w, x4[ulong(p.m_base + 3u) * xs4 + k0]));
+                    if (ROWS > 4u) d4 += float(dot(w, x4[ulong(p.m_base + 4u) * xs4 + k0]));
+                    if (ROWS > 5u) d5 += float(dot(w, x4[ulong(p.m_base + 5u) * xs4 + k0]));
+                    if (ROWS > 6u) d6 += float(dot(w, x4[ulong(p.m_base + 6u) * xs4 + k0]));
+                    if (ROWS > 7u) d7 += float(dot(w, x4[ulong(p.m_base + 7u) * xs4 + k0]));
                 }
                 {
                     half4 w = u4_hi_h_fast(ww);
                     uint k1 = k0 + 1u;
-                    if (ROWS > 0u) d0 += dot(w, x4[ulong(p.m_base + 0u) * xs4 + k1]);
-                    if (ROWS > 1u) d1 += dot(w, x4[ulong(p.m_base + 1u) * xs4 + k1]);
-                    if (ROWS > 2u) d2 += dot(w, x4[ulong(p.m_base + 2u) * xs4 + k1]);
-                    if (ROWS > 3u) d3 += dot(w, x4[ulong(p.m_base + 3u) * xs4 + k1]);
-                    if (ROWS > 4u) d4 += dot(w, x4[ulong(p.m_base + 4u) * xs4 + k1]);
-                    if (ROWS > 5u) d5 += dot(w, x4[ulong(p.m_base + 5u) * xs4 + k1]);
-                    if (ROWS > 6u) d6 += dot(w, x4[ulong(p.m_base + 6u) * xs4 + k1]);
-                    if (ROWS > 7u) d7 += dot(w, x4[ulong(p.m_base + 7u) * xs4 + k1]);
+                    if (ROWS > 0u) d0 += float(dot(w, x4[ulong(p.m_base + 0u) * xs4 + k1]));
+                    if (ROWS > 1u) d1 += float(dot(w, x4[ulong(p.m_base + 1u) * xs4 + k1]));
+                    if (ROWS > 2u) d2 += float(dot(w, x4[ulong(p.m_base + 2u) * xs4 + k1]));
+                    if (ROWS > 3u) d3 += float(dot(w, x4[ulong(p.m_base + 3u) * xs4 + k1]));
+                    if (ROWS > 4u) d4 += float(dot(w, x4[ulong(p.m_base + 4u) * xs4 + k1]));
+                    if (ROWS > 5u) d5 += float(dot(w, x4[ulong(p.m_base + 5u) * xs4 + k1]));
+                    if (ROWS > 6u) d6 += float(dot(w, x4[ulong(p.m_base + 6u) * xs4 + k1]));
+                    if (ROWS > 7u) d7 += float(dot(w, x4[ulong(p.m_base + 7u) * xs4 + k1]));
                 }
             }
-            if (ROWS > 0u) a0 += float(d0) * s;
-            if (ROWS > 1u) a1 += float(d1) * s;
-            if (ROWS > 2u) a2 += float(d2) * s;
-            if (ROWS > 3u) a3 += float(d3) * s;
-            if (ROWS > 4u) a4 += float(d4) * s;
-            if (ROWS > 5u) a5 += float(d5) * s;
-            if (ROWS > 6u) a6 += float(d6) * s;
-            if (ROWS > 7u) a7 += float(d7) * s;
+            if (ROWS > 0u) a0 += d0 * s;
+            if (ROWS > 1u) a1 += d1 * s;
+            if (ROWS > 2u) a2 += d2 * s;
+            if (ROWS > 3u) a3 += d3 * s;
+            if (ROWS > 4u) a4 += d4 * s;
+            if (ROWS > 5u) a5 += d5 * s;
+            if (ROWS > 6u) a6 += d6 * s;
+            if (ROWS > 7u) a7 += d7 * s;
         }
     }
-    float er = row < p.vocab ? err[row] : 0.0f;
+    float2 er = row < p.vocab ? err[row] : float2(0.0f);
     for (uint m = 0; m < ROWS; ++m) {
         uint gm = p.m_base + m;
         float av = m == 0u ? a0 : (m == 1u ? a1 : (m == 2u ? a2 : (m == 3u ? a3 : (m == 4u ? a4 : (m == 5u ? a5 : (m == 6u ? a6 : a7))))));
         float shat = simd8_sum(av);
         if (sl == 0u) {
             if (row < p.vocab) {
-                ub_out[ulong(gm) * p.vocab + row] = shat + state[gm * 4u + 2u] * er;
+                ub_out[ulong(gm) * p.vocab + row] = shat + state[gm * 4u + 2u] * er.x + state[gm * 4u + 3u] * er.y + 1e-4f;
                 svals[slot] = shat;
                 srows[slot] = row;
             } else {
