@@ -1793,27 +1793,27 @@ kernel void cert_head_scan_rows(device const uint4* q4 [[buffer(0)]],
                 uint ww = ws[t];
                 uint k0 = g8 + t * 2u;
                 {
-                    half4 w = u4_lo_h_fast(ww);
-                    if (ROWS > 0u) d0 += float(dot(w, x4[ulong(p.m_base + 0u) * xs4 + k0]));
-                    if (ROWS > 1u) d1 += float(dot(w, x4[ulong(p.m_base + 1u) * xs4 + k0]));
-                    if (ROWS > 2u) d2 += float(dot(w, x4[ulong(p.m_base + 2u) * xs4 + k0]));
-                    if (ROWS > 3u) d3 += float(dot(w, x4[ulong(p.m_base + 3u) * xs4 + k0]));
-                    if (ROWS > 4u) d4 += float(dot(w, x4[ulong(p.m_base + 4u) * xs4 + k0]));
-                    if (ROWS > 5u) d5 += float(dot(w, x4[ulong(p.m_base + 5u) * xs4 + k0]));
-                    if (ROWS > 6u) d6 += float(dot(w, x4[ulong(p.m_base + 6u) * xs4 + k0]));
-                    if (ROWS > 7u) d7 += float(dot(w, x4[ulong(p.m_base + 7u) * xs4 + k0]));
+                    float4 w = float4(u4_lo_h_fast(ww));
+                    if (ROWS > 0u) d0 += dot(w, float4(x4[ulong(p.m_base + 0u) * xs4 + k0]));
+                    if (ROWS > 1u) d1 += dot(w, float4(x4[ulong(p.m_base + 1u) * xs4 + k0]));
+                    if (ROWS > 2u) d2 += dot(w, float4(x4[ulong(p.m_base + 2u) * xs4 + k0]));
+                    if (ROWS > 3u) d3 += dot(w, float4(x4[ulong(p.m_base + 3u) * xs4 + k0]));
+                    if (ROWS > 4u) d4 += dot(w, float4(x4[ulong(p.m_base + 4u) * xs4 + k0]));
+                    if (ROWS > 5u) d5 += dot(w, float4(x4[ulong(p.m_base + 5u) * xs4 + k0]));
+                    if (ROWS > 6u) d6 += dot(w, float4(x4[ulong(p.m_base + 6u) * xs4 + k0]));
+                    if (ROWS > 7u) d7 += dot(w, float4(x4[ulong(p.m_base + 7u) * xs4 + k0]));
                 }
                 {
-                    half4 w = u4_hi_h_fast(ww);
+                    float4 w = float4(u4_hi_h_fast(ww));
                     uint k1 = k0 + 1u;
-                    if (ROWS > 0u) d0 += float(dot(w, x4[ulong(p.m_base + 0u) * xs4 + k1]));
-                    if (ROWS > 1u) d1 += float(dot(w, x4[ulong(p.m_base + 1u) * xs4 + k1]));
-                    if (ROWS > 2u) d2 += float(dot(w, x4[ulong(p.m_base + 2u) * xs4 + k1]));
-                    if (ROWS > 3u) d3 += float(dot(w, x4[ulong(p.m_base + 3u) * xs4 + k1]));
-                    if (ROWS > 4u) d4 += float(dot(w, x4[ulong(p.m_base + 4u) * xs4 + k1]));
-                    if (ROWS > 5u) d5 += float(dot(w, x4[ulong(p.m_base + 5u) * xs4 + k1]));
-                    if (ROWS > 6u) d6 += float(dot(w, x4[ulong(p.m_base + 6u) * xs4 + k1]));
-                    if (ROWS > 7u) d7 += float(dot(w, x4[ulong(p.m_base + 7u) * xs4 + k1]));
+                    if (ROWS > 0u) d0 += dot(w, float4(x4[ulong(p.m_base + 0u) * xs4 + k1]));
+                    if (ROWS > 1u) d1 += dot(w, float4(x4[ulong(p.m_base + 1u) * xs4 + k1]));
+                    if (ROWS > 2u) d2 += dot(w, float4(x4[ulong(p.m_base + 2u) * xs4 + k1]));
+                    if (ROWS > 3u) d3 += dot(w, float4(x4[ulong(p.m_base + 3u) * xs4 + k1]));
+                    if (ROWS > 4u) d4 += dot(w, float4(x4[ulong(p.m_base + 4u) * xs4 + k1]));
+                    if (ROWS > 5u) d5 += dot(w, float4(x4[ulong(p.m_base + 5u) * xs4 + k1]));
+                    if (ROWS > 6u) d6 += dot(w, float4(x4[ulong(p.m_base + 6u) * xs4 + k1]));
+                    if (ROWS > 7u) d7 += dot(w, float4(x4[ulong(p.m_base + 7u) * xs4 + k1]));
                 }
             }
             if (ROWS > 0u) a0 += d0 * s;

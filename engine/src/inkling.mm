@@ -216,12 +216,12 @@ public:
              u(loop, @"core_start"), u(loop, @"core_end"), u(loop, @"num_passes"), u(t, @"log_scaling_n_floor"),
              f(t, @"qk_l2_clip_threshold"), f(t, @"rel_l2_clip_threshold"), f(t, @"log_scaling_alpha"), f(t, @"mlp_gate_softcap"),
              f(t, @"mlp_up_softcap"), f(t, @"route_scale"), f(t, @"final_logit_softcapping"), {}};
-        c.local.assign(c.layers, false);
         if (c.top != 8) { error = "only num_experts_per_tok == 8 is supported"; return false; }
         if (c.inter > 2048) { error = "intermediate_size > 2048 is not supported"; return false; }
         if (c.passes == 0 || c.core_start > c.core_end || c.core_end > c.layers) { error = "invalid loop_config bounds"; return false; }
         uint64_t total_visits = uint64_t(c.layers) + uint64_t(c.passes - 1) * uint64_t(c.core_end - c.core_start);
         if (total_visits + 3 > PERSIST_SLOTS) { error = "layer visit count exceeds arena capacity"; return false; }
+        c.local.assign(c.layers, false);
         for (NSNumber* n in t[@"local_layer_ids"]) {
             long long lid = n.longLongValue;
             if (lid < 0 || static_cast<uint64_t>(lid) >= c.layers) { error = "local_layer_ids contains out-of-range layer index"; return false; }

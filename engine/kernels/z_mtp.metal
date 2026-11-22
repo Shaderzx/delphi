@@ -296,27 +296,27 @@ kernel void mtp_gemv_q4_rows(device const uint4* q4 [[buffer(0)]],
             uint ww = ws[t];
             uint k0 = g8 + t * 2u;
             {
-                half4 w = u4_lo_h_fast(ww);
-                if (ROWS > 0u) d0 += float(dot(w, x4[0ul*xs4 + k0]));
-                if (ROWS > 1u) d1 += float(dot(w, x4[1ul*xs4 + k0]));
-                if (ROWS > 2u) d2 += float(dot(w, x4[2ul*xs4 + k0]));
-                if (ROWS > 3u) d3 += float(dot(w, x4[3ul*xs4 + k0]));
-                if (ROWS > 4u) d4 += float(dot(w, x4[4ul*xs4 + k0]));
-                if (ROWS > 5u) d5 += float(dot(w, x4[5ul*xs4 + k0]));
-                if (ROWS > 6u) d6 += float(dot(w, x4[6ul*xs4 + k0]));
-                if (ROWS > 7u) d7 += float(dot(w, x4[7ul*xs4 + k0]));
+                float4 w = float4(u4_lo_h_fast(ww));
+                if (ROWS > 0u) d0 += dot(w, float4(x4[0ul*xs4 + k0]));
+                if (ROWS > 1u) d1 += dot(w, float4(x4[1ul*xs4 + k0]));
+                if (ROWS > 2u) d2 += dot(w, float4(x4[2ul*xs4 + k0]));
+                if (ROWS > 3u) d3 += dot(w, float4(x4[3ul*xs4 + k0]));
+                if (ROWS > 4u) d4 += dot(w, float4(x4[4ul*xs4 + k0]));
+                if (ROWS > 5u) d5 += dot(w, float4(x4[5ul*xs4 + k0]));
+                if (ROWS > 6u) d6 += dot(w, float4(x4[6ul*xs4 + k0]));
+                if (ROWS > 7u) d7 += dot(w, float4(x4[7ul*xs4 + k0]));
             }
             {
-                half4 w = u4_hi_h_fast(ww);
+                float4 w = float4(u4_hi_h_fast(ww));
                 uint k1 = k0 + 1u;
-                if (ROWS > 0u) d0 += float(dot(w, x4[0ul*xs4 + k1]));
-                if (ROWS > 1u) d1 += float(dot(w, x4[1ul*xs4 + k1]));
-                if (ROWS > 2u) d2 += float(dot(w, x4[2ul*xs4 + k1]));
-                if (ROWS > 3u) d3 += float(dot(w, x4[3ul*xs4 + k1]));
-                if (ROWS > 4u) d4 += float(dot(w, x4[4ul*xs4 + k1]));
-                if (ROWS > 5u) d5 += float(dot(w, x4[5ul*xs4 + k1]));
-                if (ROWS > 6u) d6 += float(dot(w, x4[6ul*xs4 + k1]));
-                if (ROWS > 7u) d7 += float(dot(w, x4[7ul*xs4 + k1]));
+                if (ROWS > 0u) d0 += dot(w, float4(x4[0ul*xs4 + k1]));
+                if (ROWS > 1u) d1 += dot(w, float4(x4[1ul*xs4 + k1]));
+                if (ROWS > 2u) d2 += dot(w, float4(x4[2ul*xs4 + k1]));
+                if (ROWS > 3u) d3 += dot(w, float4(x4[3ul*xs4 + k1]));
+                if (ROWS > 4u) d4 += dot(w, float4(x4[4ul*xs4 + k1]));
+                if (ROWS > 5u) d5 += dot(w, float4(x4[5ul*xs4 + k1]));
+                if (ROWS > 6u) d6 += dot(w, float4(x4[6ul*xs4 + k1]));
+                if (ROWS > 7u) d7 += dot(w, float4(x4[7ul*xs4 + k1]));
             }
         }
         if (ROWS > 0u) a0 += d0 * s;
@@ -625,15 +625,15 @@ kernel void mtp_base_logits_7(device const uint4* q4 [[buffer(0)]],
             uint ww = ws[t];
             uint k0 = g8 + t * 2u;
             {
-                half4 w = u4_lo_h_fast(ww);
-                d0 += float(dot(w, x4[1ul*p.xs4 + k0])); d1 += float(dot(w, x4[2ul*p.xs4 + k0])); d2 += float(dot(w, x4[3ul*p.xs4 + k0])); d3 += float(dot(w, x4[4ul*p.xs4 + k0]));
-                d4 += float(dot(w, x4[5ul*p.xs4 + k0])); d5 += float(dot(w, x4[6ul*p.xs4 + k0])); d6 += float(dot(w, x4[7ul*p.xs4 + k0]));
+                float4 w = float4(u4_lo_h_fast(ww));
+                d0 += dot(w, float4(x4[1ul*p.xs4 + k0])); d1 += dot(w, float4(x4[2ul*p.xs4 + k0])); d2 += dot(w, float4(x4[3ul*p.xs4 + k0])); d3 += dot(w, float4(x4[4ul*p.xs4 + k0]));
+                d4 += dot(w, float4(x4[5ul*p.xs4 + k0])); d5 += dot(w, float4(x4[6ul*p.xs4 + k0])); d6 += dot(w, float4(x4[7ul*p.xs4 + k0]));
             }
             {
-                half4 w = u4_hi_h_fast(ww);
+                float4 w = float4(u4_hi_h_fast(ww));
                 uint k1 = k0 + 1u;
-                d0 += float(dot(w, x4[1ul*p.xs4 + k1])); d1 += float(dot(w, x4[2ul*p.xs4 + k1])); d2 += float(dot(w, x4[3ul*p.xs4 + k1])); d3 += float(dot(w, x4[4ul*p.xs4 + k1]));
-                d4 += float(dot(w, x4[5ul*p.xs4 + k1])); d5 += float(dot(w, x4[6ul*p.xs4 + k1])); d6 += float(dot(w, x4[7ul*p.xs4 + k1]));
+                d0 += dot(w, float4(x4[1ul*p.xs4 + k1])); d1 += dot(w, float4(x4[2ul*p.xs4 + k1])); d2 += dot(w, float4(x4[3ul*p.xs4 + k1])); d3 += dot(w, float4(x4[4ul*p.xs4 + k1]));
+                d4 += dot(w, float4(x4[5ul*p.xs4 + k1])); d5 += dot(w, float4(x4[6ul*p.xs4 + k1])); d6 += dot(w, float4(x4[7ul*p.xs4 + k1]));
             }
         }
         a0 += d0 * s; a1 += d1 * s; a2 += d2 * s; a3 += d3 * s; a4 += d4 * s; a5 += d5 * s; a6 += d6 * s;
