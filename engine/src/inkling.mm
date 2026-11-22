@@ -114,9 +114,10 @@ public:
     id<MTLComputePipelineState> p_embed_b, p_norm_b, p_res_b, p_ctl_norm_b, p_ctl_mix_b, p_sconv_b, p_conv_commit, p_kv_compact;
     id<MTLComputePipelineState> p_clip_b, p_clip_kv_b, p_rel_b, p_attend_b, p_route_b, p_union, p_env4_g, p_emxf8_g, p_emxf8_g8, p_emxf8_g4, p_combine_b;
     id<MTLComputePipelineState> p_env4_g1_16, p_env4_g1_8, p_env4_g24_16, p_env4_g24_8, p_env4_g5p_16, p_env4_g5p_8;
-    id<MTLComputePipelineState> p_f32_to_bf16 = nil, p_m4_bf12_mm32 = nil, p_bf12_outlier_patch = nil, p_m4_nvfp4_g5p = nil, p_m4_mxfp8_g5p = nil;
+    id<MTLComputePipelineState> p_f32_to_f16;
+    id<MTLComputePipelineState> p_f32_to_bf16 = nil, p_m4_bf12_mm32 = nil, p_bf12_outlier_patch = nil, p_m4_nvfp4_g5p = nil, p_m4_mxfp8_g5p = nil, p_m4_q4_mm32 = nil;
     id<MTLComputePipelineState> p_ch_xnorm_b, p_ch_tau_b, p_ch_filter_b, p_ch_setup_b, p_copy_tap;
-    std::array<id<MTLComputePipelineState>, 9> p_gemv12_rows, p_gemv12_16_rows, p_gemv12_4_rows, p_gemv16_rows, p_ch_scan_rows, p_gemv_q4_rows;
+    std::array<id<MTLComputePipelineState>, 9> p_gemv12_rows, p_gemv12_16_rows, p_gemv12_4_rows, p_gemv16_rows, p_ch_scan_rows, p_gemv_q4_rows, p_gemv_q4_h8_rows, p_gemv_q4_h2_rows;
     id<MTLComputePipelineState> p_mtp_w1_norms, p_mtp_pack_head, p_mtp_q4, p_mtp_fold, p_mtp_fold_b, p_mtp_mix, p_mtp_norm_h, p_mtp_ctx_kv, p_mtp_embed;
     id<MTLComputePipelineState> p_mtp_qk_rope, p_mtp_attn, p_mtp_add_norm, p_mtp_add, p_mtp_silu;
     id<MTLComputePipelineState> p_mtp_base7, p_mtp_rnn_in, p_mtp_rnn_gates, p_mtp_mscan, p_mtp_mred;
@@ -177,7 +178,7 @@ public:
     uint64_t s_qbundle, s_kbundle, s_vbundle;
     uint64_t s_q, s_qc, s_r, s_rc, s_gate, s_sinks, s_kraw, s_vraw, s_k, s_v, s_dynk, s_dynv, s_rel, s_gated;
     uint64_t s_router, s_ids, s_gammas, s_xq, s_outer, s_gu, s_h, s_hq, s_houter, s_rows;
-    uint64_t s_normed[3], s_ctlh[3], s_gf[3], s_gain[3], s_forget[3], s_xbf16;
+    uint64_t s_normed[3], s_ctlh[3], s_gf[3], s_gain[3], s_forget[3], s_xbf16, s_xh[3];
     std::vector<id<MTLBuffer>> kcache, vcache;
     std::vector<uint32_t> kv_cap, m_kv_cap;
     std::vector<std::array<uint64_t, 4>> conv_off;
@@ -327,12 +328,14 @@ public:
         p_emxf8_g8 = pipeline(gpu, @"expert_mxfp8_grouped_8");
         p_emxf8_g4 = pipeline(gpu, @"expert_mxfp8_grouped_4");
         p_combine_b = pipeline(gpu, @"combine_batch");
+        p_f32_to_f16 = pipeline(gpu, @"f32_to_f16_rows");
         if ([gpu.library newFunctionWithName:@"m4_bf12_mm32"] != nil && !std::getenv("DELPHI_NO_M4")) {
             p_f32_to_bf16 = pipeline(gpu, @"f32_to_bf16_rows");
             p_m4_bf12_mm32 = pipeline(gpu, @"m4_bf12_mm32");
             p_bf12_outlier_patch = pipeline(gpu, @"bf12_outlier_patch_rows");
             p_m4_nvfp4_g5p = pipeline(gpu, @"m4_nvfp4_g5p");
             p_m4_mxfp8_g5p = pipeline(gpu, @"m4_mxfp8_g5p");
+            p_m4_q4_mm32 = pipeline(gpu, @"m4_q4_mm32");
             has_m4_mpp = true;
         }
         p_ch_xnorm_b = pipeline(gpu, @"cert_head_xnorm_batch");
@@ -366,6 +369,8 @@ public:
             p_gemv16_rows[r] = pipeline_for_rows(gpu, @"gemv_bf16_rows", r);
             p_ch_scan_rows[r] = pipeline_for_rows(gpu, @"cert_head_scan_rows", r);
             p_gemv_q4_rows[r] = pipeline_for_rows(gpu, @"gemv_q4_f32_rows", r);
+            p_gemv_q4_h8_rows[r] = pipeline_for_rows(gpu, @"gemv_q4_h8_rows", r);
+            p_gemv_q4_h2_rows[r] = pipeline_for_rows(gpu, @"gemv_q4_h2_rows", r);
             p_mtp_q4_rows[r] = pipeline_for_rows(gpu, @"mtp_gemv_q4_rows", r);
         }
         arena = [gpu.device newBufferWithLength:uint64_t(slots) * MAX_BATCH * c.hidden * 4 options:MTLResourceStorageModePrivate];
@@ -430,6 +435,7 @@ public:
             s_forget[k] = s_gf[k] + uint64_t(H) * 4;
         }
         s_xbf16 = slot_alloc(uint64_t(MAX_BATCH) * std::max<uint32_t>(2 * H, c.heads * c.head_dim));
+        for (int k = 0; k < 3; ++k) s_xh[k] = slot_alloc(uint64_t(MAX_BATCH) * std::max<uint32_t>(2 * H, c.heads * c.head_dim) / 2);
         scratch = [gpu.device newBufferWithLength:at options:MTLResourceStorageModePrivate];
         if (!scratch) { error = "scratch allocation failed"; return false; }
         uint32_t visits = c.layers + (c.passes - 1) * (c.core_end - c.core_start);
@@ -459,9 +465,9 @@ public:
         conv_meta = [gpu.device newBufferWithBytes:cmeta.data() length:cmeta.size() * sizeof(ConvMetaHost) options:MTLResourceStorageModeShared];
         if (!conv_buf || !conv_meta) { error = "conv state allocation failed"; return false; }
         reset_state();
-        eff_top = (mode == "turbo") ? std::min<uint32_t>(4u, c.top) : c.top;
-        if (mode == "lean") cost_ms = {0.0, 17.6, 22.4, 30.1, 33.8, 41.4, 47.2, 54.2, 61.9, 68.5, 75.0, 82.0, 88.9};
-        else if (mode == "turbo") cost_ms = {0.0, 13.4, 16.8, 21.5, 25.6, 31.0, 35.9, 39.4, 45.3, 50.0, 54.5, 59.0, 63.4};
+        eff_top = (mode == "turbo") ? std::min<uint32_t>(3u, c.top) : c.top;
+        if (mode == "lean") cost_ms = {0.0, 16.5, 22.4, 26.8, 29.5, 35.8, 40.5, 46.0, 51.5, 58.5, 65.5, 72.5, 79.5};
+        else if (mode == "turbo") cost_ms = {0.0, 12.1, 15.6, 17.8, 19.9, 22.4, 25.5, 28.0, 31.0, 35.0, 39.0, 43.0, 47.0};
         if ((use_cert_head || want_mtp) && (c.hidden % 32 == 0) && c.vocab >= 64) {
             if (!build_cert_head(error)) return false;
             cert_head_active = use_cert_head;
@@ -1272,11 +1278,59 @@ public:
     }
 
     struct GemvQ4BP { uint32_t rows, cols, ng, x_stride, y_stride, round_out; };
+    struct CastF16PP { uint32_t M, M_pad, K, x_stride; };
+    struct M4Q4PP { uint32_t M, M_pad, N, K, ng, round_out; };
 
-    void gemv_q4_m(const MatQ4& m, id<MTLBuffer> in_buf, uint64_t in_off, uint32_t x_stride, id<MTLBuffer> out_buf, uint64_t out_off, uint32_t y_stride, uint32_t M, bool round_out = true) {
+    void cast_f16(id<MTLBuffer> in_buf, uint64_t in_off, uint32_t x_stride, uint32_t xh_slot, uint32_t cols, uint32_t M) {
+        bool use_bf16 = (M >= 24 && has_m4_mpp);
+        uint32_t m_pad = use_bf16 ? ((M + 31u) / 32u * 32u) : M;
+        CastF16PP cp{M, m_pad, cols, x_stride};
+        [enc setComputePipelineState:use_bf16 ? p_f32_to_bf16 : p_f32_to_f16];
+        [enc setBuffer:in_buf offset:in_off atIndex:0];
+        [enc setBuffer:scratch offset:s_xh[xh_slot] atIndex:1];
+        [enc setBytes:&cp length:sizeof(cp) atIndex:2];
+        grid2((cols + 255) / 256, m_pad, 256);
+    }
+
+    void gemv_q4_h(const MatQ4& m, uint32_t xh_slot, id<MTLBuffer> out_buf, uint64_t out_off, uint32_t y_stride, uint32_t M, bool round_out = true) {
+        uint32_t ng = m.cols / 32;
+        if (M >= 24 && has_m4_mpp && y_stride == m.rows && (m.cols % 32u) == 0u) {
+            uint32_t m_pad = (M + 31u) / 32u * 32u;
+            M4Q4PP mp{M, m_pad, m.rows, m.cols, ng, round_out ? 1u : 0u};
+            [enc setComputePipelineState:p_m4_q4_mm32];
+            [enc setBuffer:lean_q4 offset:m.q4_off atIndex:0];
+            [enc setBuffer:lean_sc offset:m.sc_off atIndex:1];
+            [enc setBuffer:scratch offset:s_xh[xh_slot] atIndex:2];
+            [enc setBuffer:out_buf offset:out_off atIndex:3];
+            [enc setBytes:&mp length:sizeof(mp) atIndex:4];
+            grid2((m.rows + 63) / 64, m_pad / 32u, 128);
+            return;
+        }
+        bool use_h2 = (ng == 2u);
         for (uint32_t m0 = 0; m0 < M; m0 += 8) {
             uint32_t mb = std::min<uint32_t>(8, M - m0);
-            GemvQ4BP g{m.rows, m.cols, m.cols / 32, x_stride, y_stride, round_out ? 1u : 0u};
+            GemvQ4BP g{m.rows, m.cols, ng, m.cols, y_stride, round_out ? 1u : 0u};
+            [enc setComputePipelineState:use_h2 ? p_gemv_q4_h2_rows[mb] : p_gemv_q4_h8_rows[mb]];
+            [enc setBuffer:lean_q4 offset:m.q4_off atIndex:0];
+            [enc setBuffer:lean_sc offset:m.sc_off atIndex:1];
+            [enc setBuffer:scratch offset:s_xh[xh_slot] + uint64_t(m0) * m.cols * 2 atIndex:2];
+            [enc setBuffer:out_buf offset:out_off + uint64_t(m0) * y_stride * 4 atIndex:3];
+            [enc setBytes:&g length:sizeof(g) atIndex:4];
+            if (use_h2) grid((g.rows + 63) / 64, 128);
+            else grid((g.rows + 31) / 32, 256);
+        }
+    }
+
+    void gemv_q4_m(const MatQ4& m, id<MTLBuffer> in_buf, uint64_t in_off, uint32_t x_stride, id<MTLBuffer> out_buf, uint64_t out_off, uint32_t y_stride, uint32_t M, bool round_out = true) {
+        uint32_t ng = m.cols / 32;
+        if (ng == 2u || (ng % 8u) == 0u) {
+            cast_f16(in_buf, in_off, x_stride, 0u, m.cols, M);
+            gemv_q4_h(m, 0u, out_buf, out_off, y_stride, M, round_out);
+            return;
+        }
+        for (uint32_t m0 = 0; m0 < M; m0 += 8) {
+            uint32_t mb = std::min<uint32_t>(8, M - m0);
+            GemvQ4BP g{m.rows, m.cols, ng, x_stride, y_stride, round_out ? 1u : 0u};
             [enc setComputePipelineState:p_gemv_q4_rows[mb]];
             [enc setBuffer:lean_q4 offset:m.q4_off atIndex:0];
             [enc setBuffer:lean_sc offset:m.sc_off atIndex:1];
@@ -1341,27 +1395,46 @@ public:
             grid(M, 576);
         }
         together = false;
-        [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
-        together = true;
-        for (int k = 0; k < 3; ++k) {
-            if (lean_q4_ready) gemv_q4_m(w.ctl[k].down4, scratch, s_normed[k], 2 * n, scratch, s_ctlh[k], 64, M);
-            else if (bf12_ready) gemv12_m(w.ctl[k].down12, scratch, s_normed[k], 2 * n, scratch, s_ctlh[k], 64, M);
-            else gemv16_m(w.ctl[k].down, scratch, s_normed[k], 2 * n, scratch, s_ctlh[k], 64, M);
-        }
-        together = false;
-        [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
-        together = true;
-        for (int k = 0; k < 3; ++k) {
-            if (lean_q4_ready) {
-                gemv_q4_m(w.ctl[k].gf4, scratch, s_ctlh[k], 64, scratch, s_gf[k], gfs, M, false);
-            } else if (bf12_ready) {
-                gemv12_m(w.ctl[k].gf12, scratch, s_ctlh[k], 64, scratch, s_gf[k], gfs, M, false);
-            } else {
-                gemv16_m(w.ctl[k].gain, scratch, s_ctlh[k], 64, scratch, s_gain[k], gfs, M, false);
-                gemv16_m(w.ctl[k].forget, scratch, s_ctlh[k], 64, scratch, s_forget[k], gfs, M, false);
+        if (lean_q4_ready && ((2 * n) / 32) % 8 == 0) {
+            [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+            together = true;
+            for (int k = 0; k < 3; ++k) cast_f16(scratch, s_normed[k], 2 * n, uint32_t(k), 2 * n, M);
+            together = false;
+            [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+            together = true;
+            for (int k = 0; k < 3; ++k) gemv_q4_h(w.ctl[k].down4, uint32_t(k), scratch, s_ctlh[k], 64, M);
+            together = false;
+            [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+            together = true;
+            for (int k = 0; k < 3; ++k) cast_f16(scratch, s_ctlh[k], 64, uint32_t(k), 64, M);
+            together = false;
+            [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+            together = true;
+            for (int k = 0; k < 3; ++k) gemv_q4_h(w.ctl[k].gf4, uint32_t(k), scratch, s_gf[k], gfs, M, false);
+            together = false;
+        } else {
+            [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+            together = true;
+            for (int k = 0; k < 3; ++k) {
+                if (lean_q4_ready) gemv_q4_m(w.ctl[k].down4, scratch, s_normed[k], 2 * n, scratch, s_ctlh[k], 64, M);
+                else if (bf12_ready) gemv12_m(w.ctl[k].down12, scratch, s_normed[k], 2 * n, scratch, s_ctlh[k], 64, M);
+                else gemv16_m(w.ctl[k].down, scratch, s_normed[k], 2 * n, scratch, s_ctlh[k], 64, M);
             }
+            together = false;
+            [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+            together = true;
+            for (int k = 0; k < 3; ++k) {
+                if (lean_q4_ready) {
+                    gemv_q4_m(w.ctl[k].gf4, scratch, s_ctlh[k], 64, scratch, s_gf[k], gfs, M, false);
+                } else if (bf12_ready) {
+                    gemv12_m(w.ctl[k].gf12, scratch, s_ctlh[k], 64, scratch, s_gf[k], gfs, M, false);
+                } else {
+                    gemv16_m(w.ctl[k].gain, scratch, s_ctlh[k], 64, scratch, s_gain[k], gfs, M, false);
+                    gemv16_m(w.ctl[k].forget, scratch, s_ctlh[k], 64, scratch, s_forget[k], gfs, M, false);
+                }
+            }
+            together = false;
         }
-        together = false;
         [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
         together = true;
         std::array<uint32_t, 3> outs;
@@ -1522,29 +1595,46 @@ public:
         uint32_t kstr = w.local ? k_stride_local : k_stride_global;
         uint32_t qdim = c.heads * c.head_dim;
         uint32_t rdim = c.heads * c.d_rel;
-        [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
-        together = true;
-        if (lean_q4_ready) {
-            gemv_q4_m(w.q4, arena, so(sq), H, scratch, s_qbundle, q_stride, M);
-            gemv_q4_m(w.k4, arena, so(sk), H, scratch, s_kbundle, kstr, M);
-            gemv_q4_m(w.v4, arena, so(sv), H, scratch, s_vbundle, kstr, M);
-        } else if (bf12_ready) {
-            gemv12_m(w.q12, arena, so(sq), H, scratch, s_qbundle, q_stride, M);
-            gemv12_m(w.k12, arena, so(sk), H, scratch, s_kbundle, kstr, M);
-            gemv12_m(w.v12, arena, so(sv), H, scratch, s_vbundle, kstr, M);
+        if (lean_q4_ready && ((H / 32) % 8 == 0)) {
+            [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+            together = true;
+            cast_f16(arena, so(sq), H, 0u, H, M);
+            if (sk != sq) cast_f16(arena, so(sk), H, 1u, H, M);
+            if (sv != sq && sv != sk) cast_f16(arena, so(sv), H, 2u, H, M);
+            together = false;
+            [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+            together = true;
+            uint32_t sk_slot = (sk == sq) ? 0u : 1u;
+            uint32_t sv_slot = (sv == sq) ? 0u : ((sv == sk) ? sk_slot : 2u);
+            gemv_q4_h(w.q4, 0u, scratch, s_qbundle, q_stride, M);
+            gemv_q4_h(w.k4, sk_slot, scratch, s_kbundle, kstr, M);
+            gemv_q4_h(w.v4, sv_slot, scratch, s_vbundle, kstr, M);
+            together = false;
         } else {
-            gemv16_m(w.wq, arena, so(sq), H, scratch, s_q, q_stride, M);
-            gemv16_m(w.wr, arena, so(sq), H, scratch, s_r, q_stride, M);
-            gemv16_m(w.gate_attn, arena, so(sq), H, scratch, s_gate, q_stride, M);
-            gemv16_m(w.sink, arena, so(sq), H, scratch, s_sinks, q_stride, M);
-            gemv16_m(w.wk, arena, so(sk), H, scratch, s_kraw, kstr, M);
-            gemv16_m(w.wv, arena, so(sv), H, scratch, s_vraw, kstr, M);
-            if (!w.local) {
-                gemv16_m(w.dynk, arena, so(sk), H, scratch, s_dynk, kstr, M);
-                gemv16_m(w.dynv, arena, so(sv), H, scratch, s_dynv, kstr, M);
+            [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+            together = true;
+            if (lean_q4_ready) {
+                gemv_q4_m(w.q4, arena, so(sq), H, scratch, s_qbundle, q_stride, M);
+                gemv_q4_m(w.k4, arena, so(sk), H, scratch, s_kbundle, kstr, M);
+                gemv_q4_m(w.v4, arena, so(sv), H, scratch, s_vbundle, kstr, M);
+            } else if (bf12_ready) {
+                gemv12_m(w.q12, arena, so(sq), H, scratch, s_qbundle, q_stride, M);
+                gemv12_m(w.k12, arena, so(sk), H, scratch, s_kbundle, kstr, M);
+                gemv12_m(w.v12, arena, so(sv), H, scratch, s_vbundle, kstr, M);
+            } else {
+                gemv16_m(w.wq, arena, so(sq), H, scratch, s_q, q_stride, M);
+                gemv16_m(w.wr, arena, so(sq), H, scratch, s_r, q_stride, M);
+                gemv16_m(w.gate_attn, arena, so(sq), H, scratch, s_gate, q_stride, M);
+                gemv16_m(w.sink, arena, so(sq), H, scratch, s_sinks, q_stride, M);
+                gemv16_m(w.wk, arena, so(sk), H, scratch, s_kraw, kstr, M);
+                gemv16_m(w.wv, arena, so(sv), H, scratch, s_vraw, kstr, M);
+                if (!w.local) {
+                    gemv16_m(w.dynk, arena, so(sk), H, scratch, s_dynk, kstr, M);
+                    gemv16_m(w.dynv, arena, so(sv), H, scratch, s_dynv, kstr, M);
+                }
             }
+            together = false;
         }
-        together = false;
         [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
         together = true;
         sconv_run(scratch, s_kraw, conv_off[visit][0], w.k_sconv, s_dynk, scratch, s_k, kvw, !w.local, M, kstr, kstr, kvw);
@@ -2520,8 +2610,6 @@ DecodeStats run_decode_pass(Engine& engine, const std::vector<uint32_t>& ids, ui
     double ema_cal = 0.90;
     double last_exp_acc = 0.0;
     bool last_was_mtp = false;
-    uint32_t mtp_miss_streak = 0;
-    uint32_t mtp_cooldown = 0;
     while (st.out.size() < steps) {
         uint64_t rem = steps - st.out.size();
         uint32_t ctx_room = pos < engine.max_context ? engine.max_context - pos : 0;
@@ -2536,97 +2624,90 @@ DecodeStats run_decode_pass(Engine& engine, const std::vector<uint32_t>& ids, ui
             uint32_t max_k = uint32_t(std::min<uint64_t>({63ull, rem - 1, uint64_t(ctx_room - 1)}));
             if (spec == "lookup" || spec == "auto") draft = lookup_draft(history, max_k);
             if (draft.empty() && use_mtp) {
-                if (mtp_cooldown > 0) {
-                    mtp_cooldown--;
-                } else {
-                    st.decode_gpu += engine.mtp_propose(anchor, pos, pending_mtp_pos, pending_mtp_commit, pending_mtp_has_map ? pending_mtp_map.data() : nullptr);
-                    pending_mtp_commit = 0;
-                    pending_mtp_has_map = false;
-                    const uint32_t* tids = engine.mtp_tree_ids();
-                    const float* tprobs = engine.mtp_tree_probs();
-                    uint32_t max_depth = std::min<uint32_t>(7u, max_k);
-                    struct Cand { int par; uint32_t depth; uint32_t tok; double p; };
-                    std::array<Cand, 57> cands{};
+                st.decode_gpu += engine.mtp_propose(anchor, pos, pending_mtp_pos, pending_mtp_commit, pending_mtp_has_map ? pending_mtp_map.data() : nullptr);
+                pending_mtp_commit = 0;
+                pending_mtp_has_map = false;
+                const uint32_t* tids = engine.mtp_tree_ids();
+                const float* tprobs = engine.mtp_tree_probs();
+                uint32_t max_depth = std::min<uint32_t>(7u, max_k);
+                struct Cand { int par; uint32_t depth; uint32_t tok; double p; };
+                std::array<Cand, 57> cands{};
+                for (uint32_t j = 0; j < 3u; ++j) {
+                    cands[j] = {-1, 1u, tids[j], std::clamp(double(tprobs[j]) * ema_cal, 0.0, 0.99)};
+                }
+                for (uint32_t b = 0; b < 3u; ++b) {
                     for (uint32_t j = 0; j < 3u; ++j) {
-                        cands[j] = {-1, 1u, tids[j], std::clamp(double(tprobs[j]) * ema_cal, 0.0, 0.99)};
+                        uint32_t idx = 3u + b * 3u + j;
+                        double cp = std::clamp(double(tprobs[idx]) * ema_cal, 0.0, 0.99);
+                        cands[idx] = {int(b), 2u, tids[idx], cands[b].p * cp};
                     }
+                }
+                for (uint32_t k = 2u; k < 7u; ++k) {
+                    uint32_t base = 3u + (k - 1u) * 9u;
+                    uint32_t pbase = 3u + (k - 2u) * 9u;
+                    uint32_t pmap[3] = {pbase + 0u, pbase + 1u, pbase + 3u};
                     for (uint32_t b = 0; b < 3u; ++b) {
                         for (uint32_t j = 0; j < 3u; ++j) {
-                            uint32_t idx = 3u + b * 3u + j;
+                            uint32_t idx = base + b * 3u + j;
                             double cp = std::clamp(double(tprobs[idx]) * ema_cal, 0.0, 0.99);
-                            cands[idx] = {int(b), 2u, tids[idx], cands[b].p * cp};
+                            cands[idx] = {int(pmap[b]), k + 1u, tids[idx], cands[pmap[b]].p * cp};
                         }
                     }
-                    for (uint32_t k = 2u; k < 7u; ++k) {
-                        uint32_t base = 3u + (k - 1u) * 9u;
-                        uint32_t pbase = 3u + (k - 2u) * 9u;
-                        uint32_t pmap[3] = {pbase + 0u, pbase + 1u, pbase + 3u};
-                        for (uint32_t b = 0; b < 3u; ++b) {
-                            for (uint32_t j = 0; j < 3u; ++j) {
-                                uint32_t idx = base + b * 3u + j;
-                                double cp = std::clamp(double(tprobs[idx]) * ema_cal, 0.0, 0.99);
-                                cands[idx] = {int(pmap[b]), k + 1u, tids[idx], cands[pmap[b]].p * cp};
-                            }
-                        }
+                }
+                std::vector<uint32_t> order;
+                order.reserve(57);
+                for (uint32_t i = 0; i < 57u; ++i) {
+                    if (cands[i].depth <= max_depth && cands[i].p > 1e-4) order.push_back(i);
+                }
+                std::stable_sort(order.begin(), order.end(), [&](uint32_t a, uint32_t b) {
+                    if (cands[a].p != cands[b].p) return cands[a].p > cands[b].p;
+                    return cands[a].depth < cands[b].depth;
+                });
+                uint32_t k_lim = std::min<uint32_t>(7u, uint32_t(order.size()));
+                uint32_t best_k = 0;
+                double base_rate = 1.0 / engine.cost_ms[1];
+                double best_rate = base_rate;
+                double exp_tok = 1.0;
+                double best_exp = 0.0;
+                for (uint32_t k = 1; k <= k_lim; ++k) {
+                    exp_tok += cands[order[k - 1]].p;
+                    double rate = exp_tok / engine.cost_ms[k + 1];
+                    if (rate > best_rate) {
+                        best_rate = rate;
+                        best_k = k;
+                        best_exp = exp_tok - 1.0;
                     }
-                    std::vector<uint32_t> order;
-                    order.reserve(57);
-                    for (uint32_t i = 0; i < 57u; ++i) {
-                        if (cands[i].depth <= max_depth && cands[i].p > 1e-4) order.push_back(i);
-                    }
-                    std::stable_sort(order.begin(), order.end(), [&](uint32_t a, uint32_t b) {
-                        if (cands[a].p != cands[b].p) return cands[a].p > cands[b].p;
-                        return cands[a].depth < cands[b].depth;
+                }
+                if (best_k > 0) {
+                    std::vector<uint32_t> chosen(order.begin(), order.begin() + best_k);
+                    std::stable_sort(chosen.begin(), chosen.end(), [&](uint32_t a, uint32_t b) {
+                        if (cands[a].depth != cands[b].depth) return cands[a].depth < cands[b].depth;
+                        return a < b;
                     });
-                    uint32_t k_lim = std::min<uint32_t>(7u, uint32_t(order.size()));
-                    uint32_t best_k = 0;
-                    double base_rate = 1.0 / engine.cost_ms[1];
-                    double best_rate = base_rate;
-                    double exp_tok = 1.0;
-                    double best_exp = 0.0;
-                    for (uint32_t k = 1; k <= k_lim; ++k) {
-                        exp_tok += cands[order[k - 1]].p;
-                        double rate = exp_tok / engine.cost_ms[k + 1];
-                        if (rate > best_rate) {
-                            best_rate = rate;
-                            best_k = k;
-                            best_exp = exp_tok - 1.0;
-                        }
+                    std::array<int, 57> c2node;
+                    c2node.fill(-1);
+                    draft.reserve(best_k);
+                    tree.is_tree = 0u;
+                    tree.dep[0] = 0u; tree.mask[0] = 1u;
+                    tree.p1[0] = 2u; tree.p2[0] = 1u; tree.p3[0] = 0u;
+                    node_par[0] = 0u;
+                    for (uint32_t i = 0; i < best_k; ++i) {
+                        uint32_t ci = chosen[i];
+                        uint32_t m = i + 1u;
+                        c2node[ci] = int(m);
+                        uint32_t pm = cands[ci].par < 0 ? 0u : uint32_t(c2node[cands[ci].par]);
+                        node_par[m] = pm;
+                        draft.push_back(cands[ci].tok);
+                        tree.dep[m] = tree.dep[pm] + 1u;
+                        tree.mask[m] = tree.mask[pm] | (1u << m);
+                        tree.p1[m] = 3u + pm;
+                        tree.p2[m] = tree.p1[pm];
+                        tree.p3[m] = tree.p2[pm];
+                        if (pm != m - 1u) tree.is_tree = 1u;
                     }
-                    if (best_k > 0) {
-                        std::vector<uint32_t> chosen(order.begin(), order.begin() + best_k);
-                        std::stable_sort(chosen.begin(), chosen.end(), [&](uint32_t a, uint32_t b) {
-                            if (cands[a].depth != cands[b].depth) return cands[a].depth < cands[b].depth;
-                            return a < b;
-                        });
-                        std::array<int, 57> c2node;
-                        c2node.fill(-1);
-                        draft.reserve(best_k);
-                        tree.is_tree = 0u;
-                        tree.dep[0] = 0u; tree.mask[0] = 1u;
-                        tree.p1[0] = 2u; tree.p2[0] = 1u; tree.p3[0] = 0u;
-                        node_par[0] = 0u;
-                        for (uint32_t i = 0; i < best_k; ++i) {
-                            uint32_t ci = chosen[i];
-                            uint32_t m = i + 1u;
-                            c2node[ci] = int(m);
-                            uint32_t pm = cands[ci].par < 0 ? 0u : uint32_t(c2node[cands[ci].par]);
-                            node_par[m] = pm;
-                            draft.push_back(cands[ci].tok);
-                            tree.dep[m] = tree.dep[pm] + 1u;
-                            tree.mask[m] = tree.mask[pm] | (1u << m);
-                            tree.p1[m] = 3u + pm;
-                            tree.p2[m] = tree.p1[pm];
-                            tree.p3[m] = tree.p2[pm];
-                            if (pm != m - 1u) tree.is_tree = 1u;
-                        }
-                        tree_m = best_k + 1u;
-                        last_was_mtp = true;
-                        last_exp_acc = best_exp;
-                    } else if (engine.lean_q4_ready) {
-                        mtp_miss_streak++;
-                        if (mtp_miss_streak >= 3) mtp_cooldown = std::min<uint32_t>(6u, mtp_miss_streak - 2u);
-                    }
+                    tree_m = best_k + 1u;
+                    last_was_mtp = true;
+                    last_exp_acc = best_exp;
                 }
             }
         }
@@ -2712,18 +2793,9 @@ DecodeStats run_decode_pass(Engine& engine, const std::vector<uint32_t>& ids, ui
                 if (need_compact) {
                     for (uint32_t j = 0u; j < commit; ++j) pending_mtp_map[j] = win[j];
                 }
-                if (last_was_mtp) {
-                    if (accepted >= 1) {
-                        mtp_miss_streak = 0;
-                        mtp_cooldown = 0;
-                    } else if (engine.lean_q4_ready) {
-                        mtp_miss_streak++;
-                        if (mtp_miss_streak >= 3) mtp_cooldown = std::min<uint32_t>(6u, mtp_miss_streak - 2u);
-                    }
-                    if (last_exp_acc > 0.1) {
-                        double ratio = std::clamp((double(accepted) + 0.15) / (last_exp_acc + 0.15), 0.4, 1.2);
-                        ema_cal = std::clamp(0.75 * ema_cal + 0.25 * (ema_cal * ratio), 0.45, 1.15);
-                    }
+                if (last_was_mtp && last_exp_acc > 0.1) {
+                    double ratio = std::clamp((double(accepted) + 0.15) / (last_exp_acc + 0.15), 0.4, 1.2);
+                    ema_cal = std::clamp(0.75 * ema_cal + 0.25 * (ema_cal * ratio), 0.45, 1.15);
                 }
             }
         } else {
@@ -2764,18 +2836,9 @@ DecodeStats run_decode_pass(Engine& engine, const std::vector<uint32_t>& ids, ui
                 pending_mtp_pos = old_pos;
                 pending_mtp_commit = commit;
                 pending_mtp_has_map = false;
-                if (last_was_mtp) {
-                    if (accepted >= 1) {
-                        mtp_miss_streak = 0;
-                        mtp_cooldown = 0;
-                    } else if (engine.lean_q4_ready) {
-                        mtp_miss_streak++;
-                        if (mtp_miss_streak >= 3) mtp_cooldown = std::min<uint32_t>(6u, mtp_miss_streak - 2u);
-                    }
-                    if (last_exp_acc > 0.1) {
-                        double ratio = std::clamp((double(accepted) + 0.15) / (last_exp_acc + 0.15), 0.4, 1.2);
-                        ema_cal = std::clamp(0.75 * ema_cal + 0.25 * (ema_cal * ratio), 0.45, 1.15);
-                    }
+                if (last_was_mtp && last_exp_acc > 0.1) {
+                    double ratio = std::clamp((double(accepted) + 0.15) / (last_exp_acc + 0.15), 0.4, 1.2);
+                    ema_cal = std::clamp(0.75 * ema_cal + 0.25 * (ema_cal * ratio), 0.45, 1.15);
                 }
             }
         }

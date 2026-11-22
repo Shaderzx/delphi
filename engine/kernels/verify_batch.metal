@@ -2000,6 +2000,155 @@ kernel void gemv_q4_f32_rows(device const uint4* q4 [[buffer(0)]],
     if (ROWS > 7u) { float t = simd_sum(a7); if (lane == 0) y[7ul * p.y_stride + row] = p.round_out ? rbf(t) : t; }
 }
 
+struct CastF16P { uint M; uint M_pad; uint K; uint x_stride; };
+
+kernel void f32_to_f16_rows(device const float* x [[buffer(0)]],
+                            device half* y [[buffer(1)]],
+                            constant CastF16P& p [[buffer(2)]],
+                            uint2 gid [[thread_position_in_grid]]) {
+    uint k = gid.x, m = gid.y;
+    if (k >= p.K || m >= p.M_pad) return;
+    y[ulong(m) * p.K + k] = m < p.M ? half(x[ulong(m) * p.x_stride + k]) : half(0);
+}
+
+kernel void gemv_q4_h8_rows(device const uint4* q4 [[buffer(0)]],
+                            device const half* sc [[buffer(1)]],
+                            device const half4* x4 [[buffer(2)]],
+                            device float* y [[buffer(3)]],
+                            constant GemvQ4B& p [[buffer(4)]],
+                            uint group [[threadgroup_position_in_grid]],
+                            uint simd [[simdgroup_index_in_threadgroup]],
+                            uint simds [[simdgroups_per_threadgroup]],
+                            uint lane [[thread_index_in_simdgroup]]) {
+    uint sub = lane >> 3;
+    uint sl = lane & 7u;
+    uint row = (group * simds + simd) * 4u + sub;
+    if (row >= p.rows) return;
+    uint xs4 = p.cols / 4u;
+    device const uint4* qr = q4 + ulong(row) * p.ng;
+    device const half* sr = sc + ulong(row) * p.ng;
+    float a0 = 0, a1 = 0, a2 = 0, a3 = 0, a4 = 0, a5 = 0, a6 = 0, a7 = 0;
+    for (uint g = sl; g < p.ng; g += 8u) {
+        uint4 pk = qr[g];
+        float s = float(sr[g]);
+        uint g8 = g * 8u;
+        float d0 = 0, d1 = 0, d2 = 0, d3 = 0, d4 = 0, d5 = 0, d6 = 0, d7 = 0;
+        uint ws[4] = {pk.x, pk.y, pk.z, pk.w};
+        for (uint t = 0; t < 4u; ++t) {
+            uint ww = ws[t];
+            uint k0 = g8 + t * 2u;
+            {
+                half4 w = u4_lo_h_fast(ww);
+                if (ROWS > 0u) d0 += float(dot(w, x4[0ul*xs4 + k0]));
+                if (ROWS > 1u) d1 += float(dot(w, x4[1ul*xs4 + k0]));
+                if (ROWS > 2u) d2 += float(dot(w, x4[2ul*xs4 + k0]));
+                if (ROWS > 3u) d3 += float(dot(w, x4[3ul*xs4 + k0]));
+                if (ROWS > 4u) d4 += float(dot(w, x4[4ul*xs4 + k0]));
+                if (ROWS > 5u) d5 += float(dot(w, x4[5ul*xs4 + k0]));
+                if (ROWS > 6u) d6 += float(dot(w, x4[6ul*xs4 + k0]));
+                if (ROWS > 7u) d7 += float(dot(w, x4[7ul*xs4 + k0]));
+            }
+            {
+                half4 w = u4_hi_h_fast(ww);
+                uint k1 = k0 + 1u;
+                if (ROWS > 0u) d0 += float(dot(w, x4[0ul*xs4 + k1]));
+                if (ROWS > 1u) d1 += float(dot(w, x4[1ul*xs4 + k1]));
+                if (ROWS > 2u) d2 += float(dot(w, x4[2ul*xs4 + k1]));
+                if (ROWS > 3u) d3 += float(dot(w, x4[3ul*xs4 + k1]));
+                if (ROWS > 4u) d4 += float(dot(w, x4[4ul*xs4 + k1]));
+                if (ROWS > 5u) d5 += float(dot(w, x4[5ul*xs4 + k1]));
+                if (ROWS > 6u) d6 += float(dot(w, x4[6ul*xs4 + k1]));
+                if (ROWS > 7u) d7 += float(dot(w, x4[7ul*xs4 + k1]));
+            }
+        }
+        if (ROWS > 0u) a0 += d0 * s;
+        if (ROWS > 1u) a1 += d1 * s;
+        if (ROWS > 2u) a2 += d2 * s;
+        if (ROWS > 3u) a3 += d3 * s;
+        if (ROWS > 4u) a4 += d4 * s;
+        if (ROWS > 5u) a5 += d5 * s;
+        if (ROWS > 6u) a6 += d6 * s;
+        if (ROWS > 7u) a7 += d7 * s;
+    }
+    if (ROWS > 0u) { float t = simd8_sum(a0); if (sl == 0u) y[0ul * p.y_stride + row] = p.round_out ? rbf(t) : t; }
+    if (ROWS > 1u) { float t = simd8_sum(a1); if (sl == 0u) y[1ul * p.y_stride + row] = p.round_out ? rbf(t) : t; }
+    if (ROWS > 2u) { float t = simd8_sum(a2); if (sl == 0u) y[2ul * p.y_stride + row] = p.round_out ? rbf(t) : t; }
+    if (ROWS > 3u) { float t = simd8_sum(a3); if (sl == 0u) y[3ul * p.y_stride + row] = p.round_out ? rbf(t) : t; }
+    if (ROWS > 4u) { float t = simd8_sum(a4); if (sl == 0u) y[4ul * p.y_stride + row] = p.round_out ? rbf(t) : t; }
+    if (ROWS > 5u) { float t = simd8_sum(a5); if (sl == 0u) y[5ul * p.y_stride + row] = p.round_out ? rbf(t) : t; }
+    if (ROWS > 6u) { float t = simd8_sum(a6); if (sl == 0u) y[6ul * p.y_stride + row] = p.round_out ? rbf(t) : t; }
+    if (ROWS > 7u) { float t = simd8_sum(a7); if (sl == 0u) y[7ul * p.y_stride + row] = p.round_out ? rbf(t) : t; }
+}
+
+kernel void gemv_q4_h2_rows(device const uint4* q4 [[buffer(0)]],
+                            device const half* sc [[buffer(1)]],
+                            device const half4* x4 [[buffer(2)]],
+                            device float* y [[buffer(3)]],
+                            constant GemvQ4B& p [[buffer(4)]],
+                            uint group [[threadgroup_position_in_grid]],
+                            uint simd [[simdgroup_index_in_threadgroup]],
+                            uint simds [[simdgroups_per_threadgroup]],
+                            uint lane [[thread_index_in_simdgroup]]) {
+    uint sub = lane >> 1;
+    uint sl = lane & 1u;
+    uint row = (group * simds + simd) * 16u + sub;
+    if (row >= p.rows) return;
+    uint xs4 = p.cols / 4u;
+    device const uint4* qr = q4 + ulong(row) * p.ng;
+    device const half* sr = sc + ulong(row) * p.ng;
+    float a0 = 0, a1 = 0, a2 = 0, a3 = 0, a4 = 0, a5 = 0, a6 = 0, a7 = 0;
+    for (uint g = sl; g < p.ng; g += 2u) {
+        uint4 pk = qr[g];
+        float s = float(sr[g]);
+        uint g8 = g * 8u;
+        float d0 = 0, d1 = 0, d2 = 0, d3 = 0, d4 = 0, d5 = 0, d6 = 0, d7 = 0;
+        uint ws[4] = {pk.x, pk.y, pk.z, pk.w};
+        for (uint t = 0; t < 4u; ++t) {
+            uint ww = ws[t];
+            uint k0 = g8 + t * 2u;
+            {
+                half4 w = u4_lo_h_fast(ww);
+                if (ROWS > 0u) d0 += float(dot(w, x4[0ul*xs4 + k0]));
+                if (ROWS > 1u) d1 += float(dot(w, x4[1ul*xs4 + k0]));
+                if (ROWS > 2u) d2 += float(dot(w, x4[2ul*xs4 + k0]));
+                if (ROWS > 3u) d3 += float(dot(w, x4[3ul*xs4 + k0]));
+                if (ROWS > 4u) d4 += float(dot(w, x4[4ul*xs4 + k0]));
+                if (ROWS > 5u) d5 += float(dot(w, x4[5ul*xs4 + k0]));
+                if (ROWS > 6u) d6 += float(dot(w, x4[6ul*xs4 + k0]));
+                if (ROWS > 7u) d7 += float(dot(w, x4[7ul*xs4 + k0]));
+            }
+            {
+                half4 w = u4_hi_h_fast(ww);
+                uint k1 = k0 + 1u;
+                if (ROWS > 0u) d0 += float(dot(w, x4[0ul*xs4 + k1]));
+                if (ROWS > 1u) d1 += float(dot(w, x4[1ul*xs4 + k1]));
+                if (ROWS > 2u) d2 += float(dot(w, x4[2ul*xs4 + k1]));
+                if (ROWS > 3u) d3 += float(dot(w, x4[3ul*xs4 + k1]));
+                if (ROWS > 4u) d4 += float(dot(w, x4[4ul*xs4 + k1]));
+                if (ROWS > 5u) d5 += float(dot(w, x4[5ul*xs4 + k1]));
+                if (ROWS > 6u) d6 += float(dot(w, x4[6ul*xs4 + k1]));
+                if (ROWS > 7u) d7 += float(dot(w, x4[7ul*xs4 + k1]));
+            }
+        }
+        if (ROWS > 0u) a0 += d0 * s;
+        if (ROWS > 1u) a1 += d1 * s;
+        if (ROWS > 2u) a2 += d2 * s;
+        if (ROWS > 3u) a3 += d3 * s;
+        if (ROWS > 4u) a4 += d4 * s;
+        if (ROWS > 5u) a5 += d5 * s;
+        if (ROWS > 6u) a6 += d6 * s;
+        if (ROWS > 7u) a7 += d7 * s;
+    }
+    if (ROWS > 0u) { float t = a0 + simd_shuffle_xor(a0, 1u); if (sl == 0u) y[0ul * p.y_stride + row] = p.round_out ? rbf(t) : t; }
+    if (ROWS > 1u) { float t = a1 + simd_shuffle_xor(a1, 1u); if (sl == 0u) y[1ul * p.y_stride + row] = p.round_out ? rbf(t) : t; }
+    if (ROWS > 2u) { float t = a2 + simd_shuffle_xor(a2, 1u); if (sl == 0u) y[2ul * p.y_stride + row] = p.round_out ? rbf(t) : t; }
+    if (ROWS > 3u) { float t = a3 + simd_shuffle_xor(a3, 1u); if (sl == 0u) y[3ul * p.y_stride + row] = p.round_out ? rbf(t) : t; }
+    if (ROWS > 4u) { float t = a4 + simd_shuffle_xor(a4, 1u); if (sl == 0u) y[4ul * p.y_stride + row] = p.round_out ? rbf(t) : t; }
+    if (ROWS > 5u) { float t = a5 + simd_shuffle_xor(a5, 1u); if (sl == 0u) y[5ul * p.y_stride + row] = p.round_out ? rbf(t) : t; }
+    if (ROWS > 6u) { float t = a6 + simd_shuffle_xor(a6, 1u); if (sl == 0u) y[6ul * p.y_stride + row] = p.round_out ? rbf(t) : t; }
+    if (ROWS > 7u) { float t = a7 + simd_shuffle_xor(a7, 1u); if (sl == 0u) y[7ul * p.y_stride + row] = p.round_out ? rbf(t) : t; }
+}
+
 #if defined(__METAL_VERSION__) && __METAL_VERSION__ >= 400
 #include <metal_tensor>
 #include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>
@@ -2259,5 +2408,53 @@ kernel void m4_mxfp8_g5p(device const uchar* w [[buffer(0)]],
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
+}
+
+struct M4Q4P { uint M; uint M_pad; uint N; uint K; uint ng; uint round_out; };
+
+kernel void m4_q4_mm32(device const uint4* q4 [[buffer(0)]],
+                       device const half* sc [[buffer(1)]],
+                       device bfloat* X [[buffer(2)]],
+                       device float* Y [[buffer(3)]],
+                       constant M4Q4P& p [[buffer(4)]],
+                       uint2 tgid [[threadgroup_position_in_grid]],
+                       uint tid [[thread_index_in_threadgroup]]) {
+    threadgroup bfloat Wtg[64 * 32];
+    int n0 = int(tgid.x) * 64;
+    int m0 = int(tgid.y) * 32;
+    tensor<device bfloat, dextents<int32_t, 2>, tensor_inline> tX(X, dextents<int32_t, 2>(int(p.K), int(p.M_pad)));
+    tensor<threadgroup bfloat, extents<int32_t, 32, 64>, tensor_inline> tW(Wtg, extents<int32_t, 32, 64>());
+    tensor<device float, dextents<int32_t, 2>, tensor_inline> tY(Y, dextents<int32_t, 2>(int(p.N), int(p.M)));
+    constexpr auto desc = mpp::tensor_ops::matmul2d_descriptor(32, 64, 32, false, true, false, mpp::tensor_ops::matmul2d_descriptor::mode::multiply_accumulate);
+    mpp::tensor_ops::matmul2d<desc, execution_simdgroups<4>> op;
+    auto cT = op.get_destination_cooperative_tensor<decltype(tX.slice<32, 32>(0, 0)), decltype(tW), float>();
+    #pragma clang loop unroll(full)
+    for (uint16_t i = 0; i < cT.get_capacity(); ++i) if (cT.is_valid_element(i)) cT[i] = 0.0f;
+    uint r = tid >> 1;
+    uint sub16 = tid & 1u;
+    uint row = uint(n0) + r;
+    for (uint g = 0; g < p.ng; ++g) {
+        if (row < p.N) {
+            uint4 pk = q4[ulong(row) * p.ng + g];
+            float s = float(sc[ulong(row) * p.ng + g]);
+            uint w0 = sub16 ? pk.z : pk.x;
+            uint w1 = sub16 ? pk.w : pk.y;
+            threadgroup bfloat4* dst = (threadgroup bfloat4*)(Wtg + r * 32u + sub16 * 16u);
+            dst[0] = bfloat4(float4(u4_lo_h_fast(w0)) * s);
+            dst[1] = bfloat4(float4(u4_hi_h_fast(w0)) * s);
+            dst[2] = bfloat4(float4(u4_lo_h_fast(w1)) * s);
+            dst[3] = bfloat4(float4(u4_hi_h_fast(w1)) * s);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        auto sX = tX.slice<32, 32>(int(g * 32u), m0);
+        op.run(sX, tW, cT);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (p.round_out) {
+        #pragma clang loop unroll(full)
+        for (uint16_t i = 0; i < cT.get_capacity(); ++i) if (cT.is_valid_element(i)) cT[i] = rbf(cT[i]);
+    }
+    auto sY = tY.slice(n0, m0);
+    cT.store(sY);
 }
 #endif

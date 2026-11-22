@@ -123,17 +123,29 @@ test('delphi bench refuses missing model or invalid repeat counts', { timeout: 3
   });
 });
 
-test('delphi generate opt-in --mode lean and --mode turbo report mode and preserve Paris answer', { tags: ['model'], timeout: 900_000 }, () => {
+test('delphi generate opt-in --mode lean and --mode turbo report mode, stay spec-exact, and preserve Paris and 4.6K lean needle', { tags: ['model'], timeout: 900_000 }, () => {
   const deadline = Date.now() + 900_000;
   withBuiltDelphi(deadline, (bin) => {
     for (const m of ['lean', 'turbo']) {
+      const offRun = spawnSync(bin, ['generate', '--model', model, '--input-ids', JSON.stringify(paris.input_ids), '--steps', '16', '--mode', m, '--spec', 'off'], { encoding: 'utf8', timeout: remainingMs(deadline) });
+      checkRun(`delphi generate --mode ${m} --spec off`, offRun);
       const run = spawnSync(bin, ['generate', '--model', model, '--input-ids', JSON.stringify(paris.input_ids), '--steps', '16', '--mode', m], { encoding: 'utf8', timeout: remainingMs(deadline) });
       checkRun(`delphi generate --mode ${m}`, run);
       const out = JSON.parse(run.stdout) as Generated;
       expect(out.mode).toBe(m);
       expect(out.lossy).toBe(true);
       expect(out.output_ids[0]).toBe(paris.output_ids[0]);
+      expect(out.output_ids).toEqual((JSON.parse(offRun.stdout) as Generated).output_ids);
     }
+    const code = [19, 22, 17, 24, 16];
+    const needle = [371, 153536, 150406, 149884, 220, ...code, 13, 198];
+    const filler = [...truth.cases[2].input_ids, 198];
+    const prompt: number[] = [...needle];
+    while (prompt.length < 4600) prompt.push(...filler);
+    prompt.push(371, 153536, 150406, 149884, 220);
+    const leanNeedle = spawnSync(bin, ['generate', '--model', model, '--input-ids', JSON.stringify(prompt), '--steps', '6', '--mode', 'lean', '--spec', 'auto'], { encoding: 'utf8', timeout: remainingMs(deadline) });
+    checkRun('delphi generate lean 4.6k needle', leanNeedle);
+    expect((JSON.parse(leanNeedle.stdout) as Generated).output_ids.slice(0, code.length)).toEqual(code);
   });
 });
 
