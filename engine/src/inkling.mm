@@ -162,13 +162,22 @@ public:
     id<MTLBuffer> m_tg_val = nil, m_tg_row = nil, m_tg_sum = nil, m_out = nil;
     struct TreeSpec {
         uint32_t is_tree = 0;
-        uint32_t dep[16] = {};
-        uint32_t mask[16] = {};
-        uint32_t p1[16] = {};
-        uint32_t p2[16] = {};
-        uint32_t p3[16] = {};
+        uint32_t dep[64] = {};
+        uint32_t mask[64] = {};
+        uint32_t p1[64] = {};
+        uint32_t p2[64] = {};
+        uint32_t p3[64] = {};
     };
     TreeSpec active_tree{};
+    static constexpr uint32_t MAX_FAN = 32;
+    struct FanStep { bool active = false; uint32_t prefix = 0, stride = 0, qpos = 0; };
+    FanStep fan{};
+    bool full_local_kv = false;
+    bool m4_dense = true;
+    bool m4_experts = true;
+    id<MTLBuffer> fan_hist = nil, fan_meta = nil;
+    uint32_t fan_hist_stride = 0, fan_branches = 0;
+    id<MTLComputePipelineState> p_attend_fan = nil, p_fan_init = nil, p_fan_stage = nil, p_fan_commit = nil;
     uint32_t pending_conv_src[3] = {0, 0, 0};
     bool has_pending_conv = false;
     uint32_t pending_kv_pos0 = 0;
@@ -318,6 +327,10 @@ public:
         p_clip_kv_b = pipeline(gpu, @"clip_kv_store_batch");
         p_rel_b = pipeline(gpu, @"rel_bias_batch");
         p_attend_b = pipeline(gpu, @"attend_gated_batch");
+        p_attend_fan = pipeline(gpu, @"attend_gated_fan");
+        p_fan_init = pipeline(gpu, @"fan_conv_init");
+        p_fan_stage = pipeline(gpu, @"fan_conv_stage");
+        p_fan_commit = pipeline(gpu, @"fan_conv_commit");
         p_route_b = pipeline(gpu, @"route_batch");
         p_union = pipeline(gpu, @"build_expert_union");
         p_env4_g = pipeline(gpu, @"expert_nvfp4_grouped");
@@ -449,7 +462,7 @@ public:
         uint32_t core_len = c.core_end > c.core_start ? (c.core_end - c.core_start) : 1;
         for (uint32_t v = 0; v < visits; ++v) {
             uint32_t lid = v < c.layers ? v : (c.core_start + (v - c.layers) % core_len);
-            uint32_t cap = c.local[lid] ? std::min<uint32_t>(max_context, c.window + MAX_BATCH * 2) : max_context;
+            uint32_t cap = (c.local[lid] && !full_local_kv) ? std::min<uint32_t>(max_context, c.window + MAX_BATCH * 2) : max_context;
             kv_cap.push_back(cap);
             id<MTLBuffer> kb = [gpu.device newBufferWithLength:uint64_t(cap) * c.kv_heads * c.head_dim * 2 options:MTLResourceStorageModePrivate];
             id<MTLBuffer> vb = [gpu.device newBufferWithLength:uint64_t(cap) * c.kv_heads * c.head_dim * 2 options:MTLResourceStorageModePrivate];
@@ -1204,7 +1217,7 @@ public:
     struct OutlierPatchPP { uint32_t M, N, x_stride, y_stride, round_out; };
 
     void gemv12_m(const Mat12& m, id<MTLBuffer> in_buf, uint64_t in_off, uint32_t x_stride, id<MTLBuffer> out_buf, uint64_t out_off, uint32_t y_stride, uint32_t M, bool round_out = true) {
-        if (M >= 24 && has_m4_mpp && y_stride == m.rows && (m.cols % 32u) == 0u) {
+        if (M >= 24 && has_m4_mpp && m4_dense && y_stride == m.rows && (m.cols % 32u) == 0u) {
             uint32_t m_pad = (M + 31u) / 32u * 32u;
             CastBf16PP cp{M, m_pad, m.cols, x_stride};
             [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
@@ -1285,7 +1298,7 @@ public:
     struct M4Q4PP { uint32_t M, M_pad, N, K, ng, round_out; };
 
     void cast_f16(id<MTLBuffer> in_buf, uint64_t in_off, uint32_t x_stride, uint32_t xh_slot, uint32_t cols, uint32_t M) {
-        bool use_bf16 = (M >= 24 && has_m4_mpp);
+        bool use_bf16 = (M >= 24 && has_m4_mpp && m4_dense);
         uint32_t m_pad = use_bf16 ? ((M + 31u) / 32u * 32u) : M;
         CastF16PP cp{M, m_pad, cols, x_stride};
         [enc setComputePipelineState:use_bf16 ? p_f32_to_bf16 : p_f32_to_f16];
@@ -1297,7 +1310,7 @@ public:
 
     void gemv_q4_h(const MatQ4& m, uint32_t xh_slot, id<MTLBuffer> out_buf, uint64_t out_off, uint32_t y_stride, uint32_t M, bool round_out = true) {
         uint32_t ng = m.cols / 32;
-        if (M >= 24 && has_m4_mpp && y_stride == m.rows && (m.cols % 32u) == 0u) {
+        if (M >= 24 && has_m4_mpp && m4_dense && y_stride == m.rows && (m.cols % 32u) == 0u) {
             uint32_t m_pad = (M + 31u) / 32u * 32u;
             M4Q4PP mp{M, m_pad, m.rows, m.cols, ng, round_out ? 1u : 0u};
             [enc setComputePipelineState:p_m4_q4_mm32];
@@ -1497,7 +1510,7 @@ public:
         return out;
     }
 
-    struct ConvBP { uint32_t channels, dynamic, head_dim, rows, x_stride, dyn_stride, y_stride, is_tree; float scale; uint32_t p1[16], p2[16], p3[16]; };
+    struct ConvBP { uint32_t channels, dynamic, head_dim, rows, x_stride, dyn_stride, y_stride, is_tree; float scale; uint32_t p1[64], p2[64], p3[64]; };
     void sconv_run(id<MTLBuffer> xb, uint64_t xoff, uint64_t state_off, uint64_t woff, uint64_t dynoff, id<MTLBuffer> yb, uint64_t yoff, uint32_t channels, bool dynamic, uint32_t M, uint32_t x_stride, uint32_t dyn_stride, uint32_t y_stride) {
         ConvBP p{};
         p.channels = channels;
@@ -1563,7 +1576,7 @@ public:
         pending_kv_count = 0;
     }
 
-    struct ClipBP { uint32_t width, has_scale, pos0, is_local, n_floor, in_stride, out_stride, mode; float threshold, alpha; uint32_t is_tree; uint32_t dep[16]; };
+    struct ClipBP { uint32_t width, has_scale, pos0, is_local, n_floor, in_stride, out_stride, mode; float threshold, alpha; uint32_t is_tree; uint32_t dep[64]; };
     void clip_run(uint64_t in_off, uint64_t scale_off, uint64_t out_off, uint32_t rows, uint32_t width, float thr, uint32_t pos0, bool is_local, uint32_t in_stride, uint32_t out_stride, uint32_t mode, uint32_t M) {
         ClipBP p{};
         p.width = width; p.has_scale = scale_off ? 1u : 0u; p.pos0 = pos0; p.is_local = is_local ? 1u : 0u;
@@ -1591,6 +1604,64 @@ public:
     struct AttnP { uint32_t pos, start, kv_heads, group, head_dim, extent, kv_cap; float scale; };
     struct AttnBP { uint32_t pos0, rows, window, is_local, kv_heads, group, head_dim, extent, heads, q_stride, gate_stride, gate_off, sink_off, out_stride, kv_cap; float scale; uint32_t is_tree; uint32_t dep[16], mask[16]; };
     struct RelBP { uint32_t d_rel, extent, heads; };
+    struct AttnFanP { uint32_t prefix, stride, qpos, rows, window, is_local, kv_heads, group, extent, heads, q_stride, gate_stride, gate_off, sink_off, out_stride, kv_cap; float scale; };
+    struct FanConvMetaHost { uint32_t state_off, hist_off, width, pad; };
+    struct FanConvP { uint32_t branches, hist_stride, rows, pad; };
+
+    void fan_conv_encode(id<MTLComputePipelineState> ps, uint32_t rows) {
+        FanConvP p{fan_branches, fan_hist_stride, rows, 0};
+        [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+        [enc setComputePipelineState:ps];
+        [enc setBuffer:conv_buf offset:0 atIndex:0];
+        [enc setBuffer:fan_hist offset:0 atIndex:1];
+        [enc setBuffer:fan_meta offset:0 atIndex:2];
+        [enc setBytes:&p length:sizeof(p) atIndex:3];
+        grid2(conv_count, rows, 256);
+        [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+    }
+
+    bool fan_begin(uint32_t branches, uint32_t prefix, std::string& error) {
+        if (branches == 0 || branches > MAX_FAN) { error = "fan-out supports 1 to 32 branches"; return false; }
+        std::vector<FanConvMetaHost> meta;
+        uint32_t hist = 0;
+        uint32_t kvw = c.kv_heads * c.head_dim;
+        for (const auto& offs : conv_off) {
+            for (int s = 0; s < 4; ++s) {
+                uint32_t width = s < 2 ? kvw : c.hidden;
+                meta.push_back({uint32_t(offs[s] / 4), hist, width, 0});
+                hist += 3 * width;
+            }
+        }
+        fan_hist_stride = hist;
+        fan_branches = branches;
+        fan_meta = [gpu.device newBufferWithBytes:meta.data() length:meta.size() * sizeof(FanConvMetaHost) options:MTLResourceStorageModeShared];
+        fan_hist = [gpu.device newBufferWithLength:uint64_t(hist) * branches * 4 options:MTLResourceStorageModePrivate];
+        if (!fan_meta || !fan_hist) { error = "fan-out state allocation failed"; return false; }
+        id<MTLCommandBuffer> cb = [gpu.queue commandBuffer];
+        enc = [cb computeCommandEncoder];
+        fan_conv_encode(p_fan_init, branches);
+        [enc endEncoding];
+        gpu_seconds(cb);
+        fan.prefix = prefix;
+        fan.stride = branches;
+        active_tree = TreeSpec{};
+        active_tree.is_tree = 1u;
+        for (uint32_t b = 0; b < branches; ++b) {
+            active_tree.p3[b] = 3u + branches + 3u * b;
+            active_tree.p2[b] = active_tree.p3[b] + 1u;
+            active_tree.p1[b] = active_tree.p3[b] + 2u;
+        }
+        return true;
+    }
+
+    double fan_step(const uint32_t* toks, uint32_t step) {
+        fan.active = true;
+        fan.qpos = fan.prefix + step;
+        TreeSpec tree = active_tree;
+        double sec = step_rows(toks, fan.prefix + step * fan.stride, fan_branches, LOGITS_ALL, false, false, false, 0, 0, &tree);
+        fan.active = false;
+        return sec;
+    }
 
     uint32_t attention(const LayerWeights& w, uint32_t visit, uint32_t sq, uint32_t sk, uint32_t sv, uint32_t pos0, uint32_t M) {
         uint32_t H = c.hidden;
@@ -1642,8 +1713,9 @@ public:
         together = true;
         sconv_run(scratch, s_kraw, conv_off[visit][0], w.k_sconv, s_dynk, scratch, s_k, kvw, !w.local, M, kstr, kstr, kvw);
         sconv_run(scratch, s_vraw, conv_off[visit][1], w.v_sconv, s_dynv, scratch, s_v, kvw, !w.local, M, kstr, kstr, kvw);
-        clip_run(s_q, w.q_clip, s_qc, c.heads, c.head_dim, c.clip_qk, pos0, w.local, q_stride, qdim, 0, M);
-        clip_run(s_r, w.r_clip, s_rc, c.heads, c.d_rel, c.clip_rel, pos0, w.local, q_stride, rdim, 0, M);
+        uint32_t qpos0 = fan.active ? fan.qpos : pos0;
+        clip_run(s_q, w.q_clip, s_qc, c.heads, c.head_dim, c.clip_qk, qpos0, w.local, q_stride, qdim, 0, M);
+        clip_run(s_r, w.r_clip, s_rc, c.heads, c.d_rel, c.clip_rel, qpos0, w.local, q_stride, rdim, 0, M);
         together = false;
         [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
         together = true;
@@ -1657,7 +1729,19 @@ public:
         [enc setBytes:&rbp length:sizeof(rbp) atIndex:3];
         grid3((c.rel_extent + 255) / 256, c.heads, M, 256);
         together = false;
-        if (M == 1) {
+        if (fan.active) {
+            AttnFanP a{fan.prefix, fan.stride, fan.qpos, M, c.window, w.local ? 1u : 0u, c.kv_heads, c.heads / c.kv_heads, c.rel_extent, c.heads,
+                       qdim, q_stride, qdim + rdim, qdim * 2 + rdim, qdim, kv_cap[visit], 1.0f / std::sqrt(float(c.head_dim))};
+            [enc setComputePipelineState:p_attend_fan];
+            [enc setBuffer:scratch offset:s_qc atIndex:0];
+            [enc setBuffer:kcache[visit] offset:0 atIndex:1];
+            [enc setBuffer:vcache[visit] offset:0 atIndex:2];
+            [enc setBuffer:scratch offset:s_rel atIndex:3];
+            [enc setBuffer:scratch offset:s_qbundle atIndex:4];
+            [enc setBuffer:scratch offset:s_gated atIndex:5];
+            [enc setBytes:&a length:sizeof(a) atIndex:6];
+            grid2(c.heads, M, 128);
+        } else if (M == 1) {
             uint32_t start = w.local && pos0 + 1 > c.window ? pos0 + 1 - c.window : 0;
             AttnP a{pos0, start, c.kv_heads, c.heads / c.kv_heads, c.head_dim, c.rel_extent, kv_cap[visit], 1.0f / std::sqrt(float(c.head_dim))};
             [enc setComputePipelineState:p_attend];
@@ -1739,8 +1823,8 @@ public:
         if (M > 1) {
             uint32_t w13_g = fast_w13 ? (2 * I + 15) / 16 : (2 * I + 7) / 8;
             uint32_t w2_g = fast_w2 ? (H + 15) / 16 : (H + 7) / 8;
-            uint32_t w13_g5p = (M >= 24 && has_m4_mpp) ? (2 * I + 63) / 64 : w13_g;
-            uint32_t w2_g5p = (M >= 24 && has_m4_mpp) ? (H + 63) / 64 : w2_g;
+            uint32_t w13_g5p = (M >= 24 && has_m4_mpp && m4_experts) ? (2 * I + 63) / 64 : w13_g;
+            uint32_t w2_g5p = (M >= 24 && has_m4_mpp && m4_experts) ? (H + 63) / 64 : w2_g;
             UnionPP up{M, eff_top, c.experts, w13_g, w2_g, w13_g5p, w2_g5p};
             [enc setComputePipelineState:p_union];
             [enc setBuffer:scratch offset:s_ids atIndex:0];
@@ -1813,7 +1897,7 @@ public:
                 [enc setBuffer:scratch offset:out_off atIndex:12];
                 [enc setBytes:&p length:sizeof(p) atIndex:13];
                 [enc dispatchThreadgroupsWithIndirectBuffer:u_ind_b indirectBufferOffset:ibase + 16 threadsPerThreadgroup:MTLSizeMake(tpg, 1, 1)];
-                bool use_m4_g5p = (M >= 24 && has_m4_mpp);
+                bool use_m4_g5p = (M >= 24 && has_m4_mpp && m4_experts);
                 [enc setComputePipelineState:use_m4_g5p ? p_m4_nvfp4_g5p : (is_w2 ? p_env4_g5p_8 : p_env4_g5p_16)];
                 [enc setBuffer:file offset:is_w2 ? w.w2_w : w.w13_w atIndex:0];
                 [enc setBuffer:file offset:is_w2 ? w.w2_s : w.w13_s atIndex:1];
@@ -1830,7 +1914,7 @@ public:
                 [enc setBuffer:scratch offset:out_off atIndex:12];
                 [enc setBytes:&p length:sizeof(p) atIndex:13];
                 [enc dispatchThreadgroupsWithIndirectBuffer:u_ind_b indirectBufferOffset:ibase + 32 threadsPerThreadgroup:MTLSizeMake(use_m4_g5p ? 128 : tpg, 1, 1)];
-            } else if (!w.nvfp4 && fast && M >= 24 && has_m4_mpp) {
+            } else if (!w.nvfp4 && fast && M >= 24 && has_m4_mpp && m4_experts) {
                 ExpertGP p{rows, cols, per_row ? I : H, per_row ? H : 2 * I, per_row ? 1u : 0u, eff_top, 1u, 0u, is_w2 ? w.w2_eb : w.w13_eb, is_w2 ? w.w2_sb : w.w13_sb};
                 uint64_t ibase = is_w2 ? 48 : 0;
                 barrier();
@@ -1905,7 +1989,7 @@ public:
         run_expert(true, H, I, s_hq, s_houter, s_rows, true);
     }
 
-    struct CombineBP { uint32_t n, top, boundary, rows, is_tree; uint32_t p1[16], p2[16], p3[16]; };
+    struct CombineBP { uint32_t n, top, boundary, rows, is_tree; uint32_t p1[64], p2[64], p3[64]; };
     struct TapCopyP { uint32_t n4, tap_idx; };
 
     void copy_tap(uint32_t slot, uint32_t tap_idx, uint32_t M) {
@@ -2191,6 +2275,7 @@ public:
         if (pending_kv_count > 1) {
             kv_compact_encode();
         }
+        if (fan.active) fan_conv_encode(p_fan_stage, M);
         if (ingest_commit > 0 && mtp_ready) {
             mtp_ingest_encode(ingest_pos, ingest_commit, false, ingest_map);
         }
@@ -2239,6 +2324,7 @@ public:
             run_head_batch(hidden, M, lmode, full_logits);
         }
         if (auto_commit) conv_commit_encode(M);
+        if (fan.active) fan_conv_encode(p_fan_commit, M);
         [enc endEncoding];
         double seconds = gpu_seconds(cb);
         if (next_slot > PERSIST_SLOTS || tmp_slot > slots) { std::fprintf(stderr, "delphi: arena overflow %u/%u\n", next_slot, tmp_slot); std::exit(3); }
@@ -2855,6 +2941,103 @@ DecodeStats run_decode_pass(Engine& engine, const std::vector<uint32_t>& ids, ui
 
 }
 
+std::optional<std::vector<std::vector<uint32_t>>> parse_branch_ids(const std::string& text) {
+    NSData* data = [NSData dataWithBytes:text.data() length:text.size()];
+    id parsed = [NSJSONSerialization JSONObjectWithData:data options:0 error:nil];
+    if (![parsed isKindOfClass:[NSArray class]]) return std::nullopt;
+    NSArray* outer = static_cast<NSArray*>(parsed);
+    if (outer.count == 0 || outer.count > Engine::MAX_FAN) return std::nullopt;
+    std::vector<std::vector<uint32_t>> branches;
+    for (id branch in outer) {
+        if (![branch isKindOfClass:[NSArray class]] || static_cast<NSArray*>(branch).count == 0) return std::nullopt;
+        std::vector<uint32_t> ids;
+        for (id item in static_cast<NSArray*>(branch)) {
+            if (![item isKindOfClass:[NSNumber class]] || CFGetTypeID((__bridge CFTypeRef)item) == CFBooleanGetTypeID()) return std::nullopt;
+            double dv = static_cast<NSNumber*>(item).doubleValue;
+            if (!std::isfinite(dv) || dv < 0.0 || std::floor(dv) != dv || dv > double(UINT32_MAX)) return std::nullopt;
+            ids.push_back(static_cast<uint32_t>(static_cast<NSNumber*>(item).unsignedLongLongValue));
+        }
+        branches.push_back(std::move(ids));
+    }
+    return branches;
+}
+
+int fanout_command(int argc, char** argv) {
+    std::string error;
+    auto flags = parse_flags(argc, argv, {"--model", "--prefix-ids", "--branch-ids", "--steps", "--head", "--pack", "--mode"}, {"--bitwise"}, error);
+    if (!flags) return refuse(error);
+    auto steps = whole_flag(*flags, "--steps", 64, 1, 4000, error);
+    if (!steps) return refuse(error);
+    std::string head = flags->values.count("--head") ? flags->values["--head"] : "exact";
+    if (head != "exact" && head != "full") return refuse("--head must be exact or full");
+    std::string pack = flags->values.count("--pack") ? flags->values["--pack"] : "bf12";
+    if (pack != "bf12" && pack != "off") return refuse("--pack must be bf12 or off");
+    std::string mode = flags->values.count("--mode") ? flags->values["--mode"] : "exact";
+    if (mode != "exact" && mode != "lean" && mode != "turbo") return refuse("--mode must be exact, lean, or turbo");
+    if (!flags->values.count("--model") || !flags->values.count("--prefix-ids") || !flags->values.count("--branch-ids")) {
+        return refuse("fanout needs --model DIR, --prefix-ids JSON and --branch-ids JSON");
+    }
+    auto prefix_opt = parse_ids(flags->values["--prefix-ids"], error);
+    if (!prefix_opt) return refuse(error);
+    auto& prefix = *prefix_opt;
+    if (prefix.empty()) return refuse("--prefix-ids must hold at least one token id");
+    auto branches_opt = parse_branch_ids(flags->values["--branch-ids"]);
+    if (!branches_opt) return refuse("--branch-ids must be a JSON array of 1 to 32 non-empty arrays of non-negative integer token ids");
+    auto& branches = *branches_opt;
+    uint32_t B = uint32_t(branches.size());
+    size_t longest_head = 0;
+    for (const auto& b : branches) longest_head = std::max(longest_head, b.size());
+    uint64_t lockstep = longest_head - 1 + *steps;
+    Engine engine;
+    engine.full_local_kv = true;
+    engine.m4_dense = false;
+    bool bitwise = flags->switches.count("--bitwise") > 0;
+    engine.m4_experts = !bitwise;
+    if (!engine.load(flags->values["--model"], head == "exact", pack == "bf12", false, mode, error)) {
+        std::fprintf(stderr, "delphi: %s\n", error.c_str());
+        return 3;
+    }
+    if (prefix.size() + lockstep * B > engine.max_context) return refuse("prefix plus fanned-out branches exceeds 32768-token context");
+    uint64_t embed_rows = engine.T("embed.weight").shape[0];
+    for (uint32_t id : prefix) if (id >= embed_rows) return refuse("--prefix-ids holds a token id out of embedding range");
+    for (const auto& b : branches) for (uint32_t id : b) if (id >= embed_rows) return refuse("--branch-ids holds a token id out of embedding range");
+    engine.reset_state();
+    auto w0 = std::chrono::steady_clock::now();
+    for (size_t i = 0; i < prefix.size(); ) {
+        uint32_t chunk = uint32_t(std::min<size_t>(Engine::MAX_BATCH, prefix.size() - i));
+        engine.step_rows(prefix.data() + i, uint32_t(i), chunk, Engine::LOGITS_NONE, true, false, false);
+        i += chunk;
+    }
+    if (!engine.fan_begin(B, uint32_t(prefix.size()), error)) {
+        std::fprintf(stderr, "delphi: %s\n", error.c_str());
+        return 3;
+    }
+    auto w1 = std::chrono::steady_clock::now();
+    std::vector<std::vector<uint32_t>> out(B);
+    std::vector<uint32_t> toks(B);
+    double gpu = 0.0;
+    for (uint64_t s = 0; s < lockstep; ++s) {
+        for (uint32_t b = 0; b < B; ++b) toks[b] = s < branches[b].size() ? branches[b][s] : out[b].back();
+        gpu += engine.fan_step(toks.data(), uint32_t(s));
+        for (uint32_t b = 0; b < B; ++b) {
+            if (s + 1 >= branches[b].size() && out[b].size() < *steps) out[b].push_back(engine.chosen_at(b));
+        }
+    }
+    auto w2 = std::chrono::steady_clock::now();
+    double prefill_wall = std::chrono::duration<double>(w1 - w0).count();
+    double decode_wall = std::chrono::duration<double>(w2 - w1).count();
+    uint64_t generated = uint64_t(B) * *steps;
+    std::printf("{\"branches\": [");
+    for (uint32_t b = 0; b < B; ++b) {
+        std::printf(b ? ", {\"output_ids\": [" : "{\"output_ids\": [");
+        for (size_t i = 0; i < out[b].size(); ++i) std::printf(i ? ", %u" : "%u", out[b][i]);
+        std::printf("]}");
+    }
+    std::printf("], \"mode\": \"%s\", \"lossy\": %s, \"prefix_tokens\": %zu, \"branch_count\": %u, \"generated_tokens\": %llu, \"prefill_tokens_per_s\": %.3f, \"decode_tokens_per_s\": %.3f, \"decode_gpu_tokens_per_s\": %.3f, \"bitwise\": %s}\n",
+                mode.c_str(), mode != "exact" ? "true" : "false", prefix.size(), B, static_cast<unsigned long long>(generated),
+                prefix.size() / prefill_wall, generated / decode_wall, gpu > 0 ? generated / gpu : 0.0, (bitwise || B < 24) ? "true" : "false");
+    return 0;
+}
 int generate_command(int argc, char** argv) {
     std::string error;
     auto flags = parse_flags(argc, argv, {"--model", "--input-ids", "--steps", "--head", "--pack", "--spec", "--mode"}, {"--logprobs"}, error);

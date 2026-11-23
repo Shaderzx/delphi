@@ -9,11 +9,13 @@ const model = process.env.DELPHI_MODEL ?? join(homedir(), 'models', 'Inkling-2-M
 const CLEANUP_RESERVE_MS = 30_000;
 
 type Case = { text: string; input_ids: number[]; output_ids: number[] };
-type Fanout = { branches: { output_ids: number[] }[]; branch_count: number; generated_tokens: number; decode_tokens_per_s: number; mode: string; lossy: boolean };
+type Fanout = { branches: { output_ids: number[] }[]; branch_count: number; generated_tokens: number; decode_tokens_per_s: number; mode: string; lossy: boolean; bitwise: boolean };
 type Generated = { output_ids: number[] };
 
 const truth = JSON.parse(readFileSync(join(import.meta.dirname, '..', 'fixtures', 'g4-sglang-greedy.json'), 'utf8')) as { cases: Case[] };
 const story = truth.cases.find((c) => c.text.startsWith('Once upon a time'))!;
+const fibonacci = truth.cases.find((c) => c.text.startsWith('def fibonacci'))!;
+const prefix = [...story.input_ids, ...fibonacci.input_ids];
 const branchHeads = [...new Set(truth.cases.flatMap((c) => c.input_ids))].slice(0, 32).map((id) => [id]);
 
 function remainingMs(deadline: number): number {
@@ -37,8 +39,8 @@ function withBuiltDelphi<T>(deadline: number, fn: (bin: string) => T): T {
   }
 }
 
-function fanout(bin: string, branches: number[][], steps: number, deadline: number): Fanout {
-  const run = spawnSync(bin, ['fanout', '--model', model, '--prefix-ids', JSON.stringify(story.input_ids), '--branch-ids', JSON.stringify(branches), '--steps', String(steps)], { encoding: 'utf8', timeout: remainingMs(deadline) });
+function fanout(bin: string, branches: number[][], steps: number, deadline: number, extra: string[] = []): Fanout {
+  const run = spawnSync(bin, ['fanout', '--model', model, '--prefix-ids', JSON.stringify(prefix), '--branch-ids', JSON.stringify(branches), '--steps', String(steps), ...extra], { encoding: 'utf8', timeout: remainingMs(deadline) });
   checkRun('delphi fanout', run);
   return JSON.parse(run.stdout) as Fanout;
 }
@@ -61,23 +63,24 @@ test('delphi fanout refuses missing, empty or malformed branch lists', { timeout
   });
 });
 
-test('delphi fanout decodes each of 32 branches token-for-token like decoding that branch alone', { tags: ['model'], timeout: 1_800_000 }, () => {
+test('delphi fanout --bitwise decodes each of 32 branches token-for-token like decoding that branch alone', { tags: ['model'], timeout: 1_800_000 }, () => {
   const deadline = Date.now() + 1_800_000;
   const steps = 24;
   withBuiltDelphi(deadline, (bin) => {
-    const out = fanout(bin, branchHeads, steps, deadline);
+    const out = fanout(bin, branchHeads, steps, deadline, ['--bitwise']);
+    expect(out.bitwise).toBe(true);
     expect(out.branch_count).toBe(branchHeads.length);
     expect(out.mode).toBe('exact');
     expect(out.lossy).toBe(false);
     branchHeads.forEach((head, b) => {
-      const alone = spawnSync(bin, ['generate', '--model', model, '--input-ids', JSON.stringify([...story.input_ids, ...head]), '--steps', String(steps), '--spec', 'off'], { encoding: 'utf8', timeout: remainingMs(deadline) });
+      const alone = spawnSync(bin, ['generate', '--model', model, '--input-ids', JSON.stringify([...prefix, ...head]), '--steps', String(steps), '--spec', 'off'], { encoding: 'utf8', timeout: remainingMs(deadline) });
       checkRun(`delphi generate branch ${b}`, alone);
       expect(out.branches[b].output_ids).toEqual((JSON.parse(alone.stdout) as Generated).output_ids);
     });
   });
 });
 
-test('delphi fanout generates at least 200 exact tokens per second across 32 branches', { tags: ['model'], timeout: 900_000 }, () => {
+test('delphi fanout generates at least 200 tokens per second across 32 branches with Metal 4 expert kernels', { tags: ['model'], timeout: 900_000 }, () => {
   const deadline = Date.now() + 900_000;
   const steps = 128;
   withBuiltDelphi(deadline, (bin) => {
@@ -86,6 +89,7 @@ test('delphi fanout generates at least 200 exact tokens per second across 32 bra
     expect(out.generated_tokens).toBe(32 * steps);
     expect(out.branches.every((b) => b.output_ids.length === steps)).toBe(true);
     expect(out.lossy).toBe(false);
+    expect(out.bitwise).toBe(false);
     expect(out.decode_tokens_per_s).toBeGreaterThanOrEqual(200);
   });
 });
