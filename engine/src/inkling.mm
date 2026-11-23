@@ -95,6 +95,7 @@ float f(NSDictionary* d, NSString* k) { return [d[k] floatValue]; }
 class Engine {
 public:
     static constexpr uint32_t MAX_BATCH = 128;
+    static constexpr uint32_t TENSOR_MIN_ROWS = 24;
     static constexpr uint32_t MAX_LOGITS_BATCH = 64;
     static constexpr uint32_t PERSIST_SLOTS = 64;
     enum LogitsMode { LOGITS_NONE = 0, LOGITS_LAST = 1, LOGITS_ALL = 2 };
@@ -1221,7 +1222,7 @@ public:
     struct OutlierPatchPP { uint32_t M, N, x_stride, y_stride, round_out; };
 
     void gemv12_m(const Mat12& m, id<MTLBuffer> in_buf, uint64_t in_off, uint32_t x_stride, id<MTLBuffer> out_buf, uint64_t out_off, uint32_t y_stride, uint32_t M, bool round_out = true) {
-        if (M >= 24 && has_m4_mpp && m4_dense && y_stride == m.rows && (m.cols % 32u) == 0u) {
+        if (M >= TENSOR_MIN_ROWS && has_m4_mpp && m4_dense && y_stride == m.rows && (m.cols % 32u) == 0u) {
             uint32_t m_pad = (M + 31u) / 32u * 32u;
             CastBf16PP cp{M, m_pad, m.cols, x_stride};
             [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
@@ -1302,7 +1303,7 @@ public:
     struct M4Q4PP { uint32_t M, M_pad, N, K, ng, round_out; };
 
     void cast_f16(id<MTLBuffer> in_buf, uint64_t in_off, uint32_t x_stride, uint32_t xh_slot, uint32_t cols, uint32_t M) {
-        bool use_bf16 = (M >= 24 && has_m4_mpp && m4_dense);
+        bool use_bf16 = (M >= TENSOR_MIN_ROWS && has_m4_mpp && m4_dense);
         uint32_t m_pad = use_bf16 ? ((M + 31u) / 32u * 32u) : M;
         CastF16PP cp{M, m_pad, cols, x_stride};
         [enc setComputePipelineState:use_bf16 ? p_f32_to_bf16 : p_f32_to_f16];
@@ -1314,7 +1315,7 @@ public:
 
     void gemv_q4_h(const MatQ4& m, uint32_t xh_slot, id<MTLBuffer> out_buf, uint64_t out_off, uint32_t y_stride, uint32_t M, bool round_out = true) {
         uint32_t ng = m.cols / 32;
-        if (M >= 24 && has_m4_mpp && m4_dense && y_stride == m.rows && (m.cols % 32u) == 0u) {
+        if (M >= TENSOR_MIN_ROWS && has_m4_mpp && m4_dense && y_stride == m.rows && (m.cols % 32u) == 0u) {
             uint32_t m_pad = (M + 31u) / 32u * 32u;
             M4Q4PP mp{M, m_pad, m.rows, m.cols, ng, round_out ? 1u : 0u};
             [enc setComputePipelineState:p_m4_q4_mm32];
@@ -1623,10 +1624,15 @@ public:
         [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
     }
 
+    bool fan_shape_supported(std::string& error) const {
+        if (c.heads % c.kv_heads != 0 || c.heads / c.kv_heads > 4 || c.head_dim != 128) { error = "fan-out attention needs at most 4 query heads per key head and 128-wide heads"; return false; }
+        return true;
+    }
+
     bool fan_begin(uint32_t branches, uint32_t prefix, std::string& error) {
         if (!fan_capacity) { error = "engine was not loaded for fan-out"; return false; }
         if (branches == 0 || branches > MAX_FAN) { error = "fan-out supports 1 to 64 branches"; return false; }
-        if (c.heads % c.kv_heads != 0 || c.heads / c.kv_heads > 4 || c.head_dim != 128) { error = "fan-out attention needs at most 4 query heads per key head and 128-wide heads"; return false; }
+        if (!fan_shape_supported(error)) return false;
         std::vector<FanConvMetaHost> meta;
         uint32_t kvw = c.kv_heads * c.head_dim;
         for (const auto& offs : conv_off) {
@@ -1833,8 +1839,8 @@ public:
         if (M > 1) {
             uint32_t w13_g = fast_w13 ? (2 * I + 15) / 16 : (2 * I + 7) / 8;
             uint32_t w2_g = fast_w2 ? (H + 15) / 16 : (H + 7) / 8;
-            uint32_t w13_g5p = (M >= 24 && has_m4_mpp && m4_experts) ? (2 * I + 63) / 64 : w13_g;
-            uint32_t w2_g5p = (M >= 24 && has_m4_mpp && m4_experts) ? (H + 63) / 64 : w2_g;
+            uint32_t w13_g5p = (M >= TENSOR_MIN_ROWS && has_m4_mpp && m4_experts) ? (2 * I + 63) / 64 : w13_g;
+            uint32_t w2_g5p = (M >= TENSOR_MIN_ROWS && has_m4_mpp && m4_experts) ? (H + 63) / 64 : w2_g;
             UnionPP up{M, eff_top, c.experts, w13_g, w2_g, w13_g5p, w2_g5p};
             [enc setComputePipelineState:p_union];
             [enc setBuffer:scratch offset:s_ids atIndex:0];
@@ -1907,7 +1913,7 @@ public:
                 [enc setBuffer:scratch offset:out_off atIndex:12];
                 [enc setBytes:&p length:sizeof(p) atIndex:13];
                 [enc dispatchThreadgroupsWithIndirectBuffer:u_ind_b indirectBufferOffset:ibase + 16 threadsPerThreadgroup:MTLSizeMake(tpg, 1, 1)];
-                bool use_m4_g5p = (M >= 24 && has_m4_mpp && m4_experts);
+                bool use_m4_g5p = (M >= TENSOR_MIN_ROWS && has_m4_mpp && m4_experts);
                 [enc setComputePipelineState:use_m4_g5p ? p_m4_nvfp4_g5p : (is_w2 ? p_env4_g5p_8 : p_env4_g5p_16)];
                 [enc setBuffer:file offset:is_w2 ? w.w2_w : w.w13_w atIndex:0];
                 [enc setBuffer:file offset:is_w2 ? w.w2_s : w.w13_s atIndex:1];
@@ -1924,7 +1930,7 @@ public:
                 [enc setBuffer:scratch offset:out_off atIndex:12];
                 [enc setBytes:&p length:sizeof(p) atIndex:13];
                 [enc dispatchThreadgroupsWithIndirectBuffer:u_ind_b indirectBufferOffset:ibase + 32 threadsPerThreadgroup:MTLSizeMake(use_m4_g5p ? 128 : tpg, 1, 1)];
-            } else if (!w.nvfp4 && fast && M >= 24 && has_m4_mpp && m4_experts) {
+            } else if (!w.nvfp4 && fast && M >= TENSOR_MIN_ROWS && has_m4_mpp && m4_experts) {
                 ExpertGP p{rows, cols, per_row ? I : H, per_row ? H : 2 * I, per_row ? 1u : 0u, eff_top, 1u, 0u, is_w2 ? w.w2_eb : w.w13_eb, is_w2 ? w.w2_sb : w.w13_sb};
                 uint64_t ibase = is_w2 ? 48 : 0;
                 barrier();
@@ -2973,7 +2979,7 @@ std::optional<std::vector<std::vector<uint32_t>>> parse_branch_ids(const std::st
 
 int fanout_command(int argc, char** argv) {
     std::string error;
-    auto flags = parse_flags(argc, argv, {"--model", "--prefix-ids", "--branch-ids", "--steps", "--head", "--pack", "--mode"}, {"--tensor-experts", "--tensor-dense"}, error);
+    auto flags = parse_flags(argc, argv, {"--model", "--prefix-ids", "--branch-ids", "--steps", "--head", "--pack", "--mode"}, {"--tensor-experts"}, error);
     if (!flags) return refuse(error);
     auto steps = whole_flag(*flags, "--steps", 64, 1, 4000, error);
     if (!steps) return refuse(error);
@@ -3004,10 +3010,13 @@ int fanout_command(int argc, char** argv) {
     engine.max_context = uint32_t((kv_needed + 255) / 256 * 256);
     engine.m4_dense = false;
     bool tensor_experts = flags->switches.count("--tensor-experts") > 0;
-    bool tensor_dense = flags->switches.count("--tensor-dense") > 0;
-    bool solo_identical = !(tensor_experts || tensor_dense) || B < 24;
+    bool solo_identical = !tensor_experts || B < Engine::TENSOR_MIN_ROWS;
     engine.m4_experts = false;
     if (!engine.load(flags->values["--model"], head == "exact", pack == "bf12", false, mode, error)) {
+        std::fprintf(stderr, "delphi: %s\n", error.c_str());
+        return 3;
+    }
+    if (!engine.fan_shape_supported(error)) {
         std::fprintf(stderr, "delphi: %s\n", error.c_str());
         return 3;
     }
@@ -3022,7 +3031,6 @@ int fanout_command(int argc, char** argv) {
         i += chunk;
     }
     engine.m4_experts = tensor_experts;
-    engine.m4_dense = tensor_dense;
     if (!engine.fan_begin(B, uint32_t(prefix.size()), error)) {
         std::fprintf(stderr, "delphi: %s\n", error.c_str());
         return 3;
@@ -3049,9 +3057,9 @@ int fanout_command(int argc, char** argv) {
         for (size_t i = 0; i < out[b].size(); ++i) std::printf(i ? ", %u" : "%u", out[b][i]);
         std::printf("]}");
     }
-    std::printf("], \"mode\": \"%s\", \"lossy\": %s, \"prefix_tokens\": %zu, \"branch_count\": %u, \"generated_tokens\": %llu, \"prefill_tokens_per_s\": %.3f, \"decode_tokens_per_s\": %.3f, \"decode_gpu_tokens_per_s\": %.3f, \"per_branch_tokens_per_s\": %.3f, \"lockstep_steps\": %llu, \"ms_per_step\": %.3f, \"solo_identical\": %s}\n",
+    std::printf("], \"mode\": \"%s\", \"lossy\": %s, \"prefix_tokens\": %zu, \"branch_count\": %u, \"generated_tokens\": %llu, \"prefill_tokens_per_s\": %.3f, \"decode_tokens_per_s\": %.3f, \"decode_gpu_tokens_per_s\": %.3f, \"per_branch_tokens_per_s\": %.3f, \"end_to_end_tokens_per_s\": %.3f, \"lockstep_steps\": %llu, \"ms_per_step\": %.3f, \"solo_identical\": %s}\n",
                 mode.c_str(), (mode != "exact" || !solo_identical) ? "true" : "false", prefix.size(), B, static_cast<unsigned long long>(generated),
-                prefix.size() / prefill_wall, generated / decode_wall, gpu > 0 ? generated / gpu : 0.0, generated / decode_wall / B,
+                prefix.size() / prefill_wall, generated / decode_wall, gpu > 0 ? generated / gpu : 0.0, generated / decode_wall / B, generated / (prefill_wall + decode_wall),
                 static_cast<unsigned long long>(lockstep), decode_wall * 1000.0 / double(lockstep), solo_identical ? "true" : "false");
     return 0;
 }
