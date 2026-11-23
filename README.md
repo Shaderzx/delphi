@@ -30,6 +30,23 @@ Qualification highlights (exact mode unless noted):
   - `--mode lean`: Tail-free `half4` 8/2-lane INT4-g32 dense attention and controller projections + Metal 4 `bfloat` Q4 `matmul2d` prefill (`M>=24`) with exact BF16 router, all 8 experts, and certified head. Preserves 64/64 exact tokens on `fibonacci` and `copy_code` and 5/5 exact 4.6K needle retrieval (`390.9 tok/s` prefill) while cutting non-mmap footprint by 620 MiB.
   - `--mode turbo`: `lean` + top-3 expert routing. Preserves Paris answer, clean recursive Python on `fibonacci`, and fluent prose on `story` while hitting **140.1 fib / 192.5 copy_code / 575.6 p160 / 755.6 prefill tok/s** (does not guarantee long-context needle retrieval).
 
+## Fan-out decoding (one prompt, many continuations, one weight read)
+
+`delphi fanout` decodes up to 64 continuations of one shared prefix together. Every step feeds one token per branch through the model as a single batch, so each weight byte read from memory serves every branch at once. Use it when one request needs many independent continuations: the sections of an outlined answer, several candidate completions, or a batch of short tasks over the same context.
+
+Aggregate decode tok/s across all branches (`delphi fanout`, 35-token prefix, 128 steps per branch, median of 3, logged in [bench/ledger.jsonl](bench/ledger.jsonl)):
+
+| Branches | `exact` | `exact --bitwise` | `lean` (lossy) | `turbo` (lossy) |
+|---:|---:|---:|---:|---:|
+| 1 | 43.4 | 43.5 | 54.8 | 72.4 |
+| 8 | 124.9 | 125.0 | 136.1 | 233.5 |
+| 16 | 141.8 | 142.3 | 156.1 | 272.3 |
+| 32 | **201.1** | 152.5 | 230.2 | 335.4 |
+| 64 | **245.8** | 153.2 | 290.6 | 400.7 |
+
+How it works: the prefix is prefilled once. Branch tokens are stored interleaved after it (step `s` of branch `b` lives at slot `prefix + s * branches + b`), and a dedicated attention kernel maps each branch's logical positions onto that layout, so every branch attends to the prefix plus only its own tokens. The short convolutions keep a three-token history per branch, staged into the existing tree-verify parent slots each step, so the batched kernels run unchanged.
+
+Numerics: with fewer than 24 branches, or with `--bitwise`, every branch is token-for-token identical to decoding that branch alone with `delphi generate --spec off` (the e2e suite checks 64 of 64 branches). From 24 branches up, the default run uses the Metal 4 `matmul2d` expert kernels, which round expert products differently from the one-row kernels; branches stay on the same model but can pick a different token after a dozen or more steps (2 of 32 branches by token 24 in our measurement). The JSON reports `"bitwise": true` exactly when the run is token-identical to solo decoding. Fan-out always keeps the dense projections on the one-row-identical kernels.
 ## Building and running
 
 ```bash
@@ -48,6 +65,15 @@ bash engine/build.sh /tmp/delphi-bin
 
 Flags: `--mode exact|lean|turbo` (default `exact`), `--spec off|lookup|mtp|auto` (default `auto`), `--head exact|full` (default `exact`), `--pack bf12|off` (default `bf12`).
 
+```bash
+/tmp/delphi-bin/delphi fanout \
+  --model ~/models/Inkling-2-Mini \
+  --prefix-ids '[1548, 43997, 7, 77, 1546, 198]' \
+  --branch-ids '[[13], [220, 198], [1548]]' \
+  --steps 64
+```
+
+`delphi fanout` flags: `--prefix-ids JSON` (shared prefix), `--branch-ids JSON` (1 to 64 non-empty token arrays, one per branch), `--steps N` (tokens generated per branch, default 64), `--bitwise` (keep every branch token-identical to solo decoding at any width), plus `--mode`, `--head` and `--pack` as above.
 Exact means token-identical to Delphi's own plain greedy decoding on the shipped weights. Faster modes that change the output are opt-in and labelled (`"lossy": true` in JSON output).
 
 ## Using Delphi in your project
