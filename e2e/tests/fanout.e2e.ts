@@ -16,7 +16,8 @@ const truth = JSON.parse(readFileSync(join(import.meta.dirname, '..', 'fixtures'
 const story = truth.cases.find((c) => c.text.startsWith('Once upon a time'))!;
 const fibonacci = truth.cases.find((c) => c.text.startsWith('def fibonacci'))!;
 const prefix = [...story.input_ids, ...fibonacci.input_ids];
-const branchHeads = [...new Set(truth.cases.flatMap((c) => c.input_ids))].slice(0, 32).map((id) => [id]);
+const fixtureTokens = [...new Set(truth.cases.flatMap((c) => c.input_ids))].slice(0, 32);
+const branchHeads = [...fixtureTokens.map((id) => [id]), ...fixtureTokens.map((id, i) => [id, fixtureTokens[(i + 1) % fixtureTokens.length]])];
 
 function remainingMs(deadline: number): number {
   const left = deadline - Date.now() - CLEANUP_RESERVE_MS;
@@ -48,7 +49,8 @@ function fanout(bin: string, branches: number[][], steps: number, deadline: numb
 test('delphi fanout refuses missing, empty or malformed branch lists', { timeout: 300_000 }, () => {
   const deadline = Date.now() + 300_000;
   withBuiltDelphi(deadline, (bin) => {
-    for (const bad of ['[]', '[[]]', '[1, 2]', '[[1], [-3]]', 'not-json']) {
+    const tooMany = JSON.stringify(Array.from({ length: 65 }, () => [1]));
+    for (const bad of ['[]', '[[]]', '[1, 2]', '[[1], [-3]]', 'not-json', tooMany]) {
       const run = spawnSync(bin, ['fanout', '--model', '/nonexistent', '--prefix-ids', '[1]', '--branch-ids', bad], { encoding: 'utf8', timeout: remainingMs(deadline) });
       if (run.error) throw run.error;
       expect(run.status).toBe(2);
@@ -63,7 +65,7 @@ test('delphi fanout refuses missing, empty or malformed branch lists', { timeout
   });
 });
 
-test('delphi fanout --bitwise decodes each of 32 branches token-for-token like decoding that branch alone', { tags: ['model'], timeout: 1_800_000 }, () => {
+test('delphi fanout --bitwise decodes each of 64 branches token-for-token like decoding that branch alone', { tags: ['model'], timeout: 1_800_000 }, () => {
   const deadline = Date.now() + 1_800_000;
   const steps = 24;
   withBuiltDelphi(deadline, (bin) => {
@@ -80,13 +82,13 @@ test('delphi fanout --bitwise decodes each of 32 branches token-for-token like d
   });
 });
 
-test('delphi fanout generates at least 200 tokens per second across 32 branches with Metal 4 expert kernels', { tags: ['model'], timeout: 900_000 }, () => {
+test('delphi fanout generates at least 200 tokens per second across 64 branches with Metal 4 expert kernels', { tags: ['model'], timeout: 900_000 }, () => {
   const deadline = Date.now() + 900_000;
   const steps = 128;
   withBuiltDelphi(deadline, (bin) => {
     const out = fanout(bin, branchHeads, steps, deadline);
-    expect(out.branch_count).toBe(32);
-    expect(out.generated_tokens).toBe(32 * steps);
+    expect(out.branch_count).toBe(branchHeads.length);
+    expect(out.generated_tokens).toBe(branchHeads.length * steps);
     expect(out.branches.every((b) => b.output_ids.length === steps)).toBe(true);
     expect(out.lossy).toBe(false);
     expect(out.bitwise).toBe(false);
