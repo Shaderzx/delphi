@@ -177,6 +177,7 @@ public:
     struct FanStep { bool active = false; uint32_t prefix = 0, stride = 0, qpos = 0, ring = 0; TreeSpec tree{}; };
     FanStep fan{};
     bool fan_capacity = false;
+    bool tensor_prefill = false;
     bool m4_dense = true;
     bool m4_experts = true;
     id<MTLBuffer> fan_meta = nil;
@@ -2675,7 +2676,8 @@ DecodeStats run_decode_pass(Engine& engine, const std::vector<uint32_t>& ids, ui
     DecodeStats st;
     engine.reset_state();
     bool use_mtp = engine.mtp_ready && (spec == "mtp" || spec == "auto") && !logprobs;
-    bool use_batch_prefill = (spec != "off") && !logprobs;
+    bool use_batch_prefill = (spec != "off" || engine.tensor_prefill) && !logprobs;
+    engine.m4_dense = engine.m4_experts = engine.tensor_prefill;
     uint32_t pos = 0;
     auto w0 = std::chrono::steady_clock::now();
     if (use_batch_prefill && (ids.size() > 1 || use_mtp)) {
@@ -2692,6 +2694,7 @@ DecodeStats run_decode_pass(Engine& engine, const std::vector<uint32_t>& ids, ui
             engine.step(ids[i], pos++, i + 1 == ids.size(), logprobs);
         }
     }
+    engine.m4_dense = engine.m4_experts = false;
     auto w1 = std::chrono::steady_clock::now();
     st.out.reserve(steps);
     std::vector<uint32_t> history = ids;
@@ -3065,7 +3068,7 @@ int fanout_command(int argc, char** argv) {
 }
 int generate_command(int argc, char** argv) {
     std::string error;
-    auto flags = parse_flags(argc, argv, {"--model", "--input-ids", "--steps", "--head", "--pack", "--spec", "--mode"}, {"--logprobs"}, error);
+    auto flags = parse_flags(argc, argv, {"--model", "--input-ids", "--steps", "--head", "--pack", "--spec", "--mode", "--prefill"}, {"--logprobs"}, error);
     if (!flags) return refuse(error);
     auto steps = whole_flag(*flags, "--steps", 8, 1, 4000, error);
     if (!steps) return refuse(error);
@@ -3077,6 +3080,8 @@ int generate_command(int argc, char** argv) {
     if (spec != "off" && spec != "lookup" && spec != "mtp" && spec != "auto") return refuse("--spec must be off, lookup, mtp, or auto");
     std::string mode = flags->values.count("--mode") ? flags->values["--mode"] : "exact";
     if (mode != "exact" && mode != "lean" && mode != "turbo") return refuse("--mode must be exact, lean, or turbo");
+    std::string prefill = flags->values.count("--prefill") ? flags->values["--prefill"] : (mode == "exact" ? "exact" : "tensor");
+    if (prefill != "exact" && prefill != "tensor") return refuse("--prefill must be exact or tensor");
     if (!flags->values.count("--model") || !flags->values.count("--input-ids")) return refuse("generate needs --model DIR and --input-ids JSON");
     auto ids_opt = parse_ids(flags->values["--input-ids"], error);
     if (!ids_opt) return refuse(error);
@@ -3097,11 +3102,12 @@ int generate_command(int argc, char** argv) {
     for (uint32_t id : ids) {
         if (id >= embed_rows) return refuse("input token id out of embedding range");
     }
+    engine.tensor_prefill = prefill == "tensor";
     std::string steps_json;
     DecodeStats st = run_decode_pass(engine, ids, *steps, spec, logprobs, &steps_json);
     double dec_toks = *steps > 1 ? double(*steps - 1) : 0.0;
     double acc_per_step = st.verify_steps ? double(st.spec_tokens) / double(st.verify_steps) : 1.0;
-    bool is_lossy = mode != "exact";
+    bool is_lossy = mode != "exact" || engine.tensor_prefill;
     std::printf("{\"output_ids\": [");
     for (size_t i = 0; i < st.out.size(); ++i) std::printf(i ? ", %u" : "%u", st.out[i]);
     std::printf("], \"mode\": \"%s\", \"lossy\": %s, \"prompt_tokens\": %zu, \"prefill_tokens_per_s\": %.3f, \"decode_tokens_per_s\": %.3f, \"decode_gpu_tokens_per_s\": %.3f, \"verify_steps\": %llu, \"accepted_per_step\": %.3f%s%s%s}\n",
@@ -3114,7 +3120,7 @@ int generate_command(int argc, char** argv) {
 
 int bench_command(int argc, char** argv) {
     std::string error;
-    auto flags = parse_flags(argc, argv, {"--model", "--input-ids", "--steps", "--repeats", "--warmup", "--head", "--pack", "--spec", "--mode"}, {}, error);
+    auto flags = parse_flags(argc, argv, {"--model", "--input-ids", "--steps", "--repeats", "--warmup", "--head", "--pack", "--spec", "--mode", "--prefill"}, {}, error);
     if (!flags) return refuse(error);
     auto steps = whole_flag(*flags, "--steps", 64, 2, 4000, error);
     auto repeats = steps ? whole_flag(*flags, "--repeats", 6, 1, 100, error) : std::nullopt;
@@ -3128,6 +3134,8 @@ int bench_command(int argc, char** argv) {
     if (spec != "off" && spec != "lookup" && spec != "mtp" && spec != "auto") return refuse("--spec must be off, lookup, mtp, or auto");
     std::string mode = flags->values.count("--mode") ? flags->values["--mode"] : "exact";
     if (mode != "exact" && mode != "lean" && mode != "turbo") return refuse("--mode must be exact, lean, or turbo");
+    std::string prefill = flags->values.count("--prefill") ? flags->values["--prefill"] : (mode == "exact" ? "exact" : "tensor");
+    if (prefill != "exact" && prefill != "tensor") return refuse("--prefill must be exact or tensor");
     if (!flags->values.count("--model") || !flags->values.count("--input-ids")) return refuse("bench needs --model DIR and --input-ids JSON");
     auto ids_opt = parse_ids(flags->values["--input-ids"], error);
     if (!ids_opt) return refuse(error);
@@ -3146,6 +3154,7 @@ int bench_command(int argc, char** argv) {
     for (uint32_t id : ids) {
         if (id >= embed_rows) return refuse("input token id out of embedding range");
     }
+    engine.tensor_prefill = prefill == "tensor";
     std::vector<double> wall_tps, gpu_tps, prefill_tps, gpu_ms_tok;
     std::vector<uint32_t> ref_out;
     uint64_t ref_vsteps = 0;
@@ -3169,7 +3178,7 @@ int bench_command(int argc, char** argv) {
         }
     }
     std::string hash = hex64(fnv1a(ref_out.data(), ref_out.size() * sizeof(uint32_t)));
-    bool is_lossy = mode != "exact";
+    bool is_lossy = mode != "exact" || engine.tensor_prefill;
     std::printf("{\"mode\": \"%s\", \"lossy\": %s, \"prompt_tokens\": %zu, \"steps\": %llu, \"repeats\": %llu, \"output_hash\": \"%s\", \"verify_steps\": %llu, \"accepted_per_step\": %.3f, \"prefill_tokens_per_s_median\": %.3f, \"decode_tokens_per_s_median\": %.3f, \"decode_gpu_tokens_per_s_median\": %.3f, \"gpu_ms_per_token_median\": %.3f, \"decode_gpu_runs\": [",
                 mode.c_str(), is_lossy ? "true" : "false",
                 ids.size(), static_cast<unsigned long long>(*steps), static_cast<unsigned long long>(*repeats), hash.c_str(),

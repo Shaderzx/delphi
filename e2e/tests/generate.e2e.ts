@@ -15,6 +15,7 @@ type Generated = { output_ids: number[]; prompt_tokens: number; decode_tokens_pe
 const truth = JSON.parse(readFileSync(join(import.meta.dirname, '..', 'fixtures', 'g4-sglang-greedy.json'), 'utf8')) as { cases: Case[] };
 const fibonacci = truth.cases.find((c) => c.text.startsWith('def fibonacci'))!;
 const paris = truth.cases.find((c) => c.text.startsWith('The capital of France'))!;
+const chat = JSON.parse(readFileSync(join(import.meta.dirname, '..', 'fixtures', 'chat-prompts.json'), 'utf8')) as { cases: { name: string; input_ids: number[] }[] };
 
 function remainingMs(deadline: number): number {
   const left = deadline - Date.now() - CLEANUP_RESERVE_MS;
@@ -243,4 +244,58 @@ test('delphi generate picks the same 12 greedy tokens as the numpy oracle on the
   const expected = (JSON.parse(oracle.stdout) as { output_ids: number[] }).output_ids;
   expect(expected.slice(0, 5)).toEqual(paris.output_ids.slice(0, 5));
   expect(generate(paris.input_ids, steps, deadline).output_ids).toEqual(expected);
+});
+
+function generated(bin: string, ids: number[], steps: number, args: string[], deadline: number): number[] {
+  const run = spawnSync(bin, ['generate', '--model', model, '--input-ids', JSON.stringify(ids), '--steps', String(steps), ...args], { encoding: 'utf8', timeout: remainingMs(deadline) });
+  checkRun(`delphi generate ${args.join(' ')}`, run);
+  return (JSON.parse(run.stdout) as Generated).output_ids;
+}
+
+test('delphi generate exact mode matches --spec off token-for-token for 96 steps under --spec auto, mtp and lookup on chat prompts of 24 or more tokens', { tags: ['model'], timeout: 1_500_000 }, () => {
+  const deadline = Date.now() + 1_500_000;
+  withBuiltDelphi(deadline, (bin) => {
+    for (const c of chat.cases) {
+      expect(c.input_ids.length).toBeGreaterThanOrEqual(24);
+      const plain = generated(bin, c.input_ids, 96, ['--spec', 'off'], deadline);
+      for (const spec of ['auto', 'mtp', 'lookup']) {
+        expect(generated(bin, c.input_ids, 96, ['--spec', spec], deadline)).toEqual(plain);
+      }
+    }
+  });
+});
+
+test('delphi generate --mode lean and --mode turbo match their own --spec off token-for-token for 96 steps on chat prompts of 24 or more tokens', { tags: ['model'], timeout: 1_500_000 }, () => {
+  const deadline = Date.now() + 1_500_000;
+  withBuiltDelphi(deadline, (bin) => {
+    for (const mode of ['lean', 'turbo']) {
+      for (const c of chat.cases.slice(0, 2)) {
+        const plain = generated(bin, c.input_ids, 96, ['--mode', mode, '--spec', 'off'], deadline);
+        expect(generated(bin, c.input_ids, 96, ['--mode', mode, '--spec', 'auto'], deadline)).toEqual(plain);
+      }
+    }
+  });
+});
+
+test('delphi generate --prefill tensor reads a chat prompt faster in exact mode, reports itself lossy, its speculation still matches its own --spec off, and other --prefill values are refused', { tags: ['model'], timeout: 900_000 }, () => {
+  const deadline = Date.now() + 900_000;
+  const c = chat.cases[0];
+  withBuiltDelphi(deadline, (bin) => {
+    const run = (args: string[]): Generated & { prefill_tokens_per_s: number } => {
+      const r = spawnSync(bin, ['generate', '--model', model, '--input-ids', JSON.stringify(c.input_ids), '--steps', '96', ...args], { encoding: 'utf8', timeout: remainingMs(deadline) });
+      checkRun(`delphi generate ${args.join(' ')}`, r);
+      return JSON.parse(r.stdout) as Generated & { prefill_tokens_per_s: number };
+    };
+    const plain = run(['--spec', 'off']);
+    const fastPlain = run(['--spec', 'off', '--prefill', 'tensor']);
+    const fastSpec = run(['--spec', 'auto', '--prefill', 'tensor']);
+    expect(plain.lossy).toBe(false);
+    expect(fastPlain.lossy).toBe(true);
+    expect(fastSpec.lossy).toBe(true);
+    expect(fastSpec.output_ids).toEqual(fastPlain.output_ids);
+    expect(fastPlain.prefill_tokens_per_s).toBeGreaterThan(plain.prefill_tokens_per_s);
+    const bad = spawnSync(bin, ['generate', '--model', model, '--input-ids', JSON.stringify(c.input_ids), '--prefill', 'bogus'], { encoding: 'utf8', timeout: remainingMs(deadline) });
+    expect(bad.status).toBe(2);
+    expect(bad.stderr).toContain('--prefill');
+  });
 });

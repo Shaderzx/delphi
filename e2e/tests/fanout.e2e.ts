@@ -187,7 +187,7 @@ test('delphi fanout --mode lean matches lean solo decoding token-for-token acros
     expect(out.lossy).toBe(true);
     expect(out.solo_identical).toBe(true);
     heads.forEach((head, b) => {
-      const alone = spawnSync(bin, ['generate', '--model', model, '--input-ids', JSON.stringify([...prefix, ...head]), '--steps', String(steps), '--spec', 'off', '--mode', 'lean'], { encoding: 'utf8', timeout: remainingMs(deadline) });
+      const alone = spawnSync(bin, ['generate', '--model', model, '--input-ids', JSON.stringify([...prefix, ...head]), '--steps', String(steps), '--spec', 'off', '--mode', 'lean', '--prefill', 'exact'], { encoding: 'utf8', timeout: remainingMs(deadline) });
       checkRun(`delphi generate --mode lean branch ${b}`, alone);
       expect(out.branches[b].output_ids).toEqual((JSON.parse(alone.stdout) as Generated).output_ids);
     });
@@ -253,7 +253,7 @@ test('delphi fanout --mode lean and --mode turbo match solo decoding in the same
       expect(out.mode).toBe(mode);
       expect(out.lossy).toBe(true);
       expect(out.solo_identical).toBe(true);
-      expectEachBranchMatchesSolo(bin, prefix, heads, out, steps, deadline, ['--mode', mode]);
+      expectEachBranchMatchesSolo(bin, prefix, heads, out, steps, deadline, ['--mode', mode, '--prefill', 'exact']);
     }
   });
 });

@@ -19,8 +19,23 @@ Waves 1-8 are medians of 6 warm runs (64 decode steps, context 5-224 tokens; 512
 | Delphi Wave 4-5 (PR #8, linear MTP + `M=8`) | yes | 46.1 / 44.5 | 49.7 / 47.9 | 74.0 / 72.2 | 90.1 / 88.9 | 106.5 / 105.0 | 109.1 |
 | Delphi Wave 6 (+ Metal 4 prefill + tail-free kernels) | yes | 47.2 / 45.4 | 52.1 / 50.1 | 82.2 / 79.8 | 117.5 / 115.2 | 148.3 / 146.5 | **462.0** |
 | **Delphi Exact (`--mode exact`, Wave 7, default)** | **yes** | **47.1 / 45.3** | **57.2 / 55.0** (`1.58` acc) | **85.3 / 82.7** (`3.15` acc) | **132.7 / 130.0** (`7.88` acc) | **345.2 / 342.5** (`63.0` acc) | **462.0** |
+| **Delphi Exact after the long-prompt fix (`--prefill exact`, default)** | **yes** | - | **55.1 / -** | **82.4 / -** | - | - | **155.3** (256 tokens) |
 | Delphi Lean (`--mode lean`, Wave 8, opt-in lossy) | no | 55.2 / 52.5 | 58.4 / 55.5 (`1.34` acc) | 93.7 / 90.3 (`3.32` acc) | 143.8 / 140.5 (`7.88` acc) | 384.7 / 382.2 (`63.0` acc) | **489.2** |
 | Delphi Turbo (`--mode turbo`, Wave 8, opt-in lossy) | no | 77.6 / 72.4 | 77.4 / 72.3 (`1.29` acc) | **140.1 / 133.2** (`3.32` acc) | **192.5 / 185.8** (`6.30` acc) | **575.6 / 570.0** (`63.0` acc) | **755.6** |
+
+Exact on long prompts ([#10](https://github.com/Shaderzx/delphi/issues/10)): up to Wave 8, exact mode read prompts of 24 or more tokens, and checked 24 or more speculated rows, on the Metal 4 `matmul2d` kernels, which round activations to BF16 and expert products differently from the one-row kernels. Speculative output then drifted from `--spec off` on real chat prompts (story, travel and list chat-template prompts diverged at tokens 25, 39 and 45). Exact mode now reads every prompt and checks every speculated row on the one-row-identical kernels, and the e2e suite checks `--spec auto`, `mtp` and `lookup` against `--spec off` for 96 tokens on three chat prompts. The Wave 6-8 exact prefill and wide-lookup numbers above (`462.0`, `132.7`, `345.2`) were measured on the old path.
+
+What it costs, measured at `208071a` (raw runs in the ledger):
+
+| Prompt tokens | exact, `--prefill exact` (default) | exact, `--prefill tensor` (lossy) | lean (tensor, default) | turbo (tensor, default) |
+|---:|---:|---:|---:|---:|
+| 256 | 155.3 | 431.7 | 467.4 | 724.6 |
+| 1,024 | 152.2 | 406.7 | 441.3 | 664.5 |
+| 4,096 | 145.6 | 360.0 | 384.1 | 546.1 |
+
+Decode on ordinary prompts is unchanged (exact fib 81.9/82.8 main vs 83.0/81.8, story 54.2/55.3 vs 55.1/54.1 GPU tok/s, same output). Copy-heavy decode is slower because 64-row lookup verifies now run on the one-row-identical kernels: `copy8` 331.8 -> 155.7 exact, 361.8 -> 168.8 lean, 539.1 -> 317.0 turbo.
+
+`--prefill exact|tensor` picks the prompt path. `exact` is the default in exact mode; `tensor` (Metal 4 `matmul2d`) is the default in `lean` and `turbo` and always makes the run `"lossy": true`. Decode and verify never use the tensor kernels, so `--spec auto`, `mtp` and `lookup` stay token-identical to `--spec off` with the same `--mode` and `--prefill`. In `lean`, `--prefill exact` loses the 4.6K needle the tensor prefill retrieves. Fan-out reads its shared prefix with `--prefill exact`, so its `lean`/`turbo` branches match solo runs with `--prefill exact`.
 
 Qualification highlights (exact mode unless noted):
 - **Speedup vs Wave 0 baseline (`exact`):** **+47% plain decode** (32.1 -> 47.1 tok/s GPU, 73.8% of the 63.8 tok/s exact-repack streaming ceiling), **+78% creative prose** (57.2 tok/s GPU via 3-beam speculative tree), **+166% Python code** (85.3 tok/s GPU), **4.1x copy-code** (132.7 tok/s GPU), **10.8x repetitive copy (`p160`)** (345.2 tok/s GPU via `M=64` Metal 4 lookup), and **4.2x 512-token prefill vs Wave 4-5** (109.1 -> 462.0 tok/s).
@@ -77,7 +92,7 @@ bash engine/build.sh /tmp/delphi-bin
   --steps 64 --repeats 6 --mode exact --spec auto
 ```
 
-Flags: `--mode exact|lean|turbo` (default `exact`), `--spec off|lookup|mtp|auto` (default `auto`), `--head exact|full` (default `exact`), `--pack bf12|off` (default `bf12`).
+Flags: `--mode exact|lean|turbo` (default `exact`), `--prefill exact|tensor` (default `exact` in exact mode, `tensor` otherwise), `--spec off|lookup|mtp|auto` (default `auto`), `--head exact|full` (default `exact`), `--pack bf12|off` (default `bf12`).
 
 ```bash
 /tmp/delphi-bin/delphi fanout \
