@@ -276,3 +276,23 @@ test('delphi generate --mode lean and --mode turbo match their own --spec off to
     }
   });
 });
+
+test('delphi generate --tensor-prefill reads a chat prompt faster, reports itself lossy, and its speculation still matches its own --spec off', { tags: ['model'], timeout: 900_000 }, () => {
+  const deadline = Date.now() + 900_000;
+  const c = chat.cases[0];
+  withBuiltDelphi(deadline, (bin) => {
+    const run = (args: string[]): Generated & { prefill_tokens_per_s: number } => {
+      const r = spawnSync(bin, ['generate', '--model', model, '--input-ids', JSON.stringify(c.input_ids), '--steps', '96', ...args], { encoding: 'utf8', timeout: remainingMs(deadline) });
+      checkRun(`delphi generate ${args.join(' ')}`, r);
+      return JSON.parse(r.stdout) as Generated & { prefill_tokens_per_s: number };
+    };
+    const plain = run(['--spec', 'off']);
+    const fastPlain = run(['--spec', 'off', '--tensor-prefill']);
+    const fastSpec = run(['--spec', 'auto', '--tensor-prefill']);
+    expect(plain.lossy).toBe(false);
+    expect(fastPlain.lossy).toBe(true);
+    expect(fastSpec.lossy).toBe(true);
+    expect(fastSpec.output_ids).toEqual(fastPlain.output_ids);
+    expect(fastPlain.prefill_tokens_per_s).toBeGreaterThan(plain.prefill_tokens_per_s);
+  });
+});
