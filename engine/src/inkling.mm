@@ -169,7 +169,8 @@ public:
         uint32_t p3[64] = {};
     };
     TreeSpec active_tree{};
-    static constexpr uint32_t MAX_FAN = 32;
+    static constexpr uint32_t MAX_FAN = 64;
+    static_assert(MAX_FAN <= MAX_BATCH, "fan-out stages 3 history rows per branch after the batch rows of each conv state");
     struct FanStep { bool active = false; uint32_t prefix = 0, stride = 0, qpos = 0; };
     FanStep fan{};
     bool full_local_kv = false;
@@ -193,7 +194,8 @@ public:
     std::vector<std::array<uint64_t, 4>> conv_off;
     uint32_t conv_count = 0;
     uint32_t pending_conv_commit = 0;
-    uint32_t max_context = 32768;
+    static constexpr uint32_t CONTEXT_LIMIT = 32768;
+    uint32_t max_context = CONTEXT_LIMIT;
     uint32_t next_slot = 0;
     uint32_t tmp_slot = PERSIST_SLOTS;
     uint32_t cur_batch = 1;
@@ -473,7 +475,7 @@ public:
                 uint32_t width = s < 2 ? c.kv_heads * c.head_dim : c.hidden;
                 conv_off[v][s] = conv_floats * 4;
                 cmeta.push_back({uint32_t(conv_floats), width});
-                conv_floats += ((3u + MAX_BATCH) * width + 63u) / 64u * 64u;
+                conv_floats += ((3u + MAX_BATCH + 3u * MAX_FAN) * width + 63u) / 64u * 64u;
             }
         }
         conv_count = uint32_t(cmeta.size());
@@ -1602,7 +1604,7 @@ public:
     }
 
     struct AttnP { uint32_t pos, start, kv_heads, group, head_dim, extent, kv_cap; float scale; };
-    struct AttnBP { uint32_t pos0, rows, window, is_local, kv_heads, group, head_dim, extent, heads, q_stride, gate_stride, gate_off, sink_off, out_stride, kv_cap; float scale; uint32_t is_tree; uint32_t dep[16], mask[16]; };
+    struct AttnBP { uint32_t pos0, rows, window, is_local, kv_heads, group, head_dim, extent, heads, q_stride, gate_stride, gate_off, sink_off, out_stride, kv_cap; float scale; uint32_t is_tree; uint32_t dep[64], mask[64]; };
     struct RelBP { uint32_t d_rel, extent, heads; };
     struct AttnFanP { uint32_t prefix, stride, qpos, rows, window, is_local, kv_heads, group, extent, heads, q_stride, gate_stride, gate_off, sink_off, out_stride, kv_cap; float scale; };
     struct FanConvMetaHost { uint32_t state_off, hist_off, width, pad; };
@@ -1621,7 +1623,7 @@ public:
     }
 
     bool fan_begin(uint32_t branches, uint32_t prefix, std::string& error) {
-        if (branches == 0 || branches > MAX_FAN) { error = "fan-out supports 1 to 32 branches"; return false; }
+        if (branches == 0 || branches > MAX_FAN) { error = "fan-out supports 1 to 64 branches"; return false; }
         std::vector<FanConvMetaHost> meta;
         uint32_t hist = 0;
         uint32_t kvw = c.kv_heads * c.head_dim;
@@ -1740,7 +1742,7 @@ public:
             [enc setBuffer:scratch offset:s_qbundle atIndex:4];
             [enc setBuffer:scratch offset:s_gated atIndex:5];
             [enc setBytes:&a length:sizeof(a) atIndex:6];
-            grid2(c.heads, M, 128);
+            grid2(c.kv_heads, M, 128);
         } else if (M == 1) {
             uint32_t start = w.local && pos0 + 1 > c.window ? pos0 + 1 - c.window : 0;
             AttnP a{pos0, start, c.kv_heads, c.heads / c.kv_heads, c.head_dim, c.rel_extent, kv_cap[visit], 1.0f / std::sqrt(float(c.head_dim))};
@@ -2964,7 +2966,7 @@ std::optional<std::vector<std::vector<uint32_t>>> parse_branch_ids(const std::st
 
 int fanout_command(int argc, char** argv) {
     std::string error;
-    auto flags = parse_flags(argc, argv, {"--model", "--prefix-ids", "--branch-ids", "--steps", "--head", "--pack", "--mode"}, {"--bitwise"}, error);
+    auto flags = parse_flags(argc, argv, {"--model", "--prefix-ids", "--branch-ids", "--steps", "--head", "--pack", "--mode"}, {"--tensor-experts"}, error);
     if (!flags) return refuse(error);
     auto steps = whole_flag(*flags, "--steps", 64, 1, 4000, error);
     if (!steps) return refuse(error);
@@ -2982,22 +2984,25 @@ int fanout_command(int argc, char** argv) {
     auto& prefix = *prefix_opt;
     if (prefix.empty()) return refuse("--prefix-ids must hold at least one token id");
     auto branches_opt = parse_branch_ids(flags->values["--branch-ids"]);
-    if (!branches_opt) return refuse("--branch-ids must be a JSON array of 1 to 32 non-empty arrays of non-negative integer token ids");
+    if (!branches_opt) return refuse("--branch-ids must be a JSON array of 1 to 64 non-empty arrays of non-negative integer token ids");
     auto& branches = *branches_opt;
     uint32_t B = uint32_t(branches.size());
     size_t longest_head = 0;
     for (const auto& b : branches) longest_head = std::max(longest_head, b.size());
     uint64_t lockstep = longest_head - 1 + *steps;
+    uint64_t kv_needed = prefix.size() + lockstep * B;
+    if (kv_needed > Engine::CONTEXT_LIMIT) return refuse("prefix plus fanned-out branches exceeds 32768-token context");
     Engine engine;
     engine.full_local_kv = true;
+    engine.max_context = uint32_t((kv_needed + 255) / 256 * 256);
     engine.m4_dense = false;
-    bool bitwise = flags->switches.count("--bitwise") > 0;
-    engine.m4_experts = !bitwise;
+    bool tensor_experts = flags->switches.count("--tensor-experts") > 0;
+    bool bitwise = !tensor_experts || B < 24;
+    engine.m4_experts = false;
     if (!engine.load(flags->values["--model"], head == "exact", pack == "bf12", false, mode, error)) {
         std::fprintf(stderr, "delphi: %s\n", error.c_str());
         return 3;
     }
-    if (prefix.size() + lockstep * B > engine.max_context) return refuse("prefix plus fanned-out branches exceeds 32768-token context");
     uint64_t embed_rows = engine.T("embed.weight").shape[0];
     for (uint32_t id : prefix) if (id >= embed_rows) return refuse("--prefix-ids holds a token id out of embedding range");
     for (const auto& b : branches) for (uint32_t id : b) if (id >= embed_rows) return refuse("--branch-ids holds a token id out of embedding range");
@@ -3008,6 +3013,7 @@ int fanout_command(int argc, char** argv) {
         engine.step_rows(prefix.data() + i, uint32_t(i), chunk, Engine::LOGITS_NONE, true, false, false);
         i += chunk;
     }
+    engine.m4_experts = tensor_experts;
     if (!engine.fan_begin(B, uint32_t(prefix.size()), error)) {
         std::fprintf(stderr, "delphi: %s\n", error.c_str());
         return 3;
@@ -3033,9 +3039,10 @@ int fanout_command(int argc, char** argv) {
         for (size_t i = 0; i < out[b].size(); ++i) std::printf(i ? ", %u" : "%u", out[b][i]);
         std::printf("]}");
     }
-    std::printf("], \"mode\": \"%s\", \"lossy\": %s, \"prefix_tokens\": %zu, \"branch_count\": %u, \"generated_tokens\": %llu, \"prefill_tokens_per_s\": %.3f, \"decode_tokens_per_s\": %.3f, \"decode_gpu_tokens_per_s\": %.3f, \"bitwise\": %s}\n",
-                mode.c_str(), mode != "exact" ? "true" : "false", prefix.size(), B, static_cast<unsigned long long>(generated),
-                prefix.size() / prefill_wall, generated / decode_wall, gpu > 0 ? generated / gpu : 0.0, (bitwise || B < 24) ? "true" : "false");
+    std::printf("], \"mode\": \"%s\", \"lossy\": %s, \"prefix_tokens\": %zu, \"branch_count\": %u, \"generated_tokens\": %llu, \"prefill_tokens_per_s\": %.3f, \"decode_tokens_per_s\": %.3f, \"decode_gpu_tokens_per_s\": %.3f, \"per_branch_tokens_per_s\": %.3f, \"lockstep_steps\": %llu, \"ms_per_step\": %.3f, \"bitwise\": %s}\n",
+                mode.c_str(), (mode != "exact" || !bitwise) ? "true" : "false", prefix.size(), B, static_cast<unsigned long long>(generated),
+                prefix.size() / prefill_wall, generated / decode_wall, gpu > 0 ? generated / gpu : 0.0, generated / decode_wall / B,
+                static_cast<unsigned long long>(lockstep), decode_wall * 1000.0 / double(lockstep), bitwise ? "true" : "false");
     return 0;
 }
 int generate_command(int argc, char** argv) {

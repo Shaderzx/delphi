@@ -764,7 +764,7 @@ kernel void rel_bias_batch(device const float* r [[buffer(0)]],
     rel[ulong(m) * p.heads * p.extent + h * p.extent + d] = rbf(acc);
 }
 
-struct AttnB { uint pos0; uint rows; uint window; uint is_local; uint kv_heads; uint group; uint head_dim; uint extent; uint heads; uint q_stride; uint gate_stride; uint gate_off; uint sink_off; uint out_stride; uint kv_cap; float scale; uint is_tree; uint dep[16]; uint mask[16]; };
+struct AttnB { uint pos0; uint rows; uint window; uint is_local; uint kv_heads; uint group; uint head_dim; uint extent; uint heads; uint q_stride; uint gate_stride; uint gate_off; uint sink_off; uint out_stride; uint kv_cap; float scale; uint is_tree; uint dep[64]; uint mask[64]; };
 
 kernel void attend_gated_batch(device const float4* q [[buffer(0)]],
                                device const ushort4* kc [[buffer(1)]],
@@ -2535,16 +2535,23 @@ kernel void attend_gated_fan(device const float4* q [[buffer(0)]],
                              uint2 group [[threadgroup_position_in_grid]],
                              uint lane [[thread_index_in_simdgroup]],
                              uint simd [[simdgroup_index_in_threadgroup]]) {
-    threadgroup float sm[4];
-    threadgroup float sl[4];
-    threadgroup float4 so[4][32];
-    uint h = group.x;
+    threadgroup float sm[4][4];
+    threadgroup float sl[4][4];
+    threadgroup float4 so[4][4][32];
+    uint kvh = group.x;
     uint m = group.y;
-    uint kvh = h / p.group;
-    float4 q0 = q[ulong(m) * (p.q_stride / 4u) + h * 32u + lane];
-    float mv = -INFINITY;
-    float lv = 0.0f;
-    float4 o = 0.0f;
+    uint heads_here = min(p.group, 4u);
+    float4 qv[4];
+    float mv[4];
+    float lv[4];
+    float4 o[4];
+    for (uint g = 0; g < heads_here; ++g) {
+        uint h = kvh * p.group + g;
+        qv[g] = q[ulong(m) * (p.q_stride / 4u) + h * 32u + lane];
+        mv[g] = -INFINITY;
+        lv[g] = 0.0f;
+        o[g] = 0.0f;
+    }
     uint qp = p.qpos;
     uint qstart = (p.is_local && qp + 1u > p.window) ? (qp + 1u - p.window) : 0u;
     uint count = qp - qstart + 1u;
@@ -2556,26 +2563,33 @@ kernel void attend_gated_fan(device const float4* q [[buffer(0)]],
         float4 k4 = float4(bfv(ku.x), bfv(ku.y), bfv(ku.z), bfv(ku.w));
         ushort4 vu = vc[base];
         float4 v4 = float4(bfv(vu.x), bfv(vu.y), bfv(vu.z), bfv(vu.w));
-        float s = simd_sum(dot(q0, k4)) * p.scale;
         uint dist = qp - kp;
-        s += dist < p.extent ? rel[(ulong(m) * p.heads + h) * p.extent + dist] : 0.0f;
-        float mn = max(mv, s);
-        float a = mv == -INFINITY ? 0.0f : precise::exp(mv - mn);
-        float b = precise::exp(s - mn);
-        o = o * a + v4 * b; lv = lv * a + b; mv = mn;
+        for (uint g = 0; g < heads_here; ++g) {
+            uint h = kvh * p.group + g;
+            float s = simd_sum(dot(qv[g], k4)) * p.scale;
+            s += dist < p.extent ? rel[(ulong(m) * p.heads + h) * p.extent + dist] : 0.0f;
+            float mn = max(mv[g], s);
+            float a = mv[g] == -INFINITY ? 0.0f : precise::exp(mv[g] - mn);
+            float b = precise::exp(s - mn);
+            o[g] = o[g] * a + v4 * b; lv[g] = lv[g] * a + b; mv[g] = mn;
+        }
     }
-    if (lane == 0) { sm[simd] = mv; sl[simd] = lv; }
-    so[simd][lane] = o;
+    for (uint g = 0; g < heads_here; ++g) {
+        if (lane == 0) { sm[g][simd] = mv[g]; sl[g][simd] = lv[g]; }
+        so[g][simd][lane] = o[g];
+    }
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (simd == 0) {
-        float mx = max(max(sm[0], sm[1]), max(sm[2], sm[3]));
+    if (simd < heads_here) {
+        uint g = simd;
+        uint h = kvh * p.group + g;
+        float mx = max(max(sm[g][0], sm[g][1]), max(sm[g][2], sm[g][3]));
         float tot = 0.0f;
         float4 acc = 0.0f;
         for (uint s = 0; s < 4u; ++s) {
-            if (sm[s] != -INFINITY) {
-                float w = precise::exp(sm[s] - mx);
-                tot += sl[s] * w;
-                acc += so[s][lane] * w;
+            if (sm[g][s] != -INFINITY) {
+                float w = precise::exp(sm[g][s] - mx);
+                tot += sl[g][s] * w;
+                acc += so[g][s][lane] * w;
             }
         }
         float lse = mx + precise::log(tot);
