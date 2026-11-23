@@ -32,21 +32,28 @@ Qualification highlights (exact mode unless noted):
 
 ## Fan-out decoding (one prompt, many continuations, one weight read)
 
-`delphi fanout` decodes up to 64 continuations of one shared prefix together. Every step feeds one token per branch through the model as a single batch, so each weight byte read from memory serves every branch at once. Use it when one request needs many independent continuations: the sections of an outlined answer, several candidate completions, or a batch of short tasks over the same context.
+`delphi fanout` decodes up to 64 continuations of one shared prefix together. Every step feeds one token per branch through the model as a single batch, so each weight byte read from memory serves every branch at once. It suits requests that need many independent continuations of the same context: the sections of an outlined answer, several candidate completions, or a batch of short tasks over one document. It does not make one continuation faster: a single branch still decodes at the single-stream rate.
 
-Aggregate decode tok/s across all branches (`delphi fanout`, 35-token prefix, 128 steps per branch, median of 3, logged in [bench/ledger.jsonl](bench/ledger.jsonl)):
+The numbers below are aggregate decode tok/s summed over all branches (`delphi fanout`, 128 steps per branch, median of 3, logged in [bench/ledger.jsonl](bench/ledger.jsonl) at `bed1497`). Per branch, divide by the branch count; the JSON also reports `per_branch_tokens_per_s` and `ms_per_step`.
 
-| Branches | `exact` | `exact --bitwise` | `lean` (lossy) | `turbo` (lossy) |
+| Branches (35-token prefix) | `exact` (token-identical) | `exact --tensor-experts` (lossy) | `lean --tensor-experts` (lossy) | `turbo --tensor-experts` (lossy) |
 |---:|---:|---:|---:|---:|
-| 1 | 43.4 | 43.5 | 54.8 | 72.4 |
-| 8 | 124.9 | 125.0 | 136.1 | 233.5 |
-| 16 | 141.8 | 142.3 | 156.1 | 272.3 |
-| 32 | **201.1** | 152.5 | 230.2 | 335.4 |
-| 64 | **245.8** | 153.2 | 290.6 | 400.7 |
+| 1 | 42.1 | 42.2 | 52.7 | 70.8 |
+| 8 | 122.0 | 121.7 | 132.9 | 226.8 |
+| 32 | 149.7 | 197.5 | 226.2 | 328.5 |
+| 64 | 150.5 | **241.2** | 285.3 | 392.0 |
 
-How it works: the prefix is prefilled once. Branch tokens are stored interleaved after it (step `s` of branch `b` lives at slot `prefix + s * branches + b`), and a dedicated attention kernel maps each branch's logical positions onto that layout, so every branch attends to the prefix plus only its own tokens. The short convolutions keep a three-token history per branch, staged into the existing tree-verify parent slots each step, so the batched kernels run unchanged.
+| 64 branches, prefix length | 35 | 1,024 | 4,096 | 16,384 |
+|---|---:|---:|---:|---:|
+| `exact` | 150.5 | 129.2 | 121.1 | 97.3 |
+| `exact --tensor-experts` | 241.2 | 197.5 | 180.8 | 130.3 |
 
-Numerics: with fewer than 24 branches, or with `--bitwise`, every branch is token-for-token identical to decoding that branch alone with `delphi generate --spec off` (the e2e suite checks 64 of 64 branches). From 24 branches up, the default run uses the Metal 4 `matmul2d` expert kernels, which round expert products differently from the one-row kernels; branches stay on the same model but can pick a different token after a dozen or more steps (2 of 32 branches by token 24 in our measurement). The JSON reports `"bitwise": true` exactly when the run is token-identical to solo decoding. Fan-out always keeps the dense projections on the one-row-identical kernels.
+What is and is not exact:
+- By default every branch is token-for-token identical to decoding that branch alone with `delphi generate --spec off`. The e2e suite checks all 64 branches over a 35-token prefix, and 8 branches with 1-5 token heads over a 1,120-token prefix that crosses the 1,024-token local attention window.
+- `--tensor-experts` switches the expert matmuls to the Metal 4 `matmul2d` kernels once a batch reaches 24 rows. They round expert products differently from the one-row kernels, so branches can pick a different token after a dozen or more steps. The run then reports `"lossy": true, "bitwise": false`. Below 24 branches the flag changes nothing and the run stays token-identical.
+- Only `--tensor-experts` (or `lean`/`turbo`) passes 200 tok/s. The token-identical path tops out near 150 tok/s because the one-row expert kernels are ALU-bound on half-precision products, which the tensor units cannot reproduce bit for bit.
+
+How it works: the prefix is prefilled once. Branch tokens are stored interleaved after it (step `s` of branch `b` lives at slot `prefix + s * branches + b`), and `attend_gated_fan` maps each branch's logical positions onto that layout, reading each key once for the three query heads that share it. Every branch attends to the prefix plus only its own tokens. The four short convolutions per layer keep a three-token history per branch, staged into spare conv-state rows and wired in as tree-verify parents, so the batched kernels run unchanged. Branches run in lockstep: a branch with a shorter head starts generating earlier and finishes earlier, and the run lasts `longest head - 1 + steps` steps (`lockstep_steps` in the JSON). The KV cache is sized to the run (`prefix + lockstep_steps * branches`). Sharing prefix keys across four branches per threadgroup was measured slower (718.6 vs 652.9 ms/step at a 16K prefix) and is not used.
 ## Building and running
 
 ```bash
@@ -73,7 +80,7 @@ Flags: `--mode exact|lean|turbo` (default `exact`), `--spec off|lookup|mtp|auto`
   --steps 64
 ```
 
-`delphi fanout` flags: `--prefix-ids JSON` (shared prefix), `--branch-ids JSON` (1 to 64 non-empty token arrays, one per branch), `--steps N` (tokens generated per branch, default 64), `--bitwise` (keep every branch token-identical to solo decoding at any width), plus `--mode`, `--head` and `--pack` as above.
+`delphi fanout` flags: `--prefix-ids JSON` (shared prefix), `--branch-ids JSON` (1 to 64 non-empty token arrays, one per branch), `--steps N` (tokens generated per branch, default 64), `--tensor-experts` (opt in to the faster Metal 4 expert kernels; output is then reported `lossy`), plus `--mode`, `--head` and `--pack` as above.
 Exact means token-identical to Delphi's own plain greedy decoding on the shipped weights. Faster modes that change the output are opt-in and labelled (`"lossy": true` in JSON output).
 
 ## Using Delphi in your project
