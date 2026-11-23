@@ -609,7 +609,7 @@ kernel void gemv_bf16_rows(device const uint4* w [[buffer(0)]],
     if (ROWS > 7u) { float t = simd_sum(a7) * g.scale; if (lane == 0) y[7ul * g.y_stride + row] = g.round_out ? rbf(t) : t; }
 }
 
-struct ConvB { uint channels; uint dynamic; uint head_dim; uint rows; uint x_stride; uint dyn_stride; uint y_stride; uint is_tree; float scale; uint p1[16]; uint p2[16]; uint p3[16]; };
+struct ConvB { uint channels; uint dynamic; uint head_dim; uint rows; uint x_stride; uint dyn_stride; uint y_stride; uint is_tree; float scale; uint p1[64]; uint p2[64]; uint p3[64]; };
 
 kernel void sconv_batch(device const float* x [[buffer(0)]],
                         device float* state [[buffer(1)]],
@@ -691,7 +691,7 @@ kernel void kv_compact_tree(device ushort* kc [[buffer(0)]],
     }
 }
 
-struct ClipB { uint width; uint has_scale; uint pos0; uint is_local; uint n_floor; uint in_stride; uint out_stride; uint mode; float threshold; float alpha; uint is_tree; uint dep[16]; };
+struct ClipB { uint width; uint has_scale; uint pos0; uint is_local; uint n_floor; uint in_stride; uint out_stride; uint mode; float threshold; float alpha; uint is_tree; uint dep[64]; };
 
 kernel void clip_rows_batch(device const float* x [[buffer(0)]],
                             device const ushort* scale [[buffer(1)]],
@@ -764,7 +764,7 @@ kernel void rel_bias_batch(device const float* r [[buffer(0)]],
     rel[ulong(m) * p.heads * p.extent + h * p.extent + d] = rbf(acc);
 }
 
-struct AttnB { uint pos0; uint rows; uint window; uint is_local; uint kv_heads; uint group; uint head_dim; uint extent; uint heads; uint q_stride; uint gate_stride; uint gate_off; uint sink_off; uint out_stride; uint kv_cap; float scale; uint is_tree; uint dep[16]; uint mask[16]; };
+struct AttnB { uint pos0; uint rows; uint window; uint is_local; uint kv_heads; uint group; uint head_dim; uint extent; uint heads; uint q_stride; uint gate_stride; uint gate_off; uint sink_off; uint out_stride; uint kv_cap; float scale; uint is_tree; uint dep[64]; uint mask[64]; };
 
 kernel void attend_gated_batch(device const float4* q [[buffer(0)]],
                                device const ushort4* kc [[buffer(1)]],
@@ -1663,7 +1663,7 @@ kernel void expert_mxfp8_grouped(device const uchar* w [[buffer(0)]],
     }
 }
 
-struct CombineB { uint n; uint top; uint boundary; uint rows; uint is_tree; uint p1[16]; uint p2[16]; uint p3[16]; };
+struct CombineB { uint n; uint top; uint boundary; uint rows; uint is_tree; uint p1[64]; uint p2[64]; uint p3[64]; };
 
 kernel void combine_batch(device const float* rows_buf [[buffer(0)]],
                           device const uint* ids [[buffer(1)]],
@@ -2466,3 +2466,111 @@ kernel void m4_q4_mm32(device const uint4* q4 [[buffer(0)]],
     cT.store(sY);
 }
 #endif
+
+struct FanConvMeta { uint state_off; uint width; };
+struct FanConvP { uint ring_base; uint slot; };
+
+kernel void fan_conv_init(device float* conv_buf [[buffer(0)]],
+                          device const FanConvMeta* meta [[buffer(1)]],
+                          constant FanConvP& p [[buffer(2)]],
+                          uint2 group [[threadgroup_position_in_grid]],
+                          uint2 tid2 [[thread_position_in_threadgroup]],
+                          uint2 threads2 [[threads_per_threadgroup]]) {
+    FanConvMeta cm = meta[group.x];
+    device float* st = conv_buf + cm.state_off;
+    device float* ring = st + ulong(p.ring_base + 3u * group.y) * cm.width;
+    for (uint i = tid2.x; i < 3u * cm.width; i += threads2.x) ring[i] = st[i];
+}
+
+kernel void fan_conv_commit(device float* conv_buf [[buffer(0)]],
+                            device const FanConvMeta* meta [[buffer(1)]],
+                            constant FanConvP& p [[buffer(2)]],
+                            uint2 group [[threadgroup_position_in_grid]],
+                            uint2 tid2 [[thread_position_in_threadgroup]],
+                            uint2 threads2 [[threads_per_threadgroup]]) {
+    FanConvMeta cm = meta[group.x];
+    uint b = group.y;
+    device float* st = conv_buf + cm.state_off;
+    device const float* cur = st + ulong(3u + b) * cm.width;
+    device float* slot = st + ulong(p.ring_base + 3u * b + p.slot) * cm.width;
+    for (uint c = tid2.x; c < cm.width; c += threads2.x) slot[c] = cur[c];
+}
+struct AttnFan { uint prefix; uint stride; uint qpos; uint rows; uint window; uint is_local; uint kv_heads; uint group; uint extent; uint heads; uint q_stride; uint gate_stride; uint gate_off; uint sink_off; uint out_stride; uint kv_cap; float scale; };
+
+kernel void attend_gated_fan(device const float4* q [[buffer(0)]],
+                             device const ushort4* kc [[buffer(1)]],
+                             device const ushort4* vc [[buffer(2)]],
+                             device const float* rel [[buffer(3)]],
+                             device const float* qbundle [[buffer(4)]],
+                             device float4* gated [[buffer(5)]],
+                             constant AttnFan& p [[buffer(6)]],
+                             uint2 group [[threadgroup_position_in_grid]],
+                             uint lane [[thread_index_in_simdgroup]],
+                             uint simd [[simdgroup_index_in_threadgroup]]) {
+    threadgroup float sm[4][4];
+    threadgroup float sl[4][4];
+    threadgroup float4 so[4][4][32];
+    uint kvh = group.x;
+    uint m = group.y;
+    uint heads_here = min(p.group, 4u);
+    float4 qv[4];
+    float mv[4];
+    float lv[4];
+    float4 o[4];
+    for (uint g = 0; g < heads_here; ++g) {
+        uint h = kvh * p.group + g;
+        qv[g] = q[ulong(m) * (p.q_stride / 4u) + h * 32u + lane];
+        mv[g] = -INFINITY;
+        lv[g] = 0.0f;
+        o[g] = 0.0f;
+    }
+    uint qp = p.qpos;
+    uint qstart = (p.is_local && qp + 1u > p.window) ? (qp + 1u - p.window) : 0u;
+    uint count = qp - qstart + 1u;
+    for (uint t = simd; t < count; t += 4u) {
+        uint kp = qstart + t;
+        uint phys = kp < p.prefix ? kp : (p.prefix + (kp - p.prefix) * p.stride + m);
+        ulong base = (ulong(phys % p.kv_cap) * p.kv_heads + kvh) * 32u + lane;
+        ushort4 ku = kc[base];
+        float4 k4 = float4(bfv(ku.x), bfv(ku.y), bfv(ku.z), bfv(ku.w));
+        ushort4 vu = vc[base];
+        float4 v4 = float4(bfv(vu.x), bfv(vu.y), bfv(vu.z), bfv(vu.w));
+        uint dist = qp - kp;
+        for (uint g = 0; g < heads_here; ++g) {
+            uint h = kvh * p.group + g;
+            float s = simd_sum(dot(qv[g], k4)) * p.scale;
+            s += dist < p.extent ? rel[(ulong(m) * p.heads + h) * p.extent + dist] : 0.0f;
+            float mn = max(mv[g], s);
+            float a = mv[g] == -INFINITY ? 0.0f : precise::exp(mv[g] - mn);
+            float b = precise::exp(s - mn);
+            o[g] = o[g] * a + v4 * b; lv[g] = lv[g] * a + b; mv[g] = mn;
+        }
+    }
+    for (uint g = 0; g < heads_here; ++g) {
+        if (lane == 0) { sm[g][simd] = mv[g]; sl[g][simd] = lv[g]; }
+        so[g][simd][lane] = o[g];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (simd < heads_here) {
+        uint g = simd;
+        uint h = kvh * p.group + g;
+        float mx = max(max(sm[g][0], sm[g][1]), max(sm[g][2], sm[g][3]));
+        float tot = 0.0f;
+        float4 acc = 0.0f;
+        for (uint s = 0; s < 4u; ++s) {
+            if (sm[g][s] != -INFINITY) {
+                float w = precise::exp(sm[g][s] - mx);
+                tot += sl[g][s] * w;
+                acc += so[g][s][lane] * w;
+            }
+        }
+        float lse = mx + precise::log(tot);
+        float sink = qbundle[ulong(m) * p.gate_stride + p.sink_off + h];
+        float ssink = sigm(lse - sink);
+        device const float4* gptr = (device const float4*)(qbundle + ulong(m) * p.gate_stride + p.gate_off);
+        float4 g4 = gptr[h * 32u + lane];
+        float4 sg = float4(sigm(g4.x), sigm(g4.y), sigm(g4.z), sigm(g4.w));
+        float4 y4 = (acc / tot) * sg * ssink;
+        gated[ulong(m) * (p.out_stride / 4u) + h * 32u + lane] = float4(rbf(y4.x), rbf(y4.y), rbf(y4.z), rbf(y4.w));
+    }
+}
