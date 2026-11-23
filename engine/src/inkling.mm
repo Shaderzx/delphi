@@ -118,10 +118,10 @@ public:
     id<MTLComputePipelineState> p_f32_to_bf16 = nil, p_m4_bf12_mm32 = nil, p_bf12_outlier_patch = nil, p_m4_nvfp4_g5p = nil, p_m4_mxfp8_g5p = nil, p_m4_q4_mm32 = nil;
     id<MTLComputePipelineState> p_ch_xnorm_b, p_ch_tau_b, p_ch_filter_b, p_ch_setup_b, p_copy_tap;
     std::array<id<MTLComputePipelineState>, 9> p_gemv12_rows, p_gemv12_16_rows, p_gemv12_4_rows, p_gemv16_rows, p_ch_scan_rows, p_gemv_q4_rows, p_gemv_q4_h8_rows, p_gemv_q4_h2_rows;
-    id<MTLComputePipelineState> p_mtp_w1_norms, p_mtp_pack_head, p_mtp_q4, p_mtp_fold, p_mtp_fold_b, p_mtp_mix, p_mtp_norm_h, p_mtp_ctx_kv, p_mtp_embed;
+    id<MTLComputePipelineState> p_mtp_q4, p_mtp_fold, p_mtp_fold_b, p_mtp_mix, p_mtp_norm_h, p_mtp_ctx_kv, p_mtp_embed;
     id<MTLComputePipelineState> p_mtp_qk_rope, p_mtp_attn, p_mtp_add_norm, p_mtp_add, p_mtp_silu;
     id<MTLComputePipelineState> p_mtp_base7, p_mtp_rnn_in, p_mtp_rnn_gates, p_mtp_mscan, p_mtp_mred;
-    std::array<id<MTLComputePipelineState>, 9> p_mtp_q4_rows;
+    std::array<id<MTLComputePipelineState>, 9> p_mtp_bf16_rows;
     id<MTLBuffer> arena, queries, logits, token, scratch;
     id<MTLBuffer> head_q4 = nil, head_sc = nil, head_err = nil;
     id<MTLBuffer> ch_ub = nil, ch_tg_val = nil, ch_tg_row = nil, ch_state = nil, ch_count = nil, ch_cands = nil, ch_indirect = nil, ch_xh = nil;
@@ -138,11 +138,11 @@ public:
     bool has_m4_mpp = false;
     uint32_t eff_top = 8;
     std::array<double, 13> cost_ms = {0.0, 21.6, 30.1, 35.8, 40.3, 47.9, 57.6, 63.4, 71.8, 80.0, 88.0, 96.0, 104.0};
-    struct MtpQ4Mat { uint64_t q4_off = 0, sc_off = 0; uint32_t rows = 0, cols = 0; };
+    struct MtpMat { uint64_t off = 0; uint32_t rows = 0, cols = 0; };
     struct MtpLayer {
         bool local = false;
         uint64_t dflare_norm = 0, in_norm = 0, post_norm = 0, q_norm = 0, k_norm = 0, k_norm_ctx = 0;
-        MtpQ4Mat kv_ctx, qkv, wo, gu, down;
+        MtpMat kv_ctx, qkv, wo, gu, down;
     };
     struct MtpCfg {
         uint32_t hidden = 0, layers = 0, heads = 0, kv_heads = 0, head_dim = 0, inter = 0, block_size = 0, rank = 0, window = 0, dvocab = 0;
@@ -151,10 +151,10 @@ public:
     id<MTLBuffer> mtp_file = nil;
     std::map<std::string, Tensor> mtp_tensors;
     std::vector<MtpLayer> mlw;
-    MtpQ4Mat m_rnn_proj{};
+    MtpMat m_rnn_proj{};
+    std::string mtp_weights_dtype;
     uint64_t m_mask_embed = 0, m_final_norm = 0, m_markov_dflare = 0, m_markov_w1 = 0, m_rnn_bias = 0, m_hidden_out_w = 0, m_hidden_out_b = 0;
-    id<MTLBuffer> m_alpha = nil, m_q4 = nil, m_sc = nil, m_vocab_ids = nil, m_head_q4 = nil, m_head_sc = nil;
-    id<MTLBuffer> m_fold_q4 = nil, m_fold_sc = nil, m_fold_b = nil;
+    id<MTLBuffer> m_alpha = nil, m_w = nil, m_fold = nil, m_fold_b = nil;
     std::vector<id<MTLBuffer>> m_kcache, m_vcache;
     id<MTLBuffer> m_f_rnn = nil, m_ctx_x = nil, m_ctx_kv = nil, m_h = nil, m_hn = nil, m_h1 = nil;
     id<MTLBuffer> m_qkv = nil, m_attn_out = nil, m_gu = nil, m_mlp_h = nil, m_base_logits = nil;
@@ -346,8 +346,6 @@ public:
         p_ch_filter_b = pipeline(gpu, @"cert_head_filter_batch");
         p_ch_setup_b = pipeline(gpu, @"cert_head_setup_batch");
         p_copy_tap = pipeline(gpu, @"copy_tap_batch");
-        p_mtp_w1_norms = pipeline(gpu, @"mtp_w1_norms");
-        p_mtp_pack_head = pipeline(gpu, @"mtp_pack_head_sub");
         p_mtp_q4 = pipeline(gpu, @"mtp_quant_q4");
         p_mtp_fold = pipeline(gpu, @"mtp_build_fold");
         p_mtp_fold_b = pipeline(gpu, @"mtp_build_fold_bias");
@@ -374,7 +372,7 @@ public:
             p_gemv_q4_rows[r] = pipeline_for_rows(gpu, @"gemv_q4_f32_rows", r);
             p_gemv_q4_h8_rows[r] = pipeline_for_rows(gpu, @"gemv_q4_h8_rows", r);
             p_gemv_q4_h2_rows[r] = pipeline_for_rows(gpu, @"gemv_q4_h2_rows", r);
-            p_mtp_q4_rows[r] = pipeline_for_rows(gpu, @"mtp_gemv_q4_rows", r);
+            p_mtp_bf16_rows[r] = pipeline_for_rows(gpu, @"mtp_gemv_bf16_rows", r);
         }
         arena = [gpu.device newBufferWithLength:uint64_t(slots) * MAX_BATCH * c.hidden * 4 options:MTLResourceStorageModePrivate];
         if (!arena) { error = "arena allocation failed"; return false; }
@@ -471,7 +469,7 @@ public:
         eff_top = (mode == "turbo") ? std::min<uint32_t>(3u, c.top) : c.top;
         if (mode == "lean") cost_ms = {0.0, 16.5, 22.4, 26.8, 29.5, 35.8, 40.5, 46.0, 51.5, 58.5, 65.5, 72.5, 79.5};
         else if (mode == "turbo") cost_ms = {0.0, 12.1, 15.6, 17.8, 19.9, 22.4, 25.5, 28.0, 31.0, 35.0, 39.0, 43.0, 47.0};
-        if ((use_cert_head || want_mtp) && (c.hidden % 32 == 0) && c.vocab >= 64) {
+        if (use_cert_head && (c.hidden % 32 == 0) && c.vocab >= 64) {
             if (!build_cert_head(error)) return false;
             cert_head_active = use_cert_head;
         }
@@ -482,7 +480,7 @@ public:
         } else if (use_bf12 && (c.hidden % 16 == 0) && ((c.heads * c.head_dim) % 16 == 0) && ((c.heads * c.d_rel) % 4 == 0)) {
             if (!build_bf12(error)) return false;
         }
-        if (want_mtp && cert_head_ready) {
+        if (want_mtp) {
             if (!load_mtp(dir, cfg, error)) return false;
         }
         return true;
@@ -657,10 +655,10 @@ public:
             uint32_t lid = n.unsignedIntValue;
             if (lid < mc.layers) mlw[lid].local = true;
         }
-        struct Q4Job { MtpQ4Mat* dst; std::vector<std::string> names; uint32_t rows = 0, cols = 0; };
-        std::vector<Q4Job> jobs;
-        auto add_q4 = [&](MtpQ4Mat* dst, std::initializer_list<std::string> names) {
-            Q4Job j;
+        struct BfJob { MtpMat* dst; std::vector<std::string> names; uint32_t rows = 0, cols = 0; };
+        std::vector<BfJob> jobs;
+        auto add_bf = [&](MtpMat* dst, std::initializer_list<std::string> names) {
+            BfJob j;
             j.dst = dst;
             for (const std::string& n : names) {
                 const Tensor& t = MT(n);
@@ -679,60 +677,45 @@ public:
             ml.q_norm = MT(L + "self_attn.q_norm.weight").offset;
             ml.k_norm = MT(L + "self_attn.k_norm.weight").offset;
             ml.k_norm_ctx = MT(L + "self_attn.k_norm_ctx.weight").offset;
-            add_q4(&ml.kv_ctx, {L + "self_attn.k_proj_ctx.weight", L + "self_attn.v_proj_ctx.weight"});
-            add_q4(&ml.qkv, {L + "self_attn.q_proj.weight", L + "self_attn.k_proj.weight", L + "self_attn.v_proj.weight"});
-            add_q4(&ml.wo, {L + "self_attn.o_proj.weight"});
-            add_q4(&ml.gu, {L + "mlp.gate_proj.weight", L + "mlp.up_proj.weight"});
-            add_q4(&ml.down, {L + "mlp.down_proj.weight"});
+            add_bf(&ml.kv_ctx, {L + "self_attn.k_proj_ctx.weight", L + "self_attn.v_proj_ctx.weight"});
+            add_bf(&ml.qkv, {L + "self_attn.q_proj.weight", L + "self_attn.k_proj.weight", L + "self_attn.v_proj.weight"});
+            add_bf(&ml.wo, {L + "self_attn.o_proj.weight"});
+            add_bf(&ml.gu, {L + "mlp.gate_proj.weight", L + "mlp.up_proj.weight"});
+            add_bf(&ml.down, {L + "mlp.down_proj.weight"});
         }
-        add_q4(&m_rnn_proj, {"markov_head.rnn_proj.weight"});
+        add_bf(&m_rnn_proj, {"markov_head.rnn_proj.weight"});
+        for (const BfJob& j : jobs) {
+            for (const std::string& n : j.names) {
+                const Tensor& t = MT(n);
+                if (t.dtype != "BF16" || t.shape.size() != 2 || t.shape[1] != j.cols || j.cols % 8 != 0 || t.bytes != t.shape[0] * t.shape[1] * 2) {
+                    error = "mtp drafter weight " + n + " must be a BF16 matrix";
+                    return false;
+                }
+            }
+        }
+        if (c.hidden > 2304u || c.hidden % 8 != 0) { error = "mtp drafter head needs hidden size of at most 2304"; return false; }
         auto align256 = [](uint64_t v) { return (v + 255) / 256 * 256; };
-        uint64_t q4_tot = 0, sc_tot = 0;
-        for (Q4Job& j : jobs) {
-            uint32_t ng = j.cols / 32;
-            j.dst->q4_off = q4_tot;
-            j.dst->sc_off = sc_tot;
+        uint64_t w_tot = 0;
+        for (BfJob& j : jobs) {
+            j.dst->off = w_tot;
             j.dst->rows = j.rows;
             j.dst->cols = j.cols;
-            q4_tot += align256(uint64_t(j.rows) * ng * 16);
-            sc_tot += align256(uint64_t(j.rows) * ng * 2);
+            w_tot += align256(uint64_t(j.rows) * j.cols * 2);
         }
-        m_q4 = [gpu.device newBufferWithLength:q4_tot options:MTLResourceStorageModePrivate];
-        m_sc = [gpu.device newBufferWithLength:sc_tot options:MTLResourceStorageModePrivate];
+        m_w = [gpu.device newBufferWithLength:w_tot options:MTLResourceStorageModeShared];
+        if (!m_w) { error = "mtp drafter weight buffer allocation failed"; return false; }
+        for (const BfJob& j : jobs) {
+            uint64_t dst = j.dst->off;
+            for (const std::string& n : j.names) {
+                const Tensor& t = MT(n);
+                std::memcpy(static_cast<char*>(m_w.contents) + dst, static_cast<const char*>(mtp_file.contents) + t.offset, t.bytes);
+                dst += t.bytes;
+            }
+        }
         uint32_t V = c.vocab;
-        uint32_t DV = std::min<uint32_t>(V, 49152u);
-        mc.dvocab = DV;
-        id<MTLBuffer> norms_buf = [gpu.device newBufferWithLength:uint64_t(V) * 4 options:MTLResourceStorageModeShared];
-        if (!norms_buf) { error = "mtp norms buffer allocation failed"; return false; }
-        {
-            struct MtpNormPP { uint32_t vocab, rank; };
-            MtpNormPP np{V, mc.rank};
-            id<MTLCommandBuffer> cb = [gpu.queue commandBuffer];
-            id<MTLComputeCommandEncoder> e = [cb computeCommandEncoder];
-            [e setComputePipelineState:p_mtp_w1_norms];
-            [e setBuffer:mtp_file offset:m_markov_w1 atIndex:0];
-            [e setBuffer:norms_buf offset:0 atIndex:1];
-            [e setBytes:&np length:sizeof(np) atIndex:2];
-            [e dispatchThreadgroups:MTLSizeMake((V + 7) / 8, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
-            [e endEncoding];
-            gpu_seconds(cb);
-        }
-        const float* nptr = static_cast<const float*>(norms_buf.contents);
-        std::vector<uint32_t> idx(V);
-        for (uint32_t i = 0; i < V; ++i) idx[i] = i;
-        if (DV < V) {
-            std::nth_element(idx.begin(), idx.begin() + DV, idx.end(), [&](uint32_t a, uint32_t b) { return nptr[a] > nptr[b]; });
-            idx.resize(DV);
-            std::sort(idx.begin(), idx.end());
-        }
-        m_vocab_ids = [gpu.device newBufferWithBytes:idx.data() length:uint64_t(DV) * 4 options:MTLResourceStorageModeShared];
-        uint32_t ng_h = c.hidden / 32;
-        m_head_q4 = [gpu.device newBufferWithLength:uint64_t(DV) * ng_h * 16 options:MTLResourceStorageModePrivate];
-        m_head_sc = [gpu.device newBufferWithLength:uint64_t(DV) * ng_h * 2 options:MTLResourceStorageModePrivate];
-        m_fold_q4 = [gpu.device newBufferWithLength:uint64_t(DV) * 8 * 16 options:MTLResourceStorageModePrivate];
-        m_fold_sc = [gpu.device newBufferWithLength:uint64_t(DV) * 8 * 2 options:MTLResourceStorageModePrivate];
-        m_fold_b = [gpu.device newBufferWithLength:uint64_t(DV) * 4 options:MTLResourceStorageModePrivate];
-        uint32_t kvw = mc.kv_heads * mc.head_dim;
+        mc.dvocab = V;
+        m_fold = [gpu.device newBufferWithLength:uint64_t(V) * mc.rank * 2 options:MTLResourceStorageModePrivate];
+        m_fold_b = [gpu.device newBufferWithLength:uint64_t(V) * 4 options:MTLResourceStorageModePrivate];        uint32_t kvw = mc.kv_heads * mc.head_dim;
         uint32_t qdim = mc.heads * mc.head_dim;
         for (uint32_t i = 0; i < mc.layers; ++i) {
             uint32_t mcap = mlw[i].local ? std::min<uint32_t>(max_context, mc.window + MAX_BATCH * 2) : max_context;
@@ -753,7 +736,7 @@ public:
         m_attn_out = [gpu.device newBufferWithLength:uint64_t(8) * qdim * 2 options:MTLResourceStorageModePrivate];
         m_gu = [gpu.device newBufferWithLength:uint64_t(8) * 2 * mc.inter * 4 options:MTLResourceStorageModePrivate];
         m_mlp_h = [gpu.device newBufferWithLength:uint64_t(8) * mc.inter * 2 options:MTLResourceStorageModePrivate];
-        m_base_logits = [gpu.device newBufferWithLength:uint64_t(7) * DV * 2 options:MTLResourceStorageModePrivate];
+        m_base_logits = [gpu.device newBufferWithLength:uint64_t(7) * V * 4 options:MTLResourceStorageModePrivate];
         m_rnn_state[0] = [gpu.device newBufferWithLength:uint64_t(3) * mc.rank * 4 options:MTLResourceStorageModePrivate];
         m_rnn_state[1] = [gpu.device newBufferWithLength:uint64_t(3) * mc.rank * 4 options:MTLResourceStorageModePrivate];
         m_beam_tok[0] = [gpu.device newBufferWithLength:64 options:MTLResourceStorageModeShared];
@@ -761,12 +744,12 @@ public:
         m_rnn_in = [gpu.device newBufferWithLength:uint64_t(3) * (2 * mc.rank + 2 * mc.hidden) * 2 options:MTLResourceStorageModePrivate];
         m_rnn_proj_out = [gpu.device newBufferWithLength:uint64_t(3) * 3 * mc.rank * 4 options:MTLResourceStorageModePrivate];
         m_latent = [gpu.device newBufferWithLength:uint64_t(3) * mc.rank * 2 options:MTLResourceStorageModePrivate];
-        uint32_t mntg = (DV + 31) / 32;
+        uint32_t mntg = (V + 31) / 32;
         m_tg_val = [gpu.device newBufferWithLength:uint64_t(3) * mntg * 3 * 4 options:MTLResourceStorageModePrivate];
         m_tg_row = [gpu.device newBufferWithLength:uint64_t(3) * mntg * 3 * 4 options:MTLResourceStorageModePrivate];
         m_tg_sum = [gpu.device newBufferWithLength:uint64_t(3) * mntg * 4 options:MTLResourceStorageModePrivate];
         m_out = [gpu.device newBufferWithLength:512 options:MTLResourceStorageModeShared];
-        if (!m_alpha || !m_q4 || !m_sc || !m_vocab_ids || !m_head_q4 || !m_head_sc || !m_fold_q4 || !m_fold_sc || !m_fold_b
+        if (!m_alpha || !m_fold || !m_fold_b
             || !m_f_rnn || !m_ctx_x || !m_ctx_kv || !m_h || !m_hn || !m_h1 || !m_qkv || !m_attn_out || !m_gu || !m_mlp_h
             || !m_base_logits || !m_rnn_state[0] || !m_rnn_state[1] || !m_beam_tok[0] || !m_beam_tok[1]
             || !m_rnn_in || !m_rnn_proj_out || !m_latent || !m_tg_val || !m_tg_row || !m_tg_sum || !m_out) {
@@ -775,55 +758,25 @@ public:
         }
         id<MTLCommandBuffer> cb = [gpu.queue commandBuffer];
         id<MTLComputeCommandEncoder> e = [cb computeCommandEncoderWithDispatchType:MTLDispatchTypeConcurrent];
-        struct MtpQ4BuildP { uint32_t rows, cols, ng, row_off; };
-        [e setComputePipelineState:p_mtp_q4];
-        for (const Q4Job& j : jobs) {
-            uint32_t roff = 0;
-            uint32_t ng = j.cols / 32;
-            for (const std::string& n : j.names) {
-                const Tensor& t = MT(n);
-                uint32_t r = uint32_t(t.shape[0]);
-                MtpQ4BuildP bp{r, j.cols, ng, roff};
-                [e setBuffer:mtp_file offset:t.offset atIndex:0];
-                [e setBuffer:m_q4 offset:j.dst->q4_off atIndex:1];
-                [e setBuffer:m_sc offset:j.dst->sc_off atIndex:2];
-                [e setBytes:&bp length:sizeof(bp) atIndex:3];
-                [e dispatchThreadgroups:MTLSizeMake(r, 1, 1) threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
-                roff += r;
-            }
-        }
-        struct MtpPackHeadPP { uint32_t dvocab, ng; };
-        MtpPackHeadPP php{DV, ng_h};
-        [e setComputePipelineState:p_mtp_pack_head];
-        [e setBuffer:head_q4 offset:0 atIndex:0];
-        [e setBuffer:head_sc offset:0 atIndex:1];
-        [e setBuffer:m_vocab_ids offset:0 atIndex:2];
-        [e setBuffer:m_head_q4 offset:0 atIndex:3];
-        [e setBuffer:m_head_sc offset:0 atIndex:4];
-        [e setBytes:&php length:sizeof(php) atIndex:5];
-        [e dispatchThreadgroups:MTLSizeMake(DV, 1, 1) threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
-        struct MtpFoldPP { uint32_t dvocab, cols, rank; };
-        MtpFoldPP fp{DV, c.hidden, mc.rank};
+        struct MtpFoldPP { uint32_t vocab, cols, rank; };
+        MtpFoldPP fp{V, c.hidden, mc.rank};
         [e setComputePipelineState:p_mtp_fold];
         [e setBuffer:file offset:unembed_mat.offset atIndex:0];
         [e setBuffer:mtp_file offset:m_hidden_out_w atIndex:1];
-        [e setBuffer:m_vocab_ids offset:0 atIndex:2];
-        [e setBuffer:m_fold_q4 offset:0 atIndex:3];
-        [e setBuffer:m_fold_sc offset:0 atIndex:4];
-        [e setBytes:&fp length:sizeof(fp) atIndex:5];
-        [e dispatchThreadgroups:MTLSizeMake((DV + 7) / 8, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
-        struct MtpBiasPP { uint32_t dvocab, cols; };
-        MtpBiasPP fbp{DV, c.hidden};
+        [e setBuffer:m_fold offset:0 atIndex:2];
+        [e setBytes:&fp length:sizeof(fp) atIndex:3];
+        [e dispatchThreadgroups:MTLSizeMake((V + 3) / 4, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        struct MtpBiasPP { uint32_t vocab, cols; };
+        MtpBiasPP fbp{V, c.hidden};
         [e setComputePipelineState:p_mtp_fold_b];
         [e setBuffer:file offset:unembed_mat.offset atIndex:0];
         [e setBuffer:mtp_file offset:m_hidden_out_b atIndex:1];
-        [e setBuffer:m_vocab_ids offset:0 atIndex:2];
-        [e setBuffer:m_fold_b offset:0 atIndex:3];
-        [e setBytes:&fbp length:sizeof(fbp) atIndex:4];
-        [e dispatchThreadgroups:MTLSizeMake((DV + 7) / 8, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        [e setBuffer:m_fold_b offset:0 atIndex:2];
+        [e setBytes:&fbp length:sizeof(fbp) atIndex:3];
+        [e dispatchThreadgroups:MTLSizeMake((V + 7) / 8, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
         [e endEncoding];
         gpu_seconds(cb);
-        mtp_ready = true;
+        mtp_weights_dtype = "BF16";        mtp_ready = true;
         return true;
     }
 
@@ -2261,29 +2214,27 @@ public:
     }
 
     struct MtpMixPP { uint32_t hidden, alpha_row, row_start; float eps; uint32_t use_map; uint32_t map[16]; };
-    struct MtpGemvQ4PP { uint32_t rows, cols, ng, x_stride, y_stride, round_out, has_bias; };
+    struct MtpGemvPP { uint32_t rows, cols, x_stride, y_stride, round_out, has_bias; };
     struct MtpCtxKvPP { uint32_t kv_heads, head_dim, pos0, kv_cap; float eps, log_theta; };
     struct MtpEmbedPP { uint32_t hidden; float eps; };
     struct MtpQkRopePP { uint32_t q_heads, kv_heads, head_dim, qkv_stride, pos0; float eps, log_theta; };
     struct MtpAttnPP { uint32_t prefix_len, ctx_start, q_heads, kv_heads, group, qkv_stride, q_dim, kv_dim, kv_cap; float scale; };
-    struct MtpBasePP { uint32_t vocab, ng, xs4; };
+    struct MtpBasePP { uint32_t vocab, chunks, xs4; };
     struct MtpRnnInPP { uint32_t rank, hidden, step, beams; uint32_t parent_b[4]; };
     struct MtpRnnGatePP { uint32_t rank, step; uint32_t parent_b[4]; };
     struct MtpMarkovPP { uint32_t dvocab, step, beams, ntg; float cap, inv_temp; };
     struct MtpReducePP { uint32_t ntg, step, beams; float inv_temp; };
 
-    void mtp_gemv_q4(const MtpQ4Mat& m, id<MTLBuffer> xbuf, uint32_t x_stride, id<MTLBuffer> ybuf, uint32_t y_stride, uint32_t M, bool round_out, uint64_t bias_off = 0, bool has_bias = false) {
-        MtpGemvQ4PP p{m.rows, m.cols, m.cols / 32, x_stride, y_stride, round_out ? 1u : 0u, has_bias ? 1u : 0u};
-        [enc setComputePipelineState:p_mtp_q4_rows[M]];
-        [enc setBuffer:m_q4 offset:m.q4_off atIndex:0];
-        [enc setBuffer:m_sc offset:m.sc_off atIndex:1];
-        [enc setBuffer:xbuf offset:0 atIndex:2];
-        [enc setBuffer:mtp_file offset:has_bias ? bias_off : 0 atIndex:3];
-        [enc setBuffer:ybuf offset:0 atIndex:4];
-        [enc setBytes:&p length:sizeof(p) atIndex:5];
+    void mtp_gemv(const MtpMat& m, id<MTLBuffer> xbuf, uint32_t x_stride, id<MTLBuffer> ybuf, uint32_t y_stride, uint32_t M, bool round_out, uint64_t bias_off = 0, bool has_bias = false) {
+        MtpGemvPP p{m.rows, m.cols, x_stride, y_stride, round_out ? 1u : 0u, has_bias ? 1u : 0u};
+        [enc setComputePipelineState:p_mtp_bf16_rows[M]];
+        [enc setBuffer:m_w offset:m.off atIndex:0];
+        [enc setBuffer:xbuf offset:0 atIndex:1];
+        [enc setBuffer:mtp_file offset:has_bias ? bias_off : 0 atIndex:2];
+        [enc setBuffer:ybuf offset:0 atIndex:3];
+        [enc setBytes:&p length:sizeof(p) atIndex:4];
         grid((m.rows + 31) / 32, 256);
     }
-
     void mtp_ingest_encode(uint32_t pos0, uint32_t commit, bool write_f_rnn, const uint32_t* tap_map = nullptr) {
         uint32_t H = mc.hidden;
         uint32_t kvw = mc.kv_heads * mc.head_dim;
@@ -2304,7 +2255,7 @@ public:
                 [enc setBuffer:m_ctx_x offset:0 atIndex:3];
                 [enc setBytes:&mp length:sizeof(mp) atIndex:4];
                 grid(mb, 576);
-                mtp_gemv_q4(ml.kv_ctx, m_ctx_x, H, m_ctx_kv, 2 * kvw, mb, false);
+                mtp_gemv(ml.kv_ctx, m_ctx_x, H, m_ctx_kv, 2 * kvw, mb, false);
                 MtpCtxKvPP kp{mc.kv_heads, mc.head_dim, pos0 + off, m_kv_cap[i], mc.eps, mc.log_theta};
                 [enc setComputePipelineState:p_mtp_ctx_kv];
                 [enc setBuffer:m_ctx_kv offset:0 atIndex:0];
@@ -2368,7 +2319,7 @@ public:
             [enc setBuffer:m_hn offset:0 atIndex:2];
             [enc setBytes:&np length:sizeof(np) atIndex:3];
             grid(8, 576);
-            mtp_gemv_q4(ml.qkv, m_hn, H, m_qkv, qkv_stride, 8, false);
+            mtp_gemv(ml.qkv, m_hn, H, m_qkv, qkv_stride, 8, false);
             MtpQkRopePP rp{mc.heads, mc.kv_heads, mc.head_dim, qkv_stride, prefix_len, mc.eps, mc.log_theta};
             [enc setComputePipelineState:p_mtp_qk_rope];
             [enc setBuffer:m_qkv offset:0 atIndex:0];
@@ -2385,7 +2336,7 @@ public:
             [enc setBuffer:m_attn_out offset:0 atIndex:3];
             [enc setBytes:&ap length:sizeof(ap) atIndex:4];
             grid2(mc.heads, 8, 128);
-            mtp_gemv_q4(ml.wo, m_attn_out, qdim, m_h1, H, 8, true);
+            mtp_gemv(ml.wo, m_attn_out, qdim, m_h1, H, 8, true);
             [enc setComputePipelineState:p_mtp_add_norm];
             [enc setBuffer:m_h offset:0 atIndex:0];
             [enc setBuffer:m_h1 offset:0 atIndex:1];
@@ -2393,13 +2344,13 @@ public:
             [enc setBuffer:m_hn offset:0 atIndex:3];
             [enc setBytes:&np length:sizeof(np) atIndex:4];
             grid(8, 576);
-            mtp_gemv_q4(ml.gu, m_hn, H, m_gu, 2 * mc.inter, 8, false);
+            mtp_gemv(ml.gu, m_hn, H, m_gu, 2 * mc.inter, 8, false);
             [enc setComputePipelineState:p_mtp_silu];
             [enc setBuffer:m_gu offset:0 atIndex:0];
             [enc setBuffer:m_mlp_h offset:0 atIndex:1];
             [enc setBytes:&mc.inter length:4 atIndex:2];
             grid2((mc.inter + 255) / 256, 8, 256);
-            mtp_gemv_q4(ml.down, m_mlp_h, mc.inter, m_h1, H, 8, true);
+            mtp_gemv(ml.down, m_mlp_h, mc.inter, m_h1, H, 8, true);
             uint32_t n4 = H / 4;
             [enc setComputePipelineState:p_mtp_add];
             [enc setBuffer:m_h offset:0 atIndex:0];
@@ -2414,13 +2365,12 @@ public:
         [enc setBytes:&np length:sizeof(np) atIndex:3];
         grid(8, 576);
         uint32_t DV = mc.dvocab;
-        MtpBasePP bp{DV, H / 32, H / 4};
+        MtpBasePP bp{DV, H / 8, H / 4};
         [enc setComputePipelineState:p_mtp_base7];
-        [enc setBuffer:m_head_q4 offset:0 atIndex:0];
-        [enc setBuffer:m_head_sc offset:0 atIndex:1];
-        [enc setBuffer:m_hn offset:0 atIndex:2];
-        [enc setBuffer:m_base_logits offset:0 atIndex:3];
-        [enc setBytes:&bp length:sizeof(bp) atIndex:4];
+        [enc setBuffer:file offset:unembed_mat.offset atIndex:0];
+        [enc setBuffer:m_hn offset:0 atIndex:1];
+        [enc setBuffer:m_base_logits offset:0 atIndex:2];
+        [enc setBytes:&bp length:sizeof(bp) atIndex:3];
         grid((DV + 31) / 32, 256);
         uint32_t mntg = (DV + 31) / 32;
         uint32_t rnn_in_dim = 2 * mc.rank + 2 * H;
@@ -2442,7 +2392,7 @@ public:
             [enc setBuffer:m_rnn_in offset:0 atIndex:5];
             [enc setBytes:&rip length:sizeof(rip) atIndex:6];
             grid(beams, 576);
-            mtp_gemv_q4(m_rnn_proj, m_rnn_in, rnn_in_dim, m_rnn_proj_out, 3 * mc.rank, beams, false, m_rnn_bias, true);
+            mtp_gemv(m_rnn_proj, m_rnn_in, rnn_in_dim, m_rnn_proj_out, 3 * mc.rank, beams, false, m_rnn_bias, true);
             MtpRnnGatePP rgp{mc.rank, k, {pb[0], pb[1], pb[2], pb[3]}};
             [enc setComputePipelineState:p_mtp_rnn_gates];
             [enc setBuffer:m_rnn_proj_out offset:0 atIndex:0];
@@ -2453,26 +2403,24 @@ public:
             grid(beams, 256);
             MtpMarkovPP mkp{DV, k, beams, mntg, c.softcap, inv_temp};
             [enc setComputePipelineState:p_mtp_mscan];
-            [enc setBuffer:m_fold_q4 offset:0 atIndex:0];
-            [enc setBuffer:m_fold_sc offset:0 atIndex:1];
-            [enc setBuffer:m_fold_b offset:0 atIndex:2];
-            [enc setBuffer:m_base_logits offset:0 atIndex:3];
-            [enc setBuffer:m_latent offset:0 atIndex:4];
-            [enc setBuffer:m_tg_val offset:0 atIndex:5];
-            [enc setBuffer:m_tg_row offset:0 atIndex:6];
-            [enc setBuffer:m_tg_sum offset:0 atIndex:7];
-            [enc setBytes:&mkp length:sizeof(mkp) atIndex:8];
+            [enc setBuffer:m_fold offset:0 atIndex:0];
+            [enc setBuffer:m_fold_b offset:0 atIndex:1];
+            [enc setBuffer:m_base_logits offset:0 atIndex:2];
+            [enc setBuffer:m_latent offset:0 atIndex:3];
+            [enc setBuffer:m_tg_val offset:0 atIndex:4];
+            [enc setBuffer:m_tg_row offset:0 atIndex:5];
+            [enc setBuffer:m_tg_sum offset:0 atIndex:6];
+            [enc setBytes:&mkp length:sizeof(mkp) atIndex:7];
             grid(mntg, 256);
             MtpReducePP rdp{mntg, k, beams, inv_temp};
             [enc setComputePipelineState:p_mtp_mred];
             [enc setBuffer:m_tg_val offset:0 atIndex:0];
             [enc setBuffer:m_tg_row offset:0 atIndex:1];
             [enc setBuffer:m_tg_sum offset:0 atIndex:2];
-            [enc setBuffer:m_vocab_ids offset:0 atIndex:3];
-            [enc setBuffer:m_out offset:0 atIndex:4];
-            [enc setBuffer:m_out offset:256 atIndex:5];
-            [enc setBuffer:bt_out offset:0 atIndex:6];
-            [enc setBytes:&rdp length:sizeof(rdp) atIndex:7];
+            [enc setBuffer:m_out offset:0 atIndex:3];
+            [enc setBuffer:m_out offset:256 atIndex:4];
+            [enc setBuffer:bt_out offset:0 atIndex:5];
+            [enc setBytes:&rdp length:sizeof(rdp) atIndex:6];
             grid(beams, 512);
         }
         [enc endEncoding];
@@ -2894,12 +2842,13 @@ int generate_command(int argc, char** argv) {
     double dec_toks = *steps > 1 ? double(*steps - 1) : 0.0;
     double acc_per_step = st.verify_steps ? double(st.spec_tokens) / double(st.verify_steps) : 1.0;
     bool is_lossy = mode != "exact";
+    std::string drafter_json = engine.mtp_ready ? ", \"drafter\": {\"weights\": \"" + engine.mtp_weights_dtype + "\", \"vocab\": " + std::to_string(engine.mc.dvocab) + "}" : "";
     std::printf("{\"output_ids\": [");
     for (size_t i = 0; i < st.out.size(); ++i) std::printf(i ? ", %u" : "%u", st.out[i]);
-    std::printf("], \"mode\": \"%s\", \"lossy\": %s, \"prompt_tokens\": %zu, \"prefill_tokens_per_s\": %.3f, \"decode_tokens_per_s\": %.3f, \"decode_gpu_tokens_per_s\": %.3f, \"verify_steps\": %llu, \"accepted_per_step\": %.3f%s%s%s}\n",
+    std::printf("], \"mode\": \"%s\", \"lossy\": %s, \"prompt_tokens\": %zu, \"prefill_tokens_per_s\": %.3f, \"decode_tokens_per_s\": %.3f, \"decode_gpu_tokens_per_s\": %.3f, \"verify_steps\": %llu, \"accepted_per_step\": %.3f%s%s%s%s}\n",
                 mode.c_str(), is_lossy ? "true" : "false",
                 ids.size(), ids.size() / st.prefill_wall, dec_toks / st.decode_wall, st.decode_gpu > 0 ? dec_toks / st.decode_gpu : 0.0,
-                static_cast<unsigned long long>(st.verify_steps), acc_per_step,
+                static_cast<unsigned long long>(st.verify_steps), acc_per_step, drafter_json.c_str(),
                 logprobs ? ", \"steps\": [" : "", steps_json.c_str(), logprobs ? "]" : "");
     return 0;
 }

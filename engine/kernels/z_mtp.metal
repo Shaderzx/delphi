@@ -1,40 +1,75 @@
-struct MtpNormP { uint vocab; uint rank; };
-
-kernel void mtp_w1_norms(device const ushort* w1 [[buffer(0)]],
-                         device float* norms [[buffer(1)]],
-                         constant MtpNormP& p [[buffer(2)]],
-                         uint group [[threadgroup_position_in_grid]],
-                         uint simd [[simdgroup_index_in_threadgroup]],
-                         uint simds [[simdgroups_per_threadgroup]],
-                         uint lane [[thread_index_in_simdgroup]]) {
-    uint row = group * simds + simd;
-    if (row >= p.vocab) return;
-    device const ushort* wr = w1 + ulong(row) * p.rank;
-    float s = 0.0f;
-    for (uint i = lane; i < p.rank; i += 32u) {
-        float v = bfv(wr[i]);
-        s += v * v;
-    }
-    float t = simd_sum(s);
-    if (lane == 0u) norms[row] = t;
+inline float4 mtp_bf16x4_lo(uint4 pk) {
+    return float4(as_type<float>(pk.x << 16), as_type<float>(pk.x & 0xffff0000u), as_type<float>(pk.y << 16), as_type<float>(pk.y & 0xffff0000u));
 }
 
-struct MtpPackHeadP { uint dvocab; uint ng; };
+inline float4 mtp_bf16x4_hi(uint4 pk) {
+    return float4(as_type<float>(pk.z << 16), as_type<float>(pk.z & 0xffff0000u), as_type<float>(pk.w << 16), as_type<float>(pk.w & 0xffff0000u));
+}
 
-kernel void mtp_pack_head_sub(device const uint4* src_q4 [[buffer(0)]],
-                              device const half* src_sc [[buffer(1)]],
-                              device const uint* vocab_ids [[buffer(2)]],
-                              device uint4* dst_q4 [[buffer(3)]],
-                              device half* dst_sc [[buffer(4)]],
-                              constant MtpPackHeadP& p [[buffer(5)]],
-                              uint row [[threadgroup_position_in_grid]],
-                              uint tid [[thread_position_in_threadgroup]],
-                              uint threads [[threads_per_threadgroup]]) {
-    if (row >= p.dvocab) return;
-    uint orig = vocab_ids[row];
-    for (uint g = tid; g < p.ng; g += threads) {
-        dst_q4[ulong(row) * p.ng + g] = src_q4[ulong(orig) * p.ng + g];
-        dst_sc[ulong(row) * p.ng + g] = src_sc[ulong(orig) * p.ng + g];
+struct MtpGemvP { uint rows; uint cols; uint x_stride; uint y_stride; uint round_out; uint has_bias; };
+
+kernel void mtp_gemv_bf16_rows(device const uint4* w [[buffer(0)]],
+                               device const half4* x4 [[buffer(1)]],
+                               device const ushort* bias [[buffer(2)]],
+                               device float* y [[buffer(3)]],
+                               constant MtpGemvP& p [[buffer(4)]],
+                               uint group [[threadgroup_position_in_grid]],
+                               uint simd [[simdgroup_index_in_threadgroup]],
+                               uint simds [[simdgroups_per_threadgroup]],
+                               uint lane [[thread_index_in_simdgroup]]) {
+    uint sub = lane >> 3;
+    uint sl = lane & 7u;
+    uint row = (group * simds + simd) * 4u + sub;
+    if (row >= p.rows) return;
+    uint xs4 = p.x_stride / 4u;
+    uint chunks = p.cols / 8u;
+    device const uint4* wr = w + ulong(row) * chunks;
+    float a[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+    for (uint c = sl; c < chunks; c += 8u) {
+        uint4 pk = wr[c];
+        float4 w0 = mtp_bf16x4_lo(pk);
+        float4 w1 = mtp_bf16x4_hi(pk);
+        uint k = c * 2u;
+        for (uint m = 0; m < ROWS; ++m) {
+            a[m] += dot(w0, float4(x4[ulong(m) * xs4 + k])) + dot(w1, float4(x4[ulong(m) * xs4 + k + 1u]));
+        }
+    }
+    float bv = p.has_bias ? bfv(bias[row]) : 0.0f;
+    for (uint m = 0; m < ROWS; ++m) {
+        float t = simd8_sum(a[m]) + bv;
+        if (sl == 0u) y[ulong(m) * p.y_stride + row] = p.round_out ? rbf(t) : t;
+    }
+}
+
+struct MtpBaseP { uint vocab; uint chunks; uint xs4; };
+
+kernel void mtp_base_logits_7(device const uint4* unembed [[buffer(0)]],
+                              device const half4* x4 [[buffer(1)]],
+                              device float* base_out [[buffer(2)]],
+                              constant MtpBaseP& p [[buffer(3)]],
+                              uint group [[threadgroup_position_in_grid]],
+                              uint simd [[simdgroup_index_in_threadgroup]],
+                              uint simds [[simdgroups_per_threadgroup]],
+                              uint lane [[thread_index_in_simdgroup]]) {
+    uint sub = lane >> 3;
+    uint sl = lane & 7u;
+    uint row = (group * simds + simd) * 4u + sub;
+    if (row >= p.vocab) return;
+    device const uint4* wr = unembed + ulong(row) * p.chunks;
+    float a[7] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+    for (uint c = sl; c < p.chunks; c += 8u) {
+        uint4 pk = wr[c];
+        float4 w0 = mtp_bf16x4_lo(pk);
+        float4 w1 = mtp_bf16x4_hi(pk);
+        uint k = c * 2u;
+        for (uint m = 0; m < 7u; ++m) {
+            ulong xr = ulong(m + 1u) * p.xs4 + k;
+            a[m] += dot(w0, float4(x4[xr])) + dot(w1, float4(x4[xr + 1u]));
+        }
+    }
+    for (uint m = 0; m < 7u; ++m) {
+        float t = simd8_sum(a[m]);
+        if (sl == 0u) base_out[ulong(m) * p.vocab + row] = t;
     }
 }
 
@@ -72,97 +107,58 @@ kernel void mtp_quant_q4(device const ushort* src [[buffer(0)]],
     }
 }
 
-struct MtpFoldP { uint dvocab; uint cols; uint rank; };
+struct MtpFoldP { uint vocab; uint cols; uint rank; };
+
+constant uint MTP_FOLD_ROWS = 4u;
+constant uint MTP_FOLD_MAX_COLS = 2304u;
 
 kernel void mtp_build_fold(device const ushort* unembed [[buffer(0)]],
                            device const ushort* proj [[buffer(1)]],
-                           device const uint* vocab_ids [[buffer(2)]],
-                           device uint4* fold_q4 [[buffer(3)]],
-                           device half* fold_sc [[buffer(4)]],
-                           constant MtpFoldP& p [[buffer(5)]],
+                           device half* fold [[buffer(2)]],
+                           constant MtpFoldP& p [[buffer(3)]],
                            uint group [[threadgroup_position_in_grid]],
-                           uint simd [[simdgroup_index_in_threadgroup]],
-                           uint lane [[thread_index_in_simdgroup]]) {
-    threadgroup half Us[8][24];
-    threadgroup half Ps[16][256];
-    threadgroup float Out[8][256];
-    uint v0 = group * 8u;
-    uint tid = simd * 32u + lane;
-    simdgroup_float8x8 a0 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
-    simdgroup_float8x8 a1 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
-    simdgroup_float8x8 a2 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
-    simdgroup_float8x8 a3 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
-    uint ur = tid >> 4;
-    uint uc = tid & 15u;
-    uint orig_v = (v0 + ur < p.dvocab) ? vocab_ids[v0 + ur] : 0u;
-    for (uint k0 = 0; k0 < p.cols; k0 += 16u) {
-        if (tid < 128u) {
-            Us[ur][uc] = (v0 + ur < p.dvocab) ? half(bfv(unembed[ulong(orig_v) * p.cols + k0 + uc])) : half(0);
-        }
-        for (uint row = 0; row < 16u; ++row) {
-            Ps[row][tid] = half(bfv(proj[ulong(k0 + row) * p.rank + tid]));
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        uint rbase = simd * 32u;
-        for (uint kk = 0; kk < 16u; kk += 8u) {
-            simdgroup_half8x8 mu, mp0, mp1, mp2, mp3;
-            simdgroup_load(mu, &Us[0][kk], 24);
-            simdgroup_load(mp0, &Ps[kk][rbase + 0u], 256);
-            simdgroup_load(mp1, &Ps[kk][rbase + 8u], 256);
-            simdgroup_load(mp2, &Ps[kk][rbase + 16u], 256);
-            simdgroup_load(mp3, &Ps[kk][rbase + 24u], 256);
-            simdgroup_multiply_accumulate(a0, mu, mp0, a0);
-            simdgroup_multiply_accumulate(a1, mu, mp1, a1);
-            simdgroup_multiply_accumulate(a2, mu, mp2, a2);
-            simdgroup_multiply_accumulate(a3, mu, mp3, a3);
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
+                           uint tid [[thread_position_in_threadgroup]],
+                           uint threads [[threads_per_threadgroup]]) {
+    threadgroup ushort u[MTP_FOLD_ROWS][MTP_FOLD_MAX_COLS];
+    uint v0 = group * MTP_FOLD_ROWS;
+    for (uint r = 0; r < MTP_FOLD_ROWS; ++r) {
+        uint v = v0 + r;
+        for (uint k = tid; k < p.cols; k += threads) u[r][k] = v < p.vocab ? unembed[ulong(v) * p.cols + k] : ushort(0);
     }
-    uint rbase = simd * 32u;
-    simdgroup_store(a0, &Out[0][rbase + 0u], 256);
-    simdgroup_store(a1, &Out[0][rbase + 8u], 256);
-    simdgroup_store(a2, &Out[0][rbase + 16u], 256);
-    simdgroup_store(a3, &Out[0][rbase + 24u], 256);
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (tid < 64u) {
-        uint lr = tid >> 3;
-        uint g = tid & 7u;
-        uint vr = v0 + lr;
-        if (vr < p.dvocab) {
-            uint rb = g * 32u;
-            float amax = 0.0f;
-            for (uint j = 0; j < 32u; ++j) amax = max(amax, fabs(Out[lr][rb + j]));
-            float s = amax > 0.0f ? amax / 7.0f : 1.0f;
-            half sh = half(s);
-            float sf = float(sh);
-            float inv = sf > 0.0f ? 1.0f / sf : 0.0f;
-            uint words[4] = {0u, 0u, 0u, 0u};
-            for (uint j = 0; j < 32u; ++j) {
-                int q = int(clamp(rint(Out[lr][rb + j] * inv), -7.0f, 7.0f));
-                words[j >> 3] |= uint(q + 8) << ((j & 7u) * 4u);
-            }
-            fold_q4[ulong(vr) * 8u + g] = uint4(words[0], words[1], words[2], words[3]);
-            fold_sc[ulong(vr) * 8u + g] = sh;
+    for (uint j = tid; j < p.rank; j += threads) {
+        float acc[MTP_FOLD_ROWS] = {0.0f, 0.0f, 0.0f, 0.0f};
+        for (uint k = 0; k < p.cols; ++k) {
+            float wv = bfv(proj[ulong(k) * p.rank + j]);
+            for (uint r = 0; r < MTP_FOLD_ROWS; ++r) acc[r] += bfv(u[r][k]) * wv;
+        }
+        for (uint r = 0; r < MTP_FOLD_ROWS; ++r) {
+            if (v0 + r < p.vocab) fold[ulong(v0 + r) * p.rank + j] = half(acc[r]);
         }
     }
 }
+
+
+
+
+
+
+
 
 struct MtpBiasP { uint dvocab; uint cols; };
 
 kernel void mtp_build_fold_bias(device const uint4* unembed [[buffer(0)]],
                                 device const ushort* bias [[buffer(1)]],
-                                device const uint* vocab_ids [[buffer(2)]],
-                                device float* fold_b [[buffer(3)]],
-                                constant MtpBiasP& p [[buffer(4)]],
+                                device float* fold_b [[buffer(2)]],
+                                constant MtpBiasP& p [[buffer(3)]],
                                 uint group [[threadgroup_position_in_grid]],
                                 uint simd [[simdgroup_index_in_threadgroup]],
                                 uint simds [[simdgroups_per_threadgroup]],
                                 uint lane [[thread_index_in_simdgroup]]) {
     uint row = group * simds + simd;
     if (row >= p.dvocab) return;
-    uint orig = vocab_ids[row];
     uint chunks = p.cols / 8u;
-    device const uint4* wr = unembed + ulong(orig) * chunks;
+    device const uint4* wr = unembed + ulong(row) * chunks;
     float acc = 0.0f;
     for (uint c = lane; c < chunks; c += 32u) {
         uint4 pk = wr[c];
@@ -266,78 +262,7 @@ kernel void mtp_rmsnorm_h(device const float4* x [[buffer(0)]],
     }
 }
 
-struct MtpGemvQ4P { uint rows; uint cols; uint ng; uint x_stride; uint y_stride; uint round_out; uint has_bias; };
 
-kernel void mtp_gemv_q4_rows(device const uint4* q4 [[buffer(0)]],
-                             device const half* sc [[buffer(1)]],
-                             device const half4* x4 [[buffer(2)]],
-                             device const ushort* bias [[buffer(3)]],
-                             device float* y [[buffer(4)]],
-                             constant MtpGemvQ4P& p [[buffer(5)]],
-                             uint group [[threadgroup_position_in_grid]],
-                             uint simd [[simdgroup_index_in_threadgroup]],
-                             uint simds [[simdgroups_per_threadgroup]],
-                             uint lane [[thread_index_in_simdgroup]]) {
-    uint sub = lane >> 3;
-    uint sl = lane & 7u;
-    uint row = (group * simds + simd) * 4u + sub;
-    if (row >= p.rows) return;
-    uint xs4 = p.x_stride / 4u;
-    device const uint4* qr = q4 + ulong(row) * p.ng;
-    device const half* sr = sc + ulong(row) * p.ng;
-    float a0 = 0, a1 = 0, a2 = 0, a3 = 0, a4 = 0, a5 = 0, a6 = 0, a7 = 0;
-    for (uint g = sl; g < p.ng; g += 8u) {
-        uint4 pk = qr[g];
-        float s = float(sr[g]);
-        uint g8 = g * 8u;
-        float d0 = 0, d1 = 0, d2 = 0, d3 = 0, d4 = 0, d5 = 0, d6 = 0, d7 = 0;
-        uint ws[4] = {pk.x, pk.y, pk.z, pk.w};
-        for (uint t = 0; t < 4u; ++t) {
-            uint ww = ws[t];
-            uint k0 = g8 + t * 2u;
-            {
-                float4 w = float4(u4_lo_h_fast(ww));
-                if (ROWS > 0u) d0 += dot(w, float4(x4[0ul*xs4 + k0]));
-                if (ROWS > 1u) d1 += dot(w, float4(x4[1ul*xs4 + k0]));
-                if (ROWS > 2u) d2 += dot(w, float4(x4[2ul*xs4 + k0]));
-                if (ROWS > 3u) d3 += dot(w, float4(x4[3ul*xs4 + k0]));
-                if (ROWS > 4u) d4 += dot(w, float4(x4[4ul*xs4 + k0]));
-                if (ROWS > 5u) d5 += dot(w, float4(x4[5ul*xs4 + k0]));
-                if (ROWS > 6u) d6 += dot(w, float4(x4[6ul*xs4 + k0]));
-                if (ROWS > 7u) d7 += dot(w, float4(x4[7ul*xs4 + k0]));
-            }
-            {
-                float4 w = float4(u4_hi_h_fast(ww));
-                uint k1 = k0 + 1u;
-                if (ROWS > 0u) d0 += dot(w, float4(x4[0ul*xs4 + k1]));
-                if (ROWS > 1u) d1 += dot(w, float4(x4[1ul*xs4 + k1]));
-                if (ROWS > 2u) d2 += dot(w, float4(x4[2ul*xs4 + k1]));
-                if (ROWS > 3u) d3 += dot(w, float4(x4[3ul*xs4 + k1]));
-                if (ROWS > 4u) d4 += dot(w, float4(x4[4ul*xs4 + k1]));
-                if (ROWS > 5u) d5 += dot(w, float4(x4[5ul*xs4 + k1]));
-                if (ROWS > 6u) d6 += dot(w, float4(x4[6ul*xs4 + k1]));
-                if (ROWS > 7u) d7 += dot(w, float4(x4[7ul*xs4 + k1]));
-            }
-        }
-        if (ROWS > 0u) a0 += d0 * s;
-        if (ROWS > 1u) a1 += d1 * s;
-        if (ROWS > 2u) a2 += d2 * s;
-        if (ROWS > 3u) a3 += d3 * s;
-        if (ROWS > 4u) a4 += d4 * s;
-        if (ROWS > 5u) a5 += d5 * s;
-        if (ROWS > 6u) a6 += d6 * s;
-        if (ROWS > 7u) a7 += d7 * s;
-    }
-    float bv = p.has_bias ? bfv(bias[row]) : 0.0f;
-    if (ROWS > 0u) { float t = simd8_sum(a0) + bv; if (sl == 0u) y[0ul * p.y_stride + row] = p.round_out ? rbf(t) : t; }
-    if (ROWS > 1u) { float t = simd8_sum(a1) + bv; if (sl == 0u) y[1ul * p.y_stride + row] = p.round_out ? rbf(t) : t; }
-    if (ROWS > 2u) { float t = simd8_sum(a2) + bv; if (sl == 0u) y[2ul * p.y_stride + row] = p.round_out ? rbf(t) : t; }
-    if (ROWS > 3u) { float t = simd8_sum(a3) + bv; if (sl == 0u) y[3ul * p.y_stride + row] = p.round_out ? rbf(t) : t; }
-    if (ROWS > 4u) { float t = simd8_sum(a4) + bv; if (sl == 0u) y[4ul * p.y_stride + row] = p.round_out ? rbf(t) : t; }
-    if (ROWS > 5u) { float t = simd8_sum(a5) + bv; if (sl == 0u) y[5ul * p.y_stride + row] = p.round_out ? rbf(t) : t; }
-    if (ROWS > 6u) { float t = simd8_sum(a6) + bv; if (sl == 0u) y[6ul * p.y_stride + row] = p.round_out ? rbf(t) : t; }
-    if (ROWS > 7u) { float t = simd8_sum(a7) + bv; if (sl == 0u) y[7ul * p.y_stride + row] = p.round_out ? rbf(t) : t; }
-}
 
 struct MtpCtxKvP { uint kv_heads; uint head_dim; uint pos0; uint kv_cap; float eps; float log_theta; };
 
@@ -597,58 +522,7 @@ kernel void mtp_silu_mul(device const float* gu [[buffer(0)]],
     out[ulong(m) * inter + j] = half(rbf((g * sigm(g)) * u));
 }
 
-struct MtpBaseP { uint dvocab; uint ng; uint xs4; };
 
-kernel void mtp_base_logits_7(device const uint4* q4 [[buffer(0)]],
-                              device const half* sc [[buffer(1)]],
-                              device const half4* x4 [[buffer(2)]],
-                              device half* base_out [[buffer(3)]],
-                              constant MtpBaseP& p [[buffer(4)]],
-                              uint group [[threadgroup_position_in_grid]],
-                              uint simd [[simdgroup_index_in_threadgroup]],
-                              uint simds [[simdgroups_per_threadgroup]],
-                              uint lane [[thread_index_in_simdgroup]]) {
-    uint sub = lane >> 3;
-    uint sl = lane & 7u;
-    uint row = (group * simds + simd) * 4u + sub;
-    if (row >= p.dvocab) return;
-    device const uint4* qr = q4 + ulong(row) * p.ng;
-    device const half* sr = sc + ulong(row) * p.ng;
-    float a0 = 0, a1 = 0, a2 = 0, a3 = 0, a4 = 0, a5 = 0, a6 = 0;
-    for (uint g = sl; g < p.ng; g += 8u) {
-        uint4 pk = qr[g];
-        float s = float(sr[g]);
-        uint g8 = g * 8u;
-        float d0 = 0, d1 = 0, d2 = 0, d3 = 0, d4 = 0, d5 = 0, d6 = 0;
-        uint ws[4] = {pk.x, pk.y, pk.z, pk.w};
-        for (uint t = 0; t < 4u; ++t) {
-            uint ww = ws[t];
-            uint k0 = g8 + t * 2u;
-            {
-                float4 w = float4(u4_lo_h_fast(ww));
-                d0 += dot(w, float4(x4[1ul*p.xs4 + k0])); d1 += dot(w, float4(x4[2ul*p.xs4 + k0])); d2 += dot(w, float4(x4[3ul*p.xs4 + k0])); d3 += dot(w, float4(x4[4ul*p.xs4 + k0]));
-                d4 += dot(w, float4(x4[5ul*p.xs4 + k0])); d5 += dot(w, float4(x4[6ul*p.xs4 + k0])); d6 += dot(w, float4(x4[7ul*p.xs4 + k0]));
-            }
-            {
-                float4 w = float4(u4_hi_h_fast(ww));
-                uint k1 = k0 + 1u;
-                d0 += dot(w, float4(x4[1ul*p.xs4 + k1])); d1 += dot(w, float4(x4[2ul*p.xs4 + k1])); d2 += dot(w, float4(x4[3ul*p.xs4 + k1])); d3 += dot(w, float4(x4[4ul*p.xs4 + k1]));
-                d4 += dot(w, float4(x4[5ul*p.xs4 + k1])); d5 += dot(w, float4(x4[6ul*p.xs4 + k1])); d6 += dot(w, float4(x4[7ul*p.xs4 + k1]));
-            }
-        }
-        a0 += d0 * s; a1 += d1 * s; a2 += d2 * s; a3 += d3 * s; a4 += d4 * s; a5 += d5 * s; a6 += d6 * s;
-    }
-    float t0 = simd8_sum(a0), t1 = simd8_sum(a1), t2 = simd8_sum(a2), t3 = simd8_sum(a3), t4 = simd8_sum(a4), t5 = simd8_sum(a5), t6 = simd8_sum(a6);
-    if (sl == 0u) {
-        base_out[0ul * p.dvocab + row] = half(t0);
-        base_out[1ul * p.dvocab + row] = half(t1);
-        base_out[2ul * p.dvocab + row] = half(t2);
-        base_out[3ul * p.dvocab + row] = half(t3);
-        base_out[4ul * p.dvocab + row] = half(t4);
-        base_out[5ul * p.dvocab + row] = half(t5);
-        base_out[6ul * p.dvocab + row] = half(t6);
-    }
-}
 
 struct MtpRnnInP { uint rank; uint hidden; uint step; uint beams; uint parent_b[4]; };
 
@@ -705,15 +579,14 @@ kernel void mtp_rnn_gates(device const float* proj [[buffer(0)]],
 
 struct MtpMarkovP { uint dvocab; uint step; uint beams; uint ntg; float cap; float inv_temp; };
 
-kernel void mtp_markov_scan(device const uint4* fold_q4 [[buffer(0)]],
-                            device const half* fold_sc [[buffer(1)]],
-                            device const float* fold_b [[buffer(2)]],
-                            device const half* base_logits [[buffer(3)]],
-                            device const half4* latent4 [[buffer(4)]],
-                            device float* tg_val [[buffer(5)]],
-                            device uint* tg_row [[buffer(6)]],
-                            device float* tg_sum [[buffer(7)]],
-                            constant MtpMarkovP& p [[buffer(8)]],
+kernel void mtp_markov_scan(device const half4* fold4 [[buffer(0)]],
+                            device const float* fold_b [[buffer(1)]],
+                            device const float* base_logits [[buffer(2)]],
+                            device const half4* latent4 [[buffer(3)]],
+                            device float* tg_val [[buffer(4)]],
+                            device uint* tg_row [[buffer(5)]],
+                            device float* tg_sum [[buffer(6)]],
+                            constant MtpMarkovP& p [[buffer(7)]],
                             uint group [[threadgroup_position_in_grid]],
                             uint simd [[simdgroup_index_in_threadgroup]],
                             uint lane [[thread_index_in_simdgroup]]) {
@@ -725,37 +598,21 @@ kernel void mtp_markov_scan(device const uint4* fold_q4 [[buffer(0)]],
     uint row = group * 32u + slot;
     float d0 = 0.0f, d1 = 0.0f, d2 = 0.0f;
     if (row < p.dvocab) {
-        uint4 pk = fold_q4[ulong(row) * 8u + g];
-        float s = float(fold_sc[ulong(row) * 8u + g]);
-        uint g8 = g * 8u;
-        device const half4* l0 = latent4 + g8;
-        device const half4* l1 = latent4 + 64u + g8;
-        device const half4* l2 = latent4 + 128u + g8;
-        half4 w0 = u4_lo_h_fast(pk.x), w1 = u4_hi_h_fast(pk.x);
-        half4 w2 = u4_lo_h_fast(pk.y), w3 = u4_hi_h_fast(pk.y);
-        half4 w4 = u4_lo_h_fast(pk.z), w5 = u4_hi_h_fast(pk.z);
-        half4 w6 = u4_lo_h_fast(pk.w), w7 = u4_hi_h_fast(pk.w);
-        half h0 = dot(w0, l0[0]) + dot(w1, l0[1]) + dot(w2, l0[2]) + dot(w3, l0[3])
-                + dot(w4, l0[4]) + dot(w5, l0[5]) + dot(w6, l0[6]) + dot(w7, l0[7]);
-        d0 = float(h0) * s;
-        if (p.beams > 1u) {
-            half h1 = dot(w0, l1[0]) + dot(w1, l1[1]) + dot(w2, l1[2]) + dot(w3, l1[3])
-                    + dot(w4, l1[4]) + dot(w5, l1[5]) + dot(w6, l1[6]) + dot(w7, l1[7]);
-            d1 = float(h1) * s;
+        device const half4* fr = fold4 + ulong(row) * 64u + g * 8u;
+        device const half4* l0 = latent4 + g * 8u;
+        for (uint i = 0; i < 8u; ++i) {
+            float4 w = float4(fr[i]);
+            d0 += dot(w, float4(l0[i]));
+            if (p.beams > 1u) d1 += dot(w, float4(l0[64u + i]));
+            if (p.beams > 2u) d2 += dot(w, float4(l0[128u + i]));
         }
-        if (p.beams > 2u) {
-            half h2 = dot(w0, l2[0]) + dot(w1, l2[1]) + dot(w2, l2[2]) + dot(w3, l2[3])
-                    + dot(w4, l2[4]) + dot(w5, l2[5]) + dot(w6, l2[6]) + dot(w7, l2[7]);
-            d2 = float(h2) * s;
-        }
-    }
-    d0 = simd8_sum(d0);
+    }    d0 = simd8_sum(d0);
     if (p.beams > 1u) d1 = simd8_sum(d1);
     if (p.beams > 2u) d2 = simd8_sum(d2);
     if (g == 0u) {
         sr[slot] = row;
         if (row < p.dvocab) {
-            float base = float(base_logits[ulong(p.step) * p.dvocab + row]) + fold_b[row];
+            float base = base_logits[ulong(p.step) * p.dvocab + row] + fold_b[row];
             float r0 = base + d0;
             sv[0][slot] = p.cap > 0.0f ? (p.cap * precise::tanh(r0 / p.cap)) : r0;
             if (p.beams > 1u) {
@@ -810,11 +667,10 @@ struct MtpReduceP { uint ntg; uint step; uint beams; float inv_temp; };
 kernel void mtp_markov_reduce(device const float* tg_val [[buffer(0)]],
                               device const uint* tg_row [[buffer(1)]],
                               device const float* tg_sum [[buffer(2)]],
-                              device const uint* vocab_ids [[buffer(3)]],
-                              device uint* tree_ids [[buffer(4)]],
-                              device float* tree_probs [[buffer(5)]],
-                              device uint* next_beam_tok [[buffer(6)]],
-                              constant MtpReduceP& p [[buffer(7)]],
+                              device uint* tree_ids [[buffer(3)]],
+                              device float* tree_probs [[buffer(4)]],
+                              device uint* next_beam_tok [[buffer(5)]],
+                              constant MtpReduceP& p [[buffer(6)]],
                               uint b [[threadgroup_position_in_grid]],
                               uint tid [[thread_position_in_threadgroup]],
                               uint lane [[thread_index_in_simdgroup]],
@@ -885,9 +741,9 @@ kernel void mtp_markov_reduce(device const float* tg_val [[buffer(0)]],
         float tot = 0.0f;
         for (uint i = 0u; i < 16u; ++i) tot += ms[i];
         float inv_tot = tot > 0.0f ? (1.0f / tot) : 0.0f;
-        uint id1 = r1 != 0xffffffffu ? vocab_ids[r1] : 0u;
-        uint id2 = r2 != 0xffffffffu ? vocab_ids[r2] : 0u;
-        uint id3 = r3 != 0xffffffffu ? vocab_ids[r3] : 0u;
+        uint id1 = r1 != 0xffffffffu ? r1 : 0u;
+        uint id2 = r2 != 0xffffffffu ? r2 : 0u;
+        uint id3 = r3 != 0xffffffffu ? r3 : 0u;
         float p1 = r1 != 0xffffffffu ? inv_tot : 0.0f;
         float p2 = r2 != 0xffffffffu ? (precise::exp((g2 - g1) * p.inv_temp) * inv_tot) : 0.0f;
         float p3 = r3 != 0xffffffffu ? (precise::exp((g3 - g1) * p.inv_temp) * inv_tot) : 0.0f;
