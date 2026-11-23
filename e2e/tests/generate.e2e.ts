@@ -10,11 +10,38 @@ const oraclePython = process.env.DELPHI_ORACLE_PYTHON ?? 'python3';
 const CLEANUP_RESERVE_MS = 30_000;
 
 type Case = { text: string; input_ids: number[]; output_ids: number[] };
-type Generated = { output_ids: number[]; prompt_tokens: number; decode_tokens_per_s: number; accepted_per_step?: number; mode?: string; lossy?: boolean };
+type Generated = { output_ids: number[]; prompt_tokens: number; decode_tokens_per_s: number; accepted_per_step?: number; mode?: string; lossy?: boolean; drafter?: { weights: string; vocab: number } };
 
 const truth = JSON.parse(readFileSync(join(import.meta.dirname, '..', 'fixtures', 'g4-sglang-greedy.json'), 'utf8')) as { cases: Case[] };
 const fibonacci = truth.cases.find((c) => c.text.startsWith('def fibonacci'))!;
 const paris = truth.cases.find((c) => c.text.startsWith('The capital of France'))!;
+const story = truth.cases.find((c) => c.text.startsWith('Once upon a time'))!;
+
+type LedgerEntry = { commit: string; mode?: string; results?: Record<string, number> };
+
+function ledgerEntries(): LedgerEntry[] {
+  const text = readFileSync(join(repo, 'bench', 'ledger.jsonl'), 'utf8');
+  const entries: LedgerEntry[] = [];
+  let depth = 0;
+  let start = -1;
+  let inString = false;
+  for (let i = 0; i < text.length; i++) {
+    const ch = text[i];
+    if (inString) {
+      if (ch === '\\') i++;
+      else if (ch === '"') inString = false;
+    } else if (ch === '"') inString = true;
+    else if (ch === '{') { if (depth++ === 0) start = i; }
+    else if (ch === '}' && --depth === 0) entries.push(JSON.parse(text.slice(start, i + 1)) as LedgerEntry);
+  }
+  return entries;
+}
+
+function safetensorsHeader(path: string): Record<string, { dtype: string; shape: number[] }> {
+  const buf = readFileSync(path);
+  const len = Number(buf.readBigUInt64LE(0));
+  return JSON.parse(buf.subarray(8, 8 + len).toString('utf8'));
+}
 
 function remainingMs(deadline: number): number {
   const left = deadline - Date.now() - CLEANUP_RESERVE_MS;
@@ -243,4 +270,23 @@ test('delphi generate picks the same 12 greedy tokens as the numpy oracle on the
   const expected = (JSON.parse(oracle.stdout) as { output_ids: number[] }).output_ids;
   expect(expected.slice(0, 5)).toEqual(paris.output_ids.slice(0, 5));
   expect(generate(paris.input_ids, steps, deadline).output_ids).toEqual(expected);
+});
+test('delphi generate drafts with the unquantized BF16 drafter over the full vocabulary and accepts more tokens per step than the INT4 drafter did', { tags: ['model'], timeout: 1_200_000 }, () => {
+  const deadline = Date.now() + 1_200_000;
+  const header = safetensorsHeader(join(model, 'mtp.safetensors'));
+  const shippedDtype = header['layers.0.mlp.down_proj.weight'].dtype;
+  const vocab = (JSON.parse(readFileSync(join(model, 'config.json'), 'utf8')) as { text_config: { unpadded_vocab_size: number } }).text_config.unpadded_vocab_size;
+  const int4 = ledgerEntries().find((e) => e.commit === '3ded365' && e.mode === 'exact')!.results!;
+  withBuiltDelphi(deadline, (bin) => {
+    for (const [c, int4Accepted] of [[fibonacci, int4.spec_fib_acc], [story, int4.spec_story_acc]] as const) {
+      const offRun = spawnSync(bin, ['generate', '--model', model, '--input-ids', JSON.stringify(c.input_ids), '--steps', '64', '--spec', 'off'], { encoding: 'utf8', timeout: remainingMs(deadline) });
+      checkRun('delphi generate --spec off', offRun);
+      const specRun = spawnSync(bin, ['generate', '--model', model, '--input-ids', JSON.stringify(c.input_ids), '--steps', '64', '--spec', 'auto'], { encoding: 'utf8', timeout: remainingMs(deadline) });
+      checkRun('delphi generate --spec auto', specRun);
+      const out = JSON.parse(specRun.stdout) as Generated;
+      expect(out.drafter).toEqual({ weights: shippedDtype, vocab });
+      expect(out.output_ids).toEqual((JSON.parse(offRun.stdout) as Generated).output_ids);
+      expect(out.accepted_per_step ?? 0).toBeGreaterThan(int4Accepted);
+    }
+  });
 });
