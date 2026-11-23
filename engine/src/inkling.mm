@@ -170,15 +170,17 @@ public:
     };
     TreeSpec active_tree{};
     static constexpr uint32_t MAX_FAN = 64;
-    static_assert(MAX_FAN <= MAX_BATCH, "fan-out stages 3 history rows per branch after the batch rows of each conv state");
-    struct FanStep { bool active = false; uint32_t prefix = 0, stride = 0, qpos = 0; };
+    static constexpr uint32_t FAN_RING_BASE = 3u + MAX_FAN;
+    static constexpr uint32_t FAN_CONV_ROWS = FAN_RING_BASE + 3u * MAX_FAN;
+    static_assert(MAX_FAN <= MAX_BATCH && MAX_FAN <= MAX_LOGITS_BATCH, "one fan-out step is one batch of at most MAX_FAN rows");
+    struct FanStep { bool active = false; uint32_t prefix = 0, stride = 0, qpos = 0, ring = 0; TreeSpec tree{}; };
     FanStep fan{};
-    bool full_local_kv = false;
+    bool fan_capacity = false;
     bool m4_dense = true;
     bool m4_experts = true;
-    id<MTLBuffer> fan_hist = nil, fan_meta = nil;
-    uint32_t fan_hist_stride = 0, fan_branches = 0;
-    id<MTLComputePipelineState> p_attend_fan = nil, p_fan_init = nil, p_fan_stage = nil, p_fan_commit = nil;
+    id<MTLBuffer> fan_meta = nil;
+    uint32_t fan_branches = 0;
+    id<MTLComputePipelineState> p_attend_fan = nil, p_fan_init = nil, p_fan_commit = nil;
     uint32_t pending_conv_src[3] = {0, 0, 0};
     bool has_pending_conv = false;
     uint32_t pending_kv_pos0 = 0;
@@ -331,7 +333,6 @@ public:
         p_attend_b = pipeline(gpu, @"attend_gated_batch");
         p_attend_fan = pipeline(gpu, @"attend_gated_fan");
         p_fan_init = pipeline(gpu, @"fan_conv_init");
-        p_fan_stage = pipeline(gpu, @"fan_conv_stage");
         p_fan_commit = pipeline(gpu, @"fan_conv_commit");
         p_route_b = pipeline(gpu, @"route_batch");
         p_union = pipeline(gpu, @"build_expert_union");
@@ -464,7 +465,7 @@ public:
         uint32_t core_len = c.core_end > c.core_start ? (c.core_end - c.core_start) : 1;
         for (uint32_t v = 0; v < visits; ++v) {
             uint32_t lid = v < c.layers ? v : (c.core_start + (v - c.layers) % core_len);
-            uint32_t cap = (c.local[lid] && !full_local_kv) ? std::min<uint32_t>(max_context, c.window + MAX_BATCH * 2) : max_context;
+            uint32_t cap = (c.local[lid] && !fan_capacity) ? std::min<uint32_t>(max_context, c.window + MAX_BATCH * 2) : max_context;
             kv_cap.push_back(cap);
             id<MTLBuffer> kb = [gpu.device newBufferWithLength:uint64_t(cap) * c.kv_heads * c.head_dim * 2 options:MTLResourceStorageModePrivate];
             id<MTLBuffer> vb = [gpu.device newBufferWithLength:uint64_t(cap) * c.kv_heads * c.head_dim * 2 options:MTLResourceStorageModePrivate];
@@ -475,7 +476,8 @@ public:
                 uint32_t width = s < 2 ? c.kv_heads * c.head_dim : c.hidden;
                 conv_off[v][s] = conv_floats * 4;
                 cmeta.push_back({uint32_t(conv_floats), width});
-                conv_floats += ((3u + MAX_BATCH + 3u * MAX_FAN) * width + 63u) / 64u * 64u;
+                uint32_t conv_rows = fan_capacity ? std::max<uint32_t>(3u + MAX_BATCH, FAN_CONV_ROWS) : 3u + MAX_BATCH;
+                conv_floats += (conv_rows * width + 63u) / 64u * 64u;
             }
         }
         conv_count = uint32_t(cmeta.size());
@@ -1607,64 +1609,70 @@ public:
     struct AttnBP { uint32_t pos0, rows, window, is_local, kv_heads, group, head_dim, extent, heads, q_stride, gate_stride, gate_off, sink_off, out_stride, kv_cap; float scale; uint32_t is_tree; uint32_t dep[64], mask[64]; };
     struct RelBP { uint32_t d_rel, extent, heads; };
     struct AttnFanP { uint32_t prefix, stride, qpos, rows, window, is_local, kv_heads, group, extent, heads, q_stride, gate_stride, gate_off, sink_off, out_stride, kv_cap; float scale; };
-    struct FanConvMetaHost { uint32_t state_off, hist_off, width, pad; };
-    struct FanConvP { uint32_t branches, hist_stride, rows, pad; };
+    struct FanConvMetaHost { uint32_t state_off, width; };
+    struct FanConvP { uint32_t ring_base, slot; };
 
-    void fan_conv_encode(id<MTLComputePipelineState> ps, uint32_t rows) {
-        FanConvP p{fan_branches, fan_hist_stride, rows, 0};
+    void fan_conv_encode(id<MTLComputePipelineState> ps, uint32_t slot) {
+        FanConvP p{FAN_RING_BASE, slot};
         [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
         [enc setComputePipelineState:ps];
         [enc setBuffer:conv_buf offset:0 atIndex:0];
-        [enc setBuffer:fan_hist offset:0 atIndex:1];
-        [enc setBuffer:fan_meta offset:0 atIndex:2];
-        [enc setBytes:&p length:sizeof(p) atIndex:3];
-        grid2(conv_count, rows, 256);
+        [enc setBuffer:fan_meta offset:0 atIndex:1];
+        [enc setBytes:&p length:sizeof(p) atIndex:2];
+        grid2(conv_count, fan_branches, 256);
         [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
     }
 
     bool fan_begin(uint32_t branches, uint32_t prefix, std::string& error) {
+        if (!fan_capacity) { error = "engine was not loaded for fan-out"; return false; }
         if (branches == 0 || branches > MAX_FAN) { error = "fan-out supports 1 to 64 branches"; return false; }
+        if (c.heads % c.kv_heads != 0 || c.heads / c.kv_heads > 4 || c.head_dim != 128) { error = "fan-out attention needs at most 4 query heads per key head and 128-wide heads"; return false; }
         std::vector<FanConvMetaHost> meta;
-        uint32_t hist = 0;
         uint32_t kvw = c.kv_heads * c.head_dim;
         for (const auto& offs : conv_off) {
-            for (int s = 0; s < 4; ++s) {
-                uint32_t width = s < 2 ? kvw : c.hidden;
-                meta.push_back({uint32_t(offs[s] / 4), hist, width, 0});
-                hist += 3 * width;
-            }
+            for (int s = 0; s < 4; ++s) meta.push_back({uint32_t(offs[s] / 4), s < 2 ? kvw : c.hidden});
         }
-        fan_hist_stride = hist;
-        fan_branches = branches;
         fan_meta = [gpu.device newBufferWithBytes:meta.data() length:meta.size() * sizeof(FanConvMetaHost) options:MTLResourceStorageModeShared];
-        fan_hist = [gpu.device newBufferWithLength:uint64_t(hist) * branches * 4 options:MTLResourceStorageModePrivate];
-        if (!fan_meta || !fan_hist) { error = "fan-out state allocation failed"; return false; }
+        if (!fan_meta) { error = "fan-out state allocation failed"; return false; }
+        fan_branches = branches;
         id<MTLCommandBuffer> cb = [gpu.queue commandBuffer];
         enc = [cb computeCommandEncoder];
-        fan_conv_encode(p_fan_init, branches);
+        fan_conv_encode(p_fan_init, 0);
         [enc endEncoding];
         gpu_seconds(cb);
+        fan = FanStep{};
         fan.prefix = prefix;
         fan.stride = branches;
-        active_tree = TreeSpec{};
-        active_tree.is_tree = 1u;
-        for (uint32_t b = 0; b < branches; ++b) {
-            active_tree.p3[b] = 3u + branches + 3u * b;
-            active_tree.p2[b] = active_tree.p3[b] + 1u;
-            active_tree.p1[b] = active_tree.p3[b] + 2u;
-        }
         return true;
     }
 
+    void fan_tree() {
+        fan.tree = TreeSpec{};
+        fan.tree.is_tree = 1u;
+        uint32_t oldest = fan.ring, middle = (fan.ring + 1u) % 3u, newest = (fan.ring + 2u) % 3u;
+        for (uint32_t b = 0; b < fan_branches; ++b) {
+            uint32_t base = FAN_RING_BASE + 3u * b;
+            fan.tree.p3[b] = base + oldest;
+            fan.tree.p2[b] = base + middle;
+            fan.tree.p1[b] = base + newest;
+        }
+    }
+
     double fan_step(const uint32_t* toks, uint32_t step) {
+        fan_tree();
         fan.active = true;
         fan.qpos = fan.prefix + step;
-        TreeSpec tree = active_tree;
-        double sec = step_rows(toks, fan.prefix + step * fan.stride, fan_branches, LOGITS_ALL, false, false, false, 0, 0, &tree);
+        double sec = step_rows(toks, fan.prefix + step * fan.stride, fan_branches, LOGITS_ALL, false, false, false, 0, 0, &fan.tree);
         fan.active = false;
+        fan.ring = (fan.ring + 1u) % 3u;
         return sec;
     }
 
+    void fan_end() {
+        fan = FanStep{};
+        fan_branches = 0;
+        fan_meta = nil;
+    }
     uint32_t attention(const LayerWeights& w, uint32_t visit, uint32_t sq, uint32_t sk, uint32_t sv, uint32_t pos0, uint32_t M) {
         uint32_t H = c.hidden;
         uint32_t kvw = c.kv_heads * c.head_dim;
@@ -2277,7 +2285,6 @@ public:
         if (pending_kv_count > 1) {
             kv_compact_encode();
         }
-        if (fan.active) fan_conv_encode(p_fan_stage, M);
         if (ingest_commit > 0 && mtp_ready) {
             mtp_ingest_encode(ingest_pos, ingest_commit, false, ingest_map);
         }
@@ -2326,7 +2333,7 @@ public:
             run_head_batch(hidden, M, lmode, full_logits);
         }
         if (auto_commit) conv_commit_encode(M);
-        if (fan.active) fan_conv_encode(p_fan_commit, M);
+        if (fan.active) fan_conv_encode(p_fan_commit, fan.ring);
         [enc endEncoding];
         double seconds = gpu_seconds(cb);
         if (next_slot > PERSIST_SLOTS || tmp_slot > slots) { std::fprintf(stderr, "delphi: arena overflow %u/%u\n", next_slot, tmp_slot); std::exit(3); }
@@ -2993,11 +3000,11 @@ int fanout_command(int argc, char** argv) {
     uint64_t kv_needed = prefix.size() + lockstep * B;
     if (kv_needed > Engine::CONTEXT_LIMIT) return refuse("prefix plus fanned-out branches exceeds 32768-token context");
     Engine engine;
-    engine.full_local_kv = true;
+    engine.fan_capacity = true;
     engine.max_context = uint32_t((kv_needed + 255) / 256 * 256);
     engine.m4_dense = false;
     bool tensor_experts = flags->switches.count("--tensor-experts") > 0;
-    bool bitwise = !tensor_experts || B < 24;
+    bool solo_identical = !tensor_experts || B < 24;
     engine.m4_experts = false;
     if (!engine.load(flags->values["--model"], head == "exact", pack == "bf12", false, mode, error)) {
         std::fprintf(stderr, "delphi: %s\n", error.c_str());
@@ -3030,6 +3037,7 @@ int fanout_command(int argc, char** argv) {
         }
     }
     auto w2 = std::chrono::steady_clock::now();
+    engine.fan_end();
     double prefill_wall = std::chrono::duration<double>(w1 - w0).count();
     double decode_wall = std::chrono::duration<double>(w2 - w1).count();
     uint64_t generated = uint64_t(B) * *steps;
@@ -3039,10 +3047,10 @@ int fanout_command(int argc, char** argv) {
         for (size_t i = 0; i < out[b].size(); ++i) std::printf(i ? ", %u" : "%u", out[b][i]);
         std::printf("]}");
     }
-    std::printf("], \"mode\": \"%s\", \"lossy\": %s, \"prefix_tokens\": %zu, \"branch_count\": %u, \"generated_tokens\": %llu, \"prefill_tokens_per_s\": %.3f, \"decode_tokens_per_s\": %.3f, \"decode_gpu_tokens_per_s\": %.3f, \"per_branch_tokens_per_s\": %.3f, \"lockstep_steps\": %llu, \"ms_per_step\": %.3f, \"bitwise\": %s}\n",
-                mode.c_str(), (mode != "exact" || !bitwise) ? "true" : "false", prefix.size(), B, static_cast<unsigned long long>(generated),
+    std::printf("], \"mode\": \"%s\", \"lossy\": %s, \"prefix_tokens\": %zu, \"branch_count\": %u, \"generated_tokens\": %llu, \"prefill_tokens_per_s\": %.3f, \"decode_tokens_per_s\": %.3f, \"decode_gpu_tokens_per_s\": %.3f, \"per_branch_tokens_per_s\": %.3f, \"lockstep_steps\": %llu, \"ms_per_step\": %.3f, \"solo_identical\": %s}\n",
+                mode.c_str(), (mode != "exact" || !solo_identical) ? "true" : "false", prefix.size(), B, static_cast<unsigned long long>(generated),
                 prefix.size() / prefill_wall, generated / decode_wall, gpu > 0 ? generated / gpu : 0.0, generated / decode_wall / B,
-                static_cast<unsigned long long>(lockstep), decode_wall * 1000.0 / double(lockstep), bitwise ? "true" : "false");
+                static_cast<unsigned long long>(lockstep), decode_wall * 1000.0 / double(lockstep), solo_identical ? "true" : "false");
     return 0;
 }
 int generate_command(int argc, char** argv) {

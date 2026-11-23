@@ -2467,62 +2467,34 @@ kernel void m4_q4_mm32(device const uint4* q4 [[buffer(0)]],
 }
 #endif
 
-struct FanConvMeta { uint state_off; uint hist_off; uint width; uint pad; };
-struct FanConvP { uint branches; uint hist_stride; uint rows; uint pad; };
+struct FanConvMeta { uint state_off; uint width; };
+struct FanConvP { uint ring_base; uint slot; };
 
 kernel void fan_conv_init(device float* conv_buf [[buffer(0)]],
-                          device float* hist [[buffer(1)]],
-                          device const FanConvMeta* meta [[buffer(2)]],
-                          constant FanConvP& p [[buffer(3)]],
+                          device const FanConvMeta* meta [[buffer(1)]],
+                          constant FanConvP& p [[buffer(2)]],
                           uint2 group [[threadgroup_position_in_grid]],
                           uint2 tid2 [[thread_position_in_threadgroup]],
                           uint2 threads2 [[threads_per_threadgroup]]) {
-    uint tid = tid2.x;
-    uint threads = threads2.x;
     FanConvMeta cm = meta[group.x];
-    device const float* st = conv_buf + cm.state_off;
-    device float* h = hist + ulong(group.y) * p.hist_stride + cm.hist_off;
-    for (uint i = tid; i < 3u * cm.width; i += threads) h[i] = st[i];
-}
-
-kernel void fan_conv_stage(device float* conv_buf [[buffer(0)]],
-                           device float* hist [[buffer(1)]],
-                           device const FanConvMeta* meta [[buffer(2)]],
-                           constant FanConvP& p [[buffer(3)]],
-                           uint2 group [[threadgroup_position_in_grid]],
-                           uint2 tid2 [[thread_position_in_threadgroup]],
-                           uint2 threads2 [[threads_per_threadgroup]]) {
-    uint tid = tid2.x;
-    uint threads = threads2.x;
-    FanConvMeta cm = meta[group.x];
-    uint b = group.y;
-    device float* st = conv_buf + cm.state_off + ulong(3u + p.rows + 3u * b) * cm.width;
-    device const float* h = hist + ulong(b) * p.hist_stride + cm.hist_off;
-    for (uint i = tid; i < 3u * cm.width; i += threads) st[i] = h[i];
+    device float* st = conv_buf + cm.state_off;
+    device float* ring = st + ulong(p.ring_base + 3u * group.y) * cm.width;
+    for (uint i = tid2.x; i < 3u * cm.width; i += threads2.x) ring[i] = st[i];
 }
 
 kernel void fan_conv_commit(device float* conv_buf [[buffer(0)]],
-                            device float* hist [[buffer(1)]],
-                            device const FanConvMeta* meta [[buffer(2)]],
-                            constant FanConvP& p [[buffer(3)]],
+                            device const FanConvMeta* meta [[buffer(1)]],
+                            constant FanConvP& p [[buffer(2)]],
                             uint2 group [[threadgroup_position_in_grid]],
                             uint2 tid2 [[thread_position_in_threadgroup]],
                             uint2 threads2 [[threads_per_threadgroup]]) {
-    uint tid = tid2.x;
-    uint threads = threads2.x;
     FanConvMeta cm = meta[group.x];
     uint b = group.y;
-    device const float* cur = conv_buf + cm.state_off + ulong(3u + b) * cm.width;
-    device float* h = hist + ulong(b) * p.hist_stride + cm.hist_off;
-    for (uint c = tid; c < cm.width; c += threads) {
-        float older = h[cm.width + c];
-        float newer = h[2u * cm.width + c];
-        h[c] = older;
-        h[cm.width + c] = newer;
-        h[2u * cm.width + c] = cur[c];
-    }
+    device float* st = conv_buf + cm.state_off;
+    device const float* cur = st + ulong(3u + b) * cm.width;
+    device float* slot = st + ulong(p.ring_base + 3u * b + p.slot) * cm.width;
+    for (uint c = tid2.x; c < cm.width; c += threads2.x) slot[c] = cur[c];
 }
-
 struct AttnFan { uint prefix; uint stride; uint qpos; uint rows; uint window; uint is_local; uint kv_heads; uint group; uint extent; uint heads; uint q_stride; uint gate_stride; uint gate_off; uint sink_off; uint out_stride; uint kv_cap; float scale; };
 
 kernel void attend_gated_fan(device const float4* q [[buffer(0)]],
