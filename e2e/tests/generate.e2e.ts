@@ -277,7 +277,7 @@ test('delphi generate --mode lean and --mode turbo match their own --spec off to
   });
 });
 
-test('delphi generate --tensor-prefill reads a chat prompt faster, reports itself lossy, and its speculation still matches its own --spec off', { tags: ['model'], timeout: 900_000 }, () => {
+test('delphi generate --prefill tensor reads a chat prompt faster in exact mode, reports itself lossy, its speculation still matches its own --spec off, and other --prefill values are refused', { tags: ['model'], timeout: 900_000 }, () => {
   const deadline = Date.now() + 900_000;
   const c = chat.cases[0];
   withBuiltDelphi(deadline, (bin) => {
@@ -287,12 +287,15 @@ test('delphi generate --tensor-prefill reads a chat prompt faster, reports itsel
       return JSON.parse(r.stdout) as Generated & { prefill_tokens_per_s: number };
     };
     const plain = run(['--spec', 'off']);
-    const fastPlain = run(['--spec', 'off', '--tensor-prefill']);
-    const fastSpec = run(['--spec', 'auto', '--tensor-prefill']);
+    const fastPlain = run(['--spec', 'off', '--prefill', 'tensor']);
+    const fastSpec = run(['--spec', 'auto', '--prefill', 'tensor']);
     expect(plain.lossy).toBe(false);
     expect(fastPlain.lossy).toBe(true);
     expect(fastSpec.lossy).toBe(true);
     expect(fastSpec.output_ids).toEqual(fastPlain.output_ids);
     expect(fastPlain.prefill_tokens_per_s).toBeGreaterThan(plain.prefill_tokens_per_s);
+    const bad = spawnSync(bin, ['generate', '--model', model, '--input-ids', JSON.stringify(c.input_ids), '--prefill', 'bogus'], { encoding: 'utf8', timeout: remainingMs(deadline) });
+    expect(bad.status).toBe(2);
+    expect(bad.stderr).toContain('--prefill');
   });
 });
