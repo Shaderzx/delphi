@@ -95,3 +95,20 @@ test('delphi fanout generates at least 200 tokens per second across 64 branches 
     expect(out.decode_tokens_per_s).toBeGreaterThanOrEqual(200);
   });
 });
+test('delphi fanout without --bitwise keeps 16 branches over a 160-token prefix token-for-token like decoding each alone', { tags: ['model'], timeout: 1_200_000 }, () => {
+  const deadline = Date.now() + 1_200_000;
+  const steps = 24;
+  const longPrefix = Array.from({ length: 8 }, () => fibonacci.input_ids).flat();
+  const heads = branchHeads.slice(0, 16);
+  withBuiltDelphi(deadline, (bin) => {
+    const run = spawnSync(bin, ['fanout', '--model', model, '--prefix-ids', JSON.stringify(longPrefix), '--branch-ids', JSON.stringify(heads), '--steps', String(steps)], { encoding: 'utf8', timeout: remainingMs(deadline) });
+    checkRun('delphi fanout', run);
+    const out = JSON.parse(run.stdout) as Fanout;
+    expect(out.bitwise).toBe(true);
+    heads.forEach((head, b) => {
+      const alone = spawnSync(bin, ['generate', '--model', model, '--input-ids', JSON.stringify([...longPrefix, ...head]), '--steps', String(steps), '--spec', 'off'], { encoding: 'utf8', timeout: remainingMs(deadline) });
+      checkRun(`delphi generate branch ${b}`, alone);
+      expect(out.branches[b].output_ids).toEqual((JSON.parse(alone.stdout) as Generated).output_ids);
+    });
+  });
+});
