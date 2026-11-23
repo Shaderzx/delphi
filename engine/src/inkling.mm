@@ -138,7 +138,7 @@ public:
     bool mtp_ready = false;
     bool has_m4_mpp = false;
     uint32_t eff_top = 8;
-    std::array<double, 13> cost_ms = {0.0, 21.6, 30.1, 35.8, 40.3, 47.9, 57.6, 63.4, 71.8, 80.0, 88.0, 96.0, 104.0};
+    std::array<double, 13> cost_ms = {0.0, 22.4, 27.0, 30.1, 33.5, 40.6, 46.0, 51.9, 57.0, 68.5, 74.3, 80.5, 85.2};
     struct MtpQ4Mat { uint64_t q4_off = 0, sc_off = 0; uint32_t rows = 0, cols = 0; };
     struct MtpLayer {
         bool local = false;
