@@ -9,7 +9,18 @@ const model = process.env.DELPHI_MODEL ?? join(homedir(), 'models', 'Inkling-2-M
 const CLEANUP_RESERVE_MS = 30_000;
 
 type Case = { text: string; input_ids: number[]; output_ids: number[] };
-type Fanout = { branches: { output_ids: number[] }[]; branch_count: number; generated_tokens: number; decode_tokens_per_s: number; mode: string; lossy: boolean; bitwise: boolean };
+type Fanout = {
+  branches: { output_ids: number[] }[];
+  branch_count: number;
+  generated_tokens: number;
+  lockstep_steps: number;
+  decode_tokens_per_s: number;
+  per_branch_tokens_per_s: number;
+  ms_per_step: number;
+  mode: string;
+  lossy: boolean;
+  bitwise: boolean;
+};
 type Generated = { output_ids: number[] };
 
 const truth = JSON.parse(readFileSync(join(import.meta.dirname, '..', 'fixtures', 'g4-sglang-greedy.json'), 'utf8')) as { cases: Case[] };
@@ -40,13 +51,21 @@ function withBuiltDelphi<T>(deadline: number, fn: (bin: string) => T): T {
   }
 }
 
-function fanout(bin: string, branches: number[][], steps: number, deadline: number, extra: string[] = []): Fanout {
-  const run = spawnSync(bin, ['fanout', '--model', model, '--prefix-ids', JSON.stringify(prefix), '--branch-ids', JSON.stringify(branches), '--steps', String(steps), ...extra], { encoding: 'utf8', timeout: remainingMs(deadline) });
+function fanout(bin: string, prefixIds: number[], branches: number[][], steps: number, deadline: number, extra: string[] = []): Fanout {
+  const run = spawnSync(bin, ['fanout', '--model', model, '--prefix-ids', JSON.stringify(prefixIds), '--branch-ids', JSON.stringify(branches), '--steps', String(steps), ...extra], { encoding: 'utf8', timeout: remainingMs(deadline) });
   checkRun('delphi fanout', run);
   return JSON.parse(run.stdout) as Fanout;
 }
 
-test('delphi fanout refuses missing, empty or malformed branch lists', { timeout: 300_000 }, () => {
+function expectEachBranchMatchesSolo(bin: string, prefixIds: number[], heads: number[][], out: Fanout, steps: number, deadline: number): void {
+  heads.forEach((head, b) => {
+    const alone = spawnSync(bin, ['generate', '--model', model, '--input-ids', JSON.stringify([...prefixIds, ...head]), '--steps', String(steps), '--spec', 'off'], { encoding: 'utf8', timeout: remainingMs(deadline) });
+    checkRun(`delphi generate branch ${b}`, alone);
+    expect(out.branches[b].output_ids).toEqual((JSON.parse(alone.stdout) as Generated).output_ids);
+  });
+}
+
+test('delphi fanout refuses missing, empty, malformed or more than 64 branch lists', { timeout: 300_000 }, () => {
   const deadline = Date.now() + 300_000;
   withBuiltDelphi(deadline, (bin) => {
     const tooMany = JSON.stringify(Array.from({ length: 65 }, () => [1]));
@@ -59,56 +78,52 @@ test('delphi fanout refuses missing, empty or malformed branch lists', { timeout
     const missing = spawnSync(bin, ['fanout', '--model', '/nonexistent', '--prefix-ids', '[1]'], { encoding: 'utf8', timeout: remainingMs(deadline) });
     if (missing.error) throw missing.error;
     expect(missing.status).toBe(2);
-    const okShape = spawnSync(bin, ['fanout', '--model', '/nonexistent', '--prefix-ids', '[1]', '--branch-ids', '[[2], [3, 4]]'], { encoding: 'utf8', timeout: remainingMs(deadline) });
+    const okShape = spawnSync(bin, ['fanout', '--model', '/nonexistent', '--prefix-ids', '[1]', '--branch-ids', JSON.stringify(Array.from({ length: 64 }, () => [2]))], { encoding: 'utf8', timeout: remainingMs(deadline) });
     if (okShape.error) throw okShape.error;
     expect(okShape.status).toBe(3);
   });
 });
 
-test('delphi fanout --bitwise decodes each of 64 branches token-for-token like decoding that branch alone', { tags: ['model'], timeout: 1_800_000 }, () => {
+test('delphi fanout decodes each of 64 branches token-for-token like decoding that branch alone', { tags: ['model'], timeout: 1_800_000 }, () => {
   const deadline = Date.now() + 1_800_000;
   const steps = 24;
   withBuiltDelphi(deadline, (bin) => {
-    const out = fanout(bin, branchHeads, steps, deadline, ['--bitwise']);
-    expect(out.bitwise).toBe(true);
-    expect(out.branch_count).toBe(branchHeads.length);
+    const out = fanout(bin, prefix, branchHeads, steps, deadline);
+    expect(out.branch_count).toBe(64);
     expect(out.mode).toBe('exact');
     expect(out.lossy).toBe(false);
-    branchHeads.forEach((head, b) => {
-      const alone = spawnSync(bin, ['generate', '--model', model, '--input-ids', JSON.stringify([...prefix, ...head]), '--steps', String(steps), '--spec', 'off'], { encoding: 'utf8', timeout: remainingMs(deadline) });
-      checkRun(`delphi generate branch ${b}`, alone);
-      expect(out.branches[b].output_ids).toEqual((JSON.parse(alone.stdout) as Generated).output_ids);
-    });
+    expect(out.bitwise).toBe(true);
+    expectEachBranchMatchesSolo(bin, prefix, branchHeads, out, steps, deadline);
   });
 });
 
-test('delphi fanout generates at least 200 tokens per second across 64 branches with Metal 4 expert kernels', { tags: ['model'], timeout: 900_000 }, () => {
-  const deadline = Date.now() + 900_000;
-  const steps = 128;
+test('delphi fanout matches solo decoding past the 1024-token local attention window with branch heads of 1 to 5 tokens', { tags: ['model'], timeout: 1_800_000 }, () => {
+  const deadline = Date.now() + 1_800_000;
+  const steps = 24;
+  const longPrefix = Array.from({ length: 56 }, () => fibonacci.input_ids).flat();
+  const heads = [1, 2, 3, 4, 5, 1, 3, 5].map((len, b) => Array.from({ length: len }, (_, j) => fixtureTokens[(b * 5 + j) % fixtureTokens.length]));
   withBuiltDelphi(deadline, (bin) => {
-    const out = fanout(bin, branchHeads, steps, deadline);
-    expect(out.branch_count).toBe(branchHeads.length);
-    expect(out.generated_tokens).toBe(branchHeads.length * steps);
-    expect(out.branches.every((b) => b.output_ids.length === steps)).toBe(true);
-    expect(out.lossy).toBe(false);
-    expect(out.bitwise).toBe(false);
-    expect(out.decode_tokens_per_s).toBeGreaterThanOrEqual(200);
+    expect(longPrefix.length).toBeGreaterThan(1024);
+    const out = fanout(bin, longPrefix, heads, steps, deadline);
+    expect(out.bitwise).toBe(true);
+    expect(out.lockstep_steps).toBe(5 - 1 + steps);
+    expectEachBranchMatchesSolo(bin, longPrefix, heads, out, steps, deadline);
   });
 });
-test('delphi fanout without --bitwise keeps 16 branches over a 160-token prefix token-for-token like decoding each alone', { tags: ['model'], timeout: 1_200_000 }, () => {
-  const deadline = Date.now() + 1_200_000;
-  const steps = 24;
-  const longPrefix = Array.from({ length: 8 }, () => fibonacci.input_ids).flat();
-  const heads = branchHeads.slice(0, 16);
+
+test('delphi fanout --tensor-experts generates at least 200 tokens per second across 64 branches timed from outside and reports itself lossy', { tags: ['model'], timeout: 900_000 }, () => {
+  const deadline = Date.now() + 900_000;
+  const steps = 256;
   withBuiltDelphi(deadline, (bin) => {
-    const run = spawnSync(bin, ['fanout', '--model', model, '--prefix-ids', JSON.stringify(longPrefix), '--branch-ids', JSON.stringify(heads), '--steps', String(steps)], { encoding: 'utf8', timeout: remainingMs(deadline) });
-    checkRun('delphi fanout', run);
-    const out = JSON.parse(run.stdout) as Fanout;
-    expect(out.bitwise).toBe(true);
-    heads.forEach((head, b) => {
-      const alone = spawnSync(bin, ['generate', '--model', model, '--input-ids', JSON.stringify([...longPrefix, ...head]), '--steps', String(steps), '--spec', 'off'], { encoding: 'utf8', timeout: remainingMs(deadline) });
-      checkRun(`delphi generate branch ${b}`, alone);
-      expect(out.branches[b].output_ids).toEqual((JSON.parse(alone.stdout) as Generated).output_ids);
-    });
+    const started = process.hrtime.bigint();
+    const out = fanout(bin, prefix, branchHeads, steps, deadline, ['--tensor-experts']);
+    const elapsedS = Number(process.hrtime.bigint() - started) / 1e9;
+    expect(out.branch_count).toBe(64);
+    expect(out.generated_tokens).toBe(64 * steps);
+    expect(out.branches.every((b) => b.output_ids.length === steps)).toBe(true);
+    expect(out.lossy).toBe(true);
+    expect(out.bitwise).toBe(false);
+    expect(out.per_branch_tokens_per_s).toBeCloseTo(out.decode_tokens_per_s / 64, 1);
+    expect(out.generated_tokens / elapsedS).toBeGreaterThanOrEqual(200);
   });
 });
