@@ -30,30 +30,34 @@ Qualification highlights (exact mode unless noted):
   - `--mode lean`: Tail-free `half4` 8/2-lane INT4-g32 dense attention and controller projections + Metal 4 `bfloat` Q4 `matmul2d` prefill (`M>=24`) with exact BF16 router, all 8 experts, and certified head. Preserves 64/64 exact tokens on `fibonacci` and `copy_code` and 5/5 exact 4.6K needle retrieval (`390.9 tok/s` prefill) while cutting non-mmap footprint by 620 MiB.
   - `--mode turbo`: `lean` + top-3 expert routing. Preserves Paris answer, clean recursive Python on `fibonacci`, and fluent prose on `story` while hitting **140.1 fib / 192.5 copy_code / 575.6 p160 / 755.6 prefill tok/s** (does not guarantee long-context needle retrieval).
 
-## Fan-out decoding (one prompt, many continuations, one weight read)
+## Fan-out decoding (throughput: one prompt, many continuations, one weight read)
 
-`delphi fanout` decodes up to 64 continuations of one shared prefix together. Every step feeds one token per branch through the model as a single batch, so each weight byte read from memory serves every branch at once. It suits requests that need many independent continuations of the same context: the sections of an outlined answer, several candidate completions, or a batch of short tasks over one document. It does not make one continuation faster: a single branch still decodes at the single-stream rate.
+`delphi fanout` decodes up to 64 continuations of one shared prefix together. Every step feeds one token per branch through the model as a single batch, so each weight byte read from memory serves every branch at once. It suits requests that need many independent continuations of the same context: the sections of an outlined answer, several candidate completions, or a batch of short tasks over one document.
 
-The numbers below are aggregate decode tok/s summed over all branches (`delphi fanout`, 128 steps per branch, median of 3, logged in [bench/ledger.jsonl](bench/ledger.jsonl) at `bed1497`). Per branch, divide by the branch count; the JSON also reports `per_branch_tokens_per_s` and `ms_per_step`.
+This is a throughput feature. It does not make one conversation faster: a single branch decodes at the single-stream rate (42.6 tok/s here), and single-stream `generate`/`bench` speed and memory are unchanged by it (interleaved controls in the ledger).
 
-| Branches (35-token prefix) | `exact` (token-identical) | `exact --tensor-experts` (lossy) | `lean --tensor-experts` (lossy) | `turbo --tensor-experts` (lossy) |
-|---:|---:|---:|---:|---:|
-| 1 | 42.1 | 42.2 | 52.7 | 70.8 |
-| 8 | 122.0 | 121.7 | 132.9 | 226.8 |
-| 32 | 149.7 | 197.5 | 226.2 | 328.5 |
-| 64 | 150.5 | **241.2** | 285.3 | 392.0 |
+Aggregate decode tok/s summed over all branches (`delphi fanout`, 35-token prefix, 128 steps per branch, median of 3 runs, raw runs in [bench/ledger.jsonl](bench/ledger.jsonl) at `13691c9`):
+
+| Branches | `exact` (token-identical) | `--tensor-experts` (lossy) | `--tensor-experts --tensor-dense` (lossy) | `lean --tensor-experts` (lossy) | `turbo --tensor-experts` (lossy) |
+|---:|---:|---:|---:|---:|---:|
+| 1 | 42.6 | 42.4 | 42.4 | 53.3 | 70.0 |
+| 8 | 123.3 | 122.9 | 122.5 | 133.9 | 224.2 |
+| 32 | 151.1 | 199.4 | 207.3 | 222.3 | 322.6 |
+| 64 | 152.1 | **243.9** | **293.1** | 279.4 | 382.7 |
+
+Per branch at 64 branches: 2.38 tok/s token-identical, 3.81 with `--tensor-experts`. Prefill of the shared prefix runs at 134-155 tok/s, because fan-out keeps the prefill on the one-row-identical kernels. Peak memory footprint: 1.94 GiB at one branch, 3.45 GiB at 64 (exact, 35-token prefix), 6.45 GiB at 64 branches over a 16K prefix.
 
 | 64 branches, prefix length | 35 | 1,024 | 4,096 | 16,384 |
 |---|---:|---:|---:|---:|
-| `exact` | 150.5 | 129.2 | 121.1 | 97.3 |
-| `exact --tensor-experts` | 241.2 | 197.5 | 180.8 | 130.3 |
+| `exact` | 152.1 | 130.1 | 121.0 | 97.3 |
+| `exact --tensor-experts` | 243.9 | 194.8 | 176.5 | 130.5 |
 
 What is and is not exact:
-- By default every branch is token-for-token identical to decoding that branch alone with `delphi generate --spec off`. The e2e suite checks all 64 branches over a 35-token prefix, and 8 branches with 1-5 token heads over a 1,120-token prefix that crosses the 1,024-token local attention window.
-- `--tensor-experts` switches the expert matmuls to the Metal 4 `matmul2d` kernels once a batch reaches 24 rows. They round expert products differently from the one-row kernels, so branches can pick a different token after a dozen or more steps. The run then reports `"lossy": true, "bitwise": false`. Below 24 branches the flag changes nothing and the run stays token-identical.
-- Only `--tensor-experts` (or `lean`/`turbo`) passes 200 tok/s. The token-identical path tops out near 150 tok/s because the one-row expert kernels are ALU-bound on half-precision products, which the tensor units cannot reproduce bit for bit.
+- By default every branch is token-for-token identical to decoding that branch alone with `delphi generate --spec off` in the same `--mode` and `--head`, and the JSON says `"solo_identical": true`. This is structural, not luck: `attend_gated_fan` accumulates keys in the same order as the one-row `attend_gated` kernel, the dense and expert matmuls stay on the batched kernels the `probe gemv` tests prove bit-identical to one row, and the short-convolution histories are the solo values. The e2e suite checks it on all 64 branches for 128 steps, at 1, 7, 25 and 23 (tensor-threshold) branches, across the 1,024-token local window with 1-5 token heads, at the 32,768-token context limit, in `lean`, and with `--head full`.
+- `--tensor-experts` and `--tensor-dense` switch expert and dense matmuls to the Metal 4 `matmul2d` kernels once a batch reaches 24 rows. The run then reports `"lossy": true, "solo_identical": false`. Tensor experts round expert products differently: in the suite, sampled branches keep the solo tokens for their first 8 steps and agree on at least 80% of 24 (measured 100%). Tensor dense also rounds activations to BF16 first, which costs more: 74.5% agreement over 24 steps in our measurement, so it is a separate flag.
+- Only the lossy flags pass 200 tok/s. The token-identical path tops out near 152 tok/s because the one-row expert kernels are ALU-bound on half-precision products, which the tensor units cannot reproduce bit for bit.
 
-How it works: the prefix is prefilled once. Branch tokens are stored interleaved after it (step `s` of branch `b` lives at slot `prefix + s * branches + b`), and `attend_gated_fan` maps each branch's logical positions onto that layout, reading each key once for the three query heads that share it. Every branch attends to the prefix plus only its own tokens. The four short convolutions per layer keep a three-token history per branch, staged into spare conv-state rows and wired in as tree-verify parents, so the batched kernels run unchanged. Branches run in lockstep: a branch with a shorter head starts generating earlier and finishes earlier, and the run lasts `longest head - 1 + steps` steps (`lockstep_steps` in the JSON). The KV cache is sized to the run (`prefix + lockstep_steps * branches`). Sharing prefix keys across four branches per threadgroup was measured slower (718.6 vs 652.9 ms/step at a 16K prefix) and is not used.
+How it works: the prefix is prefilled once. Branch tokens are stored interleaved after it (step `s` of branch `b` lives at slot `prefix + s * branches + b`), and `attend_gated_fan` maps each branch's logical positions onto that layout, reading each key once for the query heads that share it. Every branch attends to the prefix plus only its own tokens. The four short convolutions per layer keep a three-token history per branch in a ring inside the conv state; each step the tree-verify parent slots point at that ring and one row per branch is committed, so the batched kernels run unchanged. Branches run in lockstep: the run lasts `longest head - 1 + steps` steps (`lockstep_steps` in the JSON), and a branch with a shorter head starts and finishes earlier. The KV cache is sized to the run (`prefix + lockstep_steps * branches`, at most 32,768), and the extra conv rows are only reserved when the engine is loaded for fan-out. Sharing prefix keys across four branches per threadgroup was measured slower (718.6 vs 652.9 ms/step at a 16K prefix) and is not used.
 ## Building and running
 
 ```bash
@@ -80,7 +84,7 @@ Flags: `--mode exact|lean|turbo` (default `exact`), `--spec off|lookup|mtp|auto`
   --steps 64
 ```
 
-`delphi fanout` flags: `--prefix-ids JSON` (shared prefix), `--branch-ids JSON` (1 to 64 non-empty token arrays, one per branch), `--steps N` (tokens generated per branch, default 64), `--tensor-experts` (opt in to the faster Metal 4 expert kernels; output is then reported `lossy`), plus `--mode`, `--head` and `--pack` as above.
+`delphi fanout` flags: `--prefix-ids JSON` (shared prefix), `--branch-ids JSON` (1 to 64 non-empty token arrays, one per branch), `--steps N` (tokens generated per branch, default 64), `--tensor-experts` and `--tensor-dense` (opt in to the Metal 4 `matmul2d` kernels for expert and dense matmuls from 24 branches up; output is then reported `lossy`), plus `--mode`, `--head` and `--pack` as above.
 Exact means token-identical to Delphi's own plain greedy decoding on the shipped weights. Faster modes that change the output are opt-in and labelled (`"lossy": true` in JSON output).
 
 ## Using Delphi in your project
