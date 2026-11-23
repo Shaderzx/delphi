@@ -2973,7 +2973,7 @@ std::optional<std::vector<std::vector<uint32_t>>> parse_branch_ids(const std::st
 
 int fanout_command(int argc, char** argv) {
     std::string error;
-    auto flags = parse_flags(argc, argv, {"--model", "--prefix-ids", "--branch-ids", "--steps", "--head", "--pack", "--mode"}, {"--tensor-experts"}, error);
+    auto flags = parse_flags(argc, argv, {"--model", "--prefix-ids", "--branch-ids", "--steps", "--head", "--pack", "--mode"}, {"--tensor-experts", "--tensor-dense"}, error);
     if (!flags) return refuse(error);
     auto steps = whole_flag(*flags, "--steps", 64, 1, 4000, error);
     if (!steps) return refuse(error);
@@ -3004,7 +3004,8 @@ int fanout_command(int argc, char** argv) {
     engine.max_context = uint32_t((kv_needed + 255) / 256 * 256);
     engine.m4_dense = false;
     bool tensor_experts = flags->switches.count("--tensor-experts") > 0;
-    bool solo_identical = !tensor_experts || B < 24;
+    bool tensor_dense = flags->switches.count("--tensor-dense") > 0;
+    bool solo_identical = !(tensor_experts || tensor_dense) || B < 24;
     engine.m4_experts = false;
     if (!engine.load(flags->values["--model"], head == "exact", pack == "bf12", false, mode, error)) {
         std::fprintf(stderr, "delphi: %s\n", error.c_str());
@@ -3021,6 +3022,7 @@ int fanout_command(int argc, char** argv) {
         i += chunk;
     }
     engine.m4_experts = tensor_experts;
+    engine.m4_dense = tensor_dense;
     if (!engine.fan_begin(B, uint32_t(prefix.size()), error)) {
         std::fprintf(stderr, "delphi: %s\n", error.c_str());
         return 3;
