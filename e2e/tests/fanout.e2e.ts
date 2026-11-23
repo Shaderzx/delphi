@@ -16,6 +16,7 @@ type Fanout = {
   lockstep_steps: number;
   decode_tokens_per_s: number;
   per_branch_tokens_per_s: number;
+  end_to_end_tokens_per_s: number;
   ms_per_step: number;
   mode: string;
   lossy: boolean;
@@ -57,15 +58,15 @@ function fanout(bin: string, prefixIds: number[], branches: number[][], steps: n
   return JSON.parse(run.stdout) as Fanout;
 }
 
-function expectEachBranchMatchesSolo(bin: string, prefixIds: number[], heads: number[][], out: Fanout, steps: number, deadline: number): void {
+function expectEachBranchMatchesSolo(bin: string, prefixIds: number[], heads: number[][], out: Fanout, steps: number, deadline: number, extra: string[] = []): void {
   heads.forEach((head, b) => {
-    const alone = spawnSync(bin, ['generate', '--model', model, '--input-ids', JSON.stringify([...prefixIds, ...head]), '--steps', String(steps), '--spec', 'off'], { encoding: 'utf8', timeout: remainingMs(deadline) });
+    const alone = spawnSync(bin, ['generate', '--model', model, '--input-ids', JSON.stringify([...prefixIds, ...head]), '--steps', String(steps), '--spec', 'off', ...extra], { encoding: 'utf8', timeout: remainingMs(deadline) });
     checkRun(`delphi generate branch ${b}`, alone);
     expect(out.branches[b].output_ids).toEqual((JSON.parse(alone.stdout) as Generated).output_ids);
   });
 }
 
-test('delphi fanout refuses missing, empty, malformed or more than 64 branch lists, and runs past the 32768-token context', { timeout: 300_000 }, () => {
+test('delphi fanout refuses missing, empty, malformed or more than 64 branch lists, and refuses runs that would exceed the 32768-token context', { timeout: 300_000 }, () => {
   const deadline = Date.now() + 300_000;
   withBuiltDelphi(deadline, (bin) => {
     const tooMany = JSON.stringify(Array.from({ length: 65 }, () => [1]));
@@ -88,7 +89,7 @@ test('delphi fanout refuses missing, empty, malformed or more than 64 branch lis
   });
 });
 
-test('delphi fanout decodes each of 64 branches token-for-token like decoding that branch alone for 128 steps', { tags: ['model'], timeout: 2_400_000 }, () => {
+test('delphi fanout decodes each of 64 branches token-for-token like decoding that branch alone for 128 steps at 140 tok/s or more, and reports a slower end-to-end rate that includes prefill', { tags: ['model'], timeout: 2_400_000 }, () => {
   const deadline = Date.now() + 2_400_000;
   const steps = 128;
   withBuiltDelphi(deadline, (bin) => {
@@ -97,6 +98,9 @@ test('delphi fanout decodes each of 64 branches token-for-token like decoding th
     expect(out.mode).toBe('exact');
     expect(out.lossy).toBe(false);
     expect(out.solo_identical).toBe(true);
+    expect(out.decode_tokens_per_s).toBeGreaterThanOrEqual(140);
+    expect(out.end_to_end_tokens_per_s).toBeGreaterThan(0);
+    expect(out.end_to_end_tokens_per_s).toBeLessThan(out.decode_tokens_per_s);
     expectEachBranchMatchesSolo(bin, prefix, branchHeads, out, steps, deadline);
   });
 });
@@ -203,7 +207,7 @@ test('delphi fanout --tensor-experts decodes over 200 tokens per second across 6
     expect(out.generated_tokens / elapsedS).toBeGreaterThanOrEqual(180);
   });
 });
-test('delphi fanout stays token-for-token like solo decoding when 64 branches fill the 32768-token context', { tags: ['model'], timeout: 1_800_000 }, () => {
+test('delphi fanout stays token-for-token like solo decoding when 64 branches fill the 32768-slot KV buffer', { tags: ['model'], timeout: 1_800_000 }, () => {
   const deadline = Date.now() + 1_800_000;
   const steps = Math.floor((32768 - prefix.length) / 64) - 1;
   withBuiltDelphi(deadline, (bin) => {
@@ -235,7 +239,7 @@ test('delphi fanout --head full matches solo --head full decoding token-for-toke
   });
 });
 
-test('delphi fanout --tensor-dense decodes faster than --tensor-experts alone at 64 branches and reports itself lossy', { tags: ['model'], timeout: 900_000 }, () => {
+test('delphi fanout --tensor-dense decodes faster than --tensor-experts alone at 64 branches, reports itself lossy and keeps sampled branches on at least half the solo tokens', { tags: ['model'], timeout: 900_000 }, () => {
   const deadline = Date.now() + 900_000;
   const steps = 128;
   withBuiltDelphi(deadline, (bin) => {
@@ -244,5 +248,65 @@ test('delphi fanout --tensor-dense decodes faster than --tensor-experts alone at
     expect(dense.lossy).toBe(true);
     expect(dense.solo_identical).toBe(false);
     expect(dense.decode_tokens_per_s).toBeGreaterThan(experts.decode_tokens_per_s);
+    const sampleSteps = 24;
+    let same = 0;
+    for (let b = 0; b < branchHeads.length; b += 16) {
+      const alone = spawnSync(bin, ['generate', '--model', model, '--input-ids', JSON.stringify([...prefix, ...branchHeads[b]]), '--steps', String(sampleSteps), '--spec', 'off'], { encoding: 'utf8', timeout: remainingMs(deadline) });
+      checkRun(`delphi generate branch ${b}`, alone);
+      const solo = (JSON.parse(alone.stdout) as Generated).output_ids;
+      same += solo.filter((id, i) => dense.branches[b].output_ids[i] === id).length;
+    }
+    expect(same / (4 * sampleSteps)).toBeGreaterThanOrEqual(0.5);
+  });
+});
+
+test('delphi fanout --mode lean and --mode turbo match solo decoding in the same mode token-for-token at 25 branches', { tags: ['model'], timeout: 1_800_000 }, () => {
+  const deadline = Date.now() + 1_800_000;
+  const steps = 16;
+  const heads = branchHeads.slice(0, 25);
+  withBuiltDelphi(deadline, (bin) => {
+    for (const mode of ['lean', 'turbo']) {
+      const out = fanout(bin, prefix, heads, steps, deadline, ['--mode', mode]);
+      expect(out.mode).toBe(mode);
+      expect(out.lossy).toBe(true);
+      expect(out.solo_identical).toBe(true);
+      expectEachBranchMatchesSolo(bin, prefix, heads, out, steps, deadline, ['--mode', mode]);
+    }
+  });
+});
+
+test('delphi fanout matches solo decoding token-for-token on 4 branches over a 4096-token prefix', { tags: ['model'], timeout: 1_800_000 }, () => {
+  const deadline = Date.now() + 1_800_000;
+  const steps = 16;
+  const repeated = Array.from({ length: Math.ceil(4096 / fibonacci.input_ids.length) }, () => fibonacci.input_ids).flat();
+  const longPrefix = repeated.slice(0, 4096);
+  const heads = branchHeads.slice(0, 4);
+  withBuiltDelphi(deadline, (bin) => {
+    const out = fanout(bin, longPrefix, heads, steps, deadline);
+    expect(out.solo_identical).toBe(true);
+    expectEachBranchMatchesSolo(bin, longPrefix, heads, out, steps, deadline);
+  });
+});
+
+test('delphi fanout matches solo decoding token-for-token on all 64 branches past the 1024-token local attention window', { tags: ['model'], timeout: 2_400_000 }, () => {
+  const deadline = Date.now() + 2_400_000;
+  const steps = 16;
+  const longPrefix = Array.from({ length: 56 }, () => fibonacci.input_ids).flat();
+  withBuiltDelphi(deadline, (bin) => {
+    expect(longPrefix.length).toBeGreaterThan(1100);
+    const out = fanout(bin, longPrefix, branchHeads, steps, deadline);
+    expect(out.branch_count).toBe(64);
+    expect(out.solo_identical).toBe(true);
+    expectEachBranchMatchesSolo(bin, longPrefix, branchHeads, out, steps, deadline);
+  });
+});
+
+test('delphi fanout --tensor-experts reports itself lossy from exactly 24 branches', { tags: ['model'], timeout: 600_000 }, () => {
+  const deadline = Date.now() + 600_000;
+  withBuiltDelphi(deadline, (bin) => {
+    const out = fanout(bin, prefix, branchHeads.slice(0, 24), 4, deadline, ['--tensor-experts']);
+    expect(out.branch_count).toBe(24);
+    expect(out.lossy).toBe(true);
+    expect(out.solo_identical).toBe(false);
   });
 });
